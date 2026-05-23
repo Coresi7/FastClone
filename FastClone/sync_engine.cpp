@@ -431,18 +431,20 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (!done.load()) {
             bool didWork = false;
+            std::vector<uint8_t> sendBatch;
+            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(options.chunkSize) * options.streamLimit));
             {
                 std::lock_guard<std::mutex> lock(mu);
                 size_t highBudget = 256;
                 while (!outboundHigh.empty() && highBudget > 0) {
-                    SendFrame(client, outboundHigh.front());
+                    AppendEncodedFrame(sendBatch, outboundHigh.front());
                     outboundHigh.pop();
                     didWork = true;
                     --highBudget;
                 }
                 size_t manifestBudget = outboundHigh.empty() ? 8 : 0;
                 while (!outboundManifest.empty() && manifestBudget > 0) {
-                    SendFrame(client, outboundManifest.front());
+                    AppendEncodedFrame(sendBatch, outboundManifest.front());
                     outboundManifest.pop();
                     outboundCv.notify_one();
                     didWork = true;
@@ -454,17 +456,20 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     const std::streamsize got = it->second.input.gcount();
                     if (got > 0) {
                         chunk.resize(static_cast<size_t>(got));
-                        SendFrame(client, Frame{MsgType::FileChunk, it->first, std::move(chunk)});
+                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileChunk, it->first, std::move(chunk)});
                         didWork = true;
                     }
                     if (!it->second.input || got == 0) {
-                        SendFrame(client, Frame{MsgType::FileEnd, it->first, {}});
+                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileEnd, it->first, {}});
                         it = activeStreams.erase(it);
                         didWork = true;
                     } else {
                         ++it;
                     }
                 }
+            }
+            if (!sendBatch.empty()) {
+                SendAll(client, sendBatch.data(), sendBatch.size());
             }
             if (debugEnabled) {
                 const auto now = std::chrono::steady_clock::now();
@@ -879,16 +884,25 @@ int RunClient(const CliOptions& options) {
     };
 
     auto dispatchHashRequests = [&]() {
+        std::vector<uint8_t> outboundBatch;
+        outboundBatch.reserve(256 * 1024);
         while (!pendingHashRequests.empty() && (hashRequestsSent - hashResponsesReceived) < maxInFlightHashRequests) {
             const std::string rel = pendingHashRequests.front();
             pendingHashRequests.pop_front();
             ++hashRequestsSent;
-            SendFrame(socket, Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
+            AppendEncodedFrame(outboundBatch, Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
             {
                 std::lock_guard<std::mutex> lock(hashTaskMu);
                 hashTaskQueue.push_back(ClientHashTask{rel, JoinRel(options.rootDir, rel)});
             }
             hashTaskCv.notify_one();
+            if (outboundBatch.size() >= (1024 * 1024)) {
+                SendAll(socket, outboundBatch.data(), outboundBatch.size());
+                outboundBatch.clear();
+            }
+        }
+        if (!outboundBatch.empty()) {
+            SendAll(socket, outboundBatch.data(), outboundBatch.size());
         }
     };
 

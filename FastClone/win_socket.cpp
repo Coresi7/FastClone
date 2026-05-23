@@ -13,6 +13,19 @@ std::string LastSocketError(const char* prefix) {
     return std::string(prefix) + " WSA=" + std::to_string(WSAGetLastError());
 }
 
+void TuneSocketForThroughput(SOCKET s) {
+    if (s == INVALID_SOCKET) {
+        return;
+    }
+    int noDelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+
+    // A larger kernel buffer helps keep a 2.5G link fed.
+    int bufSize = 4 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+}
+
 }  // namespace
 
 WsaContext::WsaContext() {
@@ -77,6 +90,7 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port) {
         if (!attempt.Valid()) {
             continue;
         }
+        TuneSocketForThroughput(attempt.Get());
         if (connect(attempt.Get(), p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
             connected = std::move(attempt);
             break;
@@ -120,6 +134,7 @@ SocketHandle AcceptClient(const SocketHandle& listener) {
     if (client == INVALID_SOCKET) {
         throw std::runtime_error(LastSocketError("accept failed"));
     }
+    TuneSocketForThroughput(client);
     return SocketHandle(client);
 }
 

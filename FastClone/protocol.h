@@ -34,6 +34,7 @@ struct Frame {
 };
 
 void SendFrame(const SocketHandle& socket, const Frame& frame);
+void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame);
 Frame RecvFrame(const SocketHandle& socket);
 
 void AppendU16(std::vector<uint8_t>& out, uint16_t value);

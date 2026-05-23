@@ -17,22 +17,27 @@ void Ensure(bool cond, const char* message) {
 
 }  // namespace
 
-void SendFrame(const SocketHandle& socket, const Frame& frame) {
+void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame) {
     const uint32_t payloadLen = static_cast<uint32_t>(frame.payload.size());
-    std::array<uint8_t, kHeaderSize> header{};
-    header[0] = static_cast<uint8_t>(frame.type);
-    header[1] = static_cast<uint8_t>(frame.streamId & 0xFF);
-    header[2] = static_cast<uint8_t>((frame.streamId >> 8) & 0xFF);
-    header[3] = static_cast<uint8_t>((frame.streamId >> 16) & 0xFF);
-    header[4] = static_cast<uint8_t>((frame.streamId >> 24) & 0xFF);
-    header[5] = static_cast<uint8_t>(payloadLen & 0xFF);
-    header[6] = static_cast<uint8_t>((payloadLen >> 8) & 0xFF);
-    header[7] = static_cast<uint8_t>((payloadLen >> 16) & 0xFF);
-    header[8] = static_cast<uint8_t>((payloadLen >> 24) & 0xFF);
-    SendAll(socket, header.data(), header.size());
+    out.reserve(out.size() + kHeaderSize + frame.payload.size());
+    out.push_back(static_cast<uint8_t>(frame.type));
+    out.push_back(static_cast<uint8_t>(frame.streamId & 0xFF));
+    out.push_back(static_cast<uint8_t>((frame.streamId >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((frame.streamId >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((frame.streamId >> 24) & 0xFF));
+    out.push_back(static_cast<uint8_t>(payloadLen & 0xFF));
+    out.push_back(static_cast<uint8_t>((payloadLen >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((payloadLen >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((payloadLen >> 24) & 0xFF));
     if (!frame.payload.empty()) {
-        SendAll(socket, frame.payload.data(), frame.payload.size());
+        out.insert(out.end(), frame.payload.begin(), frame.payload.end());
     }
+}
+
+void SendFrame(const SocketHandle& socket, const Frame& frame) {
+    std::vector<uint8_t> encoded;
+    AppendEncodedFrame(encoded, frame);
+    SendAll(socket, encoded.data(), encoded.size());
 }
 
 Frame RecvFrame(const SocketHandle& socket) {
