@@ -103,22 +103,9 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
     const uint32_t hw = std::max<uint32_t>(1, std::thread::hardware_concurrency());
 
     if (options.streamAutoTune) {
-        if (options.chunkAutoTune) {
-            tuned.streamLimit = std::clamp<uint32_t>(hw * 2, 8, 24);
-        } else {
-            const uint32_t chunkKb = tuned.chunkSize / 1024;
-            if (chunkKb >= 8192) {
-                tuned.streamLimit = 8;
-            } else if (chunkKb >= 4096) {
-                tuned.streamLimit = 10;
-            } else if (chunkKb >= 2048) {
-                tuned.streamLimit = 12;
-            } else if (chunkKb >= 1024) {
-                tuned.streamLimit = 16;
-            } else {
-                tuned.streamLimit = 24;
-            }
-        }
+        // Keep default stream count conservative to reduce failure rate
+        // on weak SSD/controllers when user doesn't explicitly set --streams.
+        tuned.streamLimit = 4;
     }
 
     if (options.chunkAutoTune) {
@@ -544,17 +531,25 @@ void EnsureParentDir(const fs::path& filePath) {
     }
 }
 
-size_t RemoveLocalExtras(const fs::path& root,
-                         const std::unordered_set<std::string>& remoteDirs,
-                         const std::unordered_map<std::string, FileEntry>& remoteFiles,
-                         const std::optional<fs::path>& exclude) {
+struct RemoveLocalExtrasResult {
     size_t deletedFiles = 0;
+    size_t failedOps = 0;
+};
+
+RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
+                                          const std::unordered_set<std::string>& remoteDirs,
+                                          const std::unordered_map<std::string, FileEntry>& remoteFiles,
+                                          const std::optional<fs::path>& exclude) {
+    RemoveLocalExtrasResult result;
     LocalState local = BuildLocalState(root, exclude);
     for (const auto& kv : local.files) {
         if (!remoteFiles.contains(kv.first)) {
             std::error_code ec;
-            if (fs::remove(JoinRel(root, kv.first), ec)) {
-                ++deletedFiles;
+            const bool removed = fs::remove(JoinRel(root, kv.first), ec);
+            if (removed) {
+                ++result.deletedFiles;
+            } else if (ec) {
+                ++result.failedOps;
             }
         }
     }
@@ -566,9 +561,12 @@ size_t RemoveLocalExtras(const fs::path& root,
         if (!remoteDirs.contains(dir)) {
             std::error_code ec;
             fs::remove(JoinRel(root, dir), ec);
+            if (ec) {
+                ++result.failedOps;
+            }
         }
     }
-    return deletedFiles;
+    return result;
 }
 
 std::optional<fs::path> CurrentExePath() {
@@ -967,12 +965,14 @@ size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effective
 
 void PrintClientCounters(size_t enumerated,
                          size_t compared,
-                         size_t skipped,
+                         size_t unchanged,
+                         size_t failed,
                          size_t transferred,
                          size_t deleted,
                          size_t& lastEnumerated,
                          size_t& lastCompared,
-                         size_t& lastSkipped,
+                         size_t& lastUnchanged,
+                         size_t& lastFailed,
                          size_t& lastTransferred,
                          size_t& lastDeleted,
                          bool force = false) {
@@ -982,7 +982,8 @@ void PrintClientCounters(size_t enumerated,
     const bool tickReached = (now - lastPrint) >= std::chrono::seconds(1);
     const bool changedEnough = (enumerated != lastEnumerated) ||
                                (compared != lastCompared) ||
-                               (skipped != lastSkipped) ||
+                               (unchanged != lastUnchanged) ||
+                               (failed != lastFailed) ||
                                (transferred != lastTransferred) ||
                                (deleted != lastDeleted);
     if (!force && (!tickReached || !changedEnough)) {
@@ -991,13 +992,15 @@ void PrintClientCounters(size_t enumerated,
     lastPrint = now;
     lastEnumerated = enumerated;
     lastCompared = compared;
-    lastSkipped = skipped;
+    lastUnchanged = unchanged;
+    lastFailed = failed;
     lastTransferred = transferred;
     lastDeleted = deleted;
     std::cout << "\r"
               << "Enumrated: " << enumerated
               << "  Compared: " << compared
-              << "  Skipped: " << skipped
+              << "  Unchanged: " << unchanged
+              << "  Failed: " << failed
               << "  Transfered: " << transferred
               << "  Deleted: " << deleted
               << "      " << std::flush;
@@ -1163,6 +1166,11 @@ int RunClient(const CliOptions& options) {
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
                   << std::endl;
     }
+    if (!options.streamAutoTune && streamLimit > 8) {
+        std::cerr << "[warning] streams=" << streamLimit
+                  << " may increase file transfer failure probability on unstable disks/controllers."
+                  << std::endl;
+    }
 
     SendFrame(socket, Frame{MsgType::ManifestRequest, 0, {}});
     std::unordered_map<std::string, FileEntry> remoteFiles;
@@ -1172,7 +1180,10 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<uint32_t, std::string> streamToPath;
     std::deque<std::string> pendingTransfers;
     std::deque<std::string> pendingBatchTransfers;
+    std::deque<std::string> pendingRetryTransfers;
+    std::deque<std::string> pendingRetryBatchTransfers;
     std::unordered_set<std::string> scheduledTransfers;
+    std::unordered_map<std::string, uint8_t> transferRetryCounts;
 
     std::unordered_map<std::string, Hash256> remoteHashes;
     std::unordered_map<std::string, Hash256> localHashes;
@@ -1246,7 +1257,8 @@ int RunClient(const CliOptions& options) {
 
     size_t enumerated = 0;
     size_t compared = 0;
-    size_t skipped = 0;
+    size_t unchanged = 0;
+    size_t failed = 0;
     size_t transferred = 0;
     size_t deleted = 0;
     size_t fallbackCount = 0;
@@ -1254,9 +1266,11 @@ int RunClient(const CliOptions& options) {
     size_t hashRequestsSent = 0;
     size_t hashResponsesReceived = 0;
     const size_t maxInFlightHashRequests = std::max<size_t>(256, static_cast<size_t>(streamLimit) * 32);
+    constexpr uint8_t kMaxTransferRetries = 3;
     size_t lastEnum = 0;
     size_t lastCompared = 0;
-    size_t lastSkipped = 0;
+    size_t lastUnchanged = 0;
+    size_t lastFailed = 0;
     size_t lastTransferred = 0;
     size_t lastDeleted = 0;
     size_t reservedEntryCapacity = 0;
@@ -1273,6 +1287,7 @@ int RunClient(const CliOptions& options) {
         hashRequested.reserve(target);
         localHashFailed.reserve(target);
         scheduledTransfers.reserve(target);
+        transferRetryCounts.reserve(target);
         remoteDirs.reserve((target / 4) + 256);
         reservedEntryCapacity = target;
     };
@@ -1305,15 +1320,44 @@ int RunClient(const CliOptions& options) {
     uint64_t smallFileBatchThreshold = 128 * 1024;
     size_t smallBatchMaxFiles = 256;
     size_t smallBatchMaxBytes = 8 * 1024 * 1024;
+    auto enqueueTransfer = [&](const std::string& rel, bool isRetry) {
+        const auto it = remoteFiles.find(rel);
+        const bool useBatch = (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold);
+        if (isRetry) {
+            if (useBatch) {
+                pendingRetryBatchTransfers.push_back(rel);
+            } else {
+                pendingRetryTransfers.push_back(rel);
+            }
+        } else {
+            if (useBatch) {
+                pendingBatchTransfers.push_back(rel);
+            } else {
+                pendingTransfers.push_back(rel);
+            }
+        }
+    };
+
     auto scheduleTransfer = [&](const std::string& rel) {
         if (!scheduledTransfers.insert(rel).second) {
             return;
         }
-        const auto it = remoteFiles.find(rel);
-        if (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold) {
-            pendingBatchTransfers.push_back(rel);
+        enqueueTransfer(rel, false);
+    };
+
+    auto markTransferFailed = [&](const std::string&) {
+        ++compared;
+        ++failed;
+    };
+
+    auto retryOrFail = [&](const std::string& rel) {
+        uint8_t& retries = transferRetryCounts[rel];
+        if (retries < kMaxTransferRetries) {
+            ++retries;
+            enqueueTransfer(rel, true);
         } else {
-            pendingTransfers.push_back(rel);
+            markTransferFailed(rel);
+            transferRetryCounts.erase(rel);
         }
     };
 
@@ -1405,7 +1449,7 @@ int RunClient(const CliOptions& options) {
             scheduleTransfer(r.relPath);
         } else if (action == CompareAction::Skip) {
             ++compared;
-            ++skipped;
+            ++unchanged;
         } else {
             if (!hashRequested.contains(r.relPath)) {
                 hashRequested.insert(r.relPath);
@@ -1413,7 +1457,7 @@ int RunClient(const CliOptions& options) {
                 pendingHashRequests.push_back(r.relPath);
             }
         }
-        PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
     };
 
     auto dispatchHashRequests = [&]() {
@@ -1445,13 +1489,25 @@ int RunClient(const CliOptions& options) {
         };
         while (activeTransferSlots() < streamLimit) {
             bool started = false;
+            std::deque<std::string>* batchQueue = nullptr;
+            std::deque<std::string>* regularQueue = nullptr;
             if (!pendingBatchTransfers.empty()) {
+                batchQueue = &pendingBatchTransfers;
+            } else if (!pendingTransfers.empty()) {
+                regularQueue = &pendingTransfers;
+            } else if (!pendingRetryBatchTransfers.empty()) {
+                batchQueue = &pendingRetryBatchTransfers;
+            } else if (!pendingRetryTransfers.empty()) {
+                regularQueue = &pendingRetryTransfers;
+            }
+
+            if (batchQueue != nullptr) {
                 std::vector<std::string> batchPaths;
                 batchPaths.reserve(smallBatchMaxFiles);
                 size_t batchBytes = 0;
-                while (!pendingBatchTransfers.empty() && batchPaths.size() < smallBatchMaxFiles && batchBytes < smallBatchMaxBytes) {
-                    const std::string rel = pendingBatchTransfers.front();
-                    pendingBatchTransfers.pop_front();
+                while (!batchQueue->empty() && batchPaths.size() < smallBatchMaxFiles && batchBytes < smallBatchMaxBytes) {
+                    const std::string rel = batchQueue->front();
+                    batchQueue->pop_front();
                     batchPaths.push_back(rel);
                     const auto it = remoteFiles.find(rel);
                     if (it != remoteFiles.end()) {
@@ -1468,18 +1524,17 @@ int RunClient(const CliOptions& options) {
                     SendFrame(socket, Frame{MsgType::FileBatchOpen, sid, EncodeFileBatchRequest(batchPaths)});
                     started = true;
                 }
-            } else if (!pendingTransfers.empty()) {
-                const std::string rel = pendingTransfers.front();
-                pendingTransfers.pop_front();
+            } else if (regularQueue != nullptr) {
+                const std::string rel = regularQueue->front();
+                regularQueue->pop_front();
                 const fs::path abs = JoinRel(options.rootDir, rel);
                 EnsureParentDir(abs);
                 DownloadState d;
                 d.relPath = rel;
                 d.output.open(abs, std::ios::binary | std::ios::trunc);
                 if (!d.output) {
-                    ++compared;
-                    ++skipped;
-                    PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+                    retryOrFail(rel);
+                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
                 } else {
                     const uint32_t sid = nextStreamId++;
                     d.flushThreshold = downloadFlushThreshold;
@@ -1516,15 +1571,15 @@ int RunClient(const CliOptions& options) {
             SetFileCreateAndModifyTime(JoinRel(options.rootDir, entry.relPath), entry.ctimeNs, entry.mtimeNs);
             ++compared;
             ++transferred;
+            transferRetryCounts.erase(entry.relPath);
         } else {
             if (entry.output.is_open()) {
                 entry.output.close();
             }
-            ++compared;
-            ++skipped;
+            retryOrFail(entry.relPath);
         }
         entry.finalized = true;
-        PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
     };
 
     auto resolveFallbackIfReady = [&]() {
@@ -1563,11 +1618,11 @@ int RunClient(const CliOptions& options) {
                 const FileEntry& meta = remoteFiles.at(rel);
                 SetFileCreateAndModifyTime(JoinRel(options.rootDir, rel), meta.ctimeNs, meta.mtimeNs);
                 ++compared;
-                ++skipped;
+                ++unchanged;
             }
             hashResolved.insert(rel);
             ++fallbackResolved;
-            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         }
     };
 
@@ -1595,7 +1650,7 @@ int RunClient(const CliOptions& options) {
                 ++compareTasksIssued;
                 compareTaskCv.notify_one();
             }
-            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::ManifestProgress) {
             size_t cursor = 0;
             const uint64_t serverEnumerated = ReadU64(frame.payload, cursor);
@@ -1728,7 +1783,8 @@ int RunClient(const CliOptions& options) {
             streamToPath.erase(frame.streamId);
             ++compared;
             ++transferred;
-            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+            transferRetryCounts.erase(rel);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::FileError) {
             auto itBatch = activeBatchDownloads.find(frame.streamId);
             if (itBatch != activeBatchDownloads.end()) {
@@ -1748,12 +1804,19 @@ int RunClient(const CliOptions& options) {
                 itDl->second.output.close();
                 activeDownloads.erase(itDl);
             }
+            std::string relPath;
+            bool hasRelPath = false;
             if (itPath != streamToPath.end()) {
+                relPath = itPath->second;
+                hasRelPath = true;
                 streamToPath.erase(itPath);
             }
-            ++compared;
-            ++skipped;
-            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+            if (hasRelPath) {
+                retryOrFail(relPath);
+            } else {
+                markTransferFailed("<unknown>");
+            }
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else {
             throw std::runtime_error("Unexpected frame in client stream loop");
         }
@@ -1817,7 +1880,8 @@ int RunClient(const CliOptions& options) {
                     const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
                     std::cerr << "[debug][client] enum=" << enumerated
                               << " compared=" << compared
-                              << " skipped=" << skipped
+                              << " unchanged=" << unchanged
+                              << " failed=" << failed
                               << " transferred=" << transferred
                               << " in_flight_hash=" << hashInflight
                               << " pending_hash_req=" << pendingHashRequests.size()
@@ -1827,7 +1891,8 @@ int RunClient(const CliOptions& options) {
                               << " ready_compare_results=" << readyCompareResults
                               << " delayed_compare_entries=" << delayedCompareEntries.size()
                               << " queued_incoming_frames=" << queuedIncomingFrames
-                              << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size())
+                              << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size() +
+                                                           pendingRetryTransfers.size() + pendingRetryBatchTransfers.size())
                               << " active_downloads=" << activeDownloads.size()
                               << " active_batches=" << activeBatchDownloads.size()
                               << " batch_thr_kb=" << (smallFileBatchThreshold / 1024)
@@ -1841,7 +1906,9 @@ int RunClient(const CliOptions& options) {
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
-            if (manifestDone && allCompareDone && pendingTransfers.empty() && pendingBatchTransfers.empty() &&
+            if (manifestDone && allCompareDone &&
+                pendingTransfers.empty() && pendingBatchTransfers.empty() &&
+                pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone) {
                 break;
             }
@@ -1911,21 +1978,26 @@ int RunClient(const CliOptions& options) {
             w.join();
         }
     }
-    PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted, true);
+    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
 
     std::cout << "Deleting obsoleted files (sync with server)..." << std::endl;
-    deleted = RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath);
+    const RemoveLocalExtrasResult deleteResult = RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath);
+    deleted = deleteResult.deletedFiles;
+    failed += deleteResult.failedOps;
+    compared += deleteResult.failedOps;
     compared += deleted;
     std::cout << "Delete done, " << deleted << " files" << std::endl;
-    PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted, true);
+    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
     SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
     recvStop.store(true);
     shutdown(socket.Get(), SD_BOTH);
     if (recvThread.joinable()) {
         recvThread.join();
     }
-    std::cout << "Sync completed. changed_files=" << transferred << std::endl;
-    return 0;
+    const bool success = (failed == 0);
+    std::cout << "Sync completed. changed_files=" << transferred
+              << " failed_files=" << failed << std::endl;
+    return success ? 0 : 2;
 }
 
 }  // namespace fc

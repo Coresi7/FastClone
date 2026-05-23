@@ -35,7 +35,7 @@ FastClone.exe client --server <host[:port]> --target <path> --password <pwd> [--
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）
 - `--target`：本地目标目录
 - `--password`：口令（与服务端一致）
-- `--streams`：并发 stream 数；不传走 auto-tune
+- `--streams`：并发 stream 数；不传走 auto-tune（默认按 `4`，显式设置大于 `8` 会打印失败率风险警告）
 - `--chunk-kb`：块大小（KB）；不传走 auto-tune，范围 `1..65536`
 
 ## 进度输出
@@ -44,7 +44,8 @@ FastClone.exe client --server <host[:port]> --target <path> --password <pwd> [--
 
 - `Enumrated`：已枚举远端文件数
 - `Compared`：已完成判定数
-- `Skipped`：无需传输数
+- `Unchanged`：无需传输数
+- `Failed`：传输失败且重试（最多 3 次）后仍失败的文件数
 - `Transfered`：已传输完成数
 - `Deleted`：镜像删除数（删除阶段结束后更新）
 
