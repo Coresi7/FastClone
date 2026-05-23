@@ -1,0 +1,17 @@
+.vs/
+x64/
+tmp/
+FastClone/x64/
+FastClone/FastClone/x64/
+*.user
+*.VC.db
+*.VC.opendb
+*.suo
+*.pdb
+*.obj
+*.ilk
+*.ipch
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
