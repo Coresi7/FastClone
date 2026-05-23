@@ -618,7 +618,13 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     didWork = true;
                     --manifestBudget;
                 }
+                const bool hasRegularStreams = !activeStreams.empty();
+                const size_t batchSendQuotaBytes = (streamLimit <= 8) ? (24 * 1024 * 1024) : (12 * 1024 * 1024);
+                size_t batchBytesSentThisRound = 0;
                 for (auto it = activeBatchStreams.begin(); it != activeBatchStreams.end();) {
+                    if (hasRegularStreams && batchBytesSentThisRound >= batchSendQuotaBytes) {
+                        break;
+                    }
                     ServerBatchStream& batch = it->second;
                     if (!batch.headerSent) {
                         AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchOpen, it->first, EncodeFileBatchOpenResponse(batch.files)});
@@ -656,6 +662,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         }
                         chunk.resize(static_cast<size_t>(got));
                         burstBytes += static_cast<size_t>(got);
+                        batchBytesSentThisRound += static_cast<size_t>(got);
                         batch.remainingBytes -= static_cast<uint64_t>(got);
                         AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
                         didWork = true;
@@ -1134,9 +1141,9 @@ int RunClient(const CliOptions& options) {
         }
     });
 
-    const uint64_t smallFileBatchThreshold = 128 * 1024;
-    const size_t smallBatchMaxFiles = 256;
-    const size_t smallBatchMaxBytes = 8 * 1024 * 1024;
+    uint64_t smallFileBatchThreshold = 128 * 1024;
+    size_t smallBatchMaxFiles = 256;
+    size_t smallBatchMaxBytes = 8 * 1024 * 1024;
     auto scheduleTransfer = [&](const std::string& rel) {
         if (!scheduledTransfers.insert(rel).second) {
             return;
@@ -1147,6 +1154,36 @@ int RunClient(const CliOptions& options) {
         } else {
             pendingTransfers.push_back(rel);
         }
+    };
+
+    auto refreshSmallBatchTuning = [&]() {
+        const size_t backlog = pendingBatchTransfers.size();
+        uint64_t threshold = 128 * 1024;
+        size_t maxFiles = 256;
+        size_t maxBytes = 8 * 1024 * 1024;
+
+        if (backlog > 40000) {
+            threshold = 256 * 1024;
+            maxFiles = 512;
+            maxBytes = 16 * 1024 * 1024;
+        } else if (backlog > 12000) {
+            threshold = 192 * 1024;
+            maxFiles = 384;
+            maxBytes = 12 * 1024 * 1024;
+        } else if (backlog < 1000) {
+            threshold = 96 * 1024;
+            maxFiles = 192;
+            maxBytes = 6 * 1024 * 1024;
+        }
+
+        if (streamLimit <= 8) {
+            maxBytes = std::max<size_t>(maxBytes, 16 * 1024 * 1024);
+            maxFiles = std::max<size_t>(maxFiles, 384);
+        }
+
+        smallFileBatchThreshold = threshold;
+        smallBatchMaxFiles = maxFiles;
+        smallBatchMaxBytes = maxBytes;
     };
 
     auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
@@ -1562,6 +1599,7 @@ int RunClient(const CliOptions& options) {
         while (true) {
             resolveFallbackIfReady();
             dispatchHashRequests();
+            refreshSmallBatchTuning();
             tryStartTransfers();
             {
                 std::deque<CompareResult> ready;
@@ -1627,6 +1665,9 @@ int RunClient(const CliOptions& options) {
                               << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size())
                               << " active_downloads=" << activeDownloads.size()
                               << " active_batches=" << activeBatchDownloads.size()
+                              << " batch_thr_kb=" << (smallFileBatchThreshold / 1024)
+                              << " batch_max_files=" << smallBatchMaxFiles
+                              << " batch_max_kb=" << (smallBatchMaxBytes / 1024)
                               << " fallback_open=" << (fallbackCount - fallbackResolved)
                               << std::endl;
                     lastDebugPrint = now;
