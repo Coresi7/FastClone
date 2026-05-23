@@ -18,7 +18,7 @@ struct FileEntry {
     int64_t ctimeNs = 0;
 };
 
-using Hash256 = std::array<uint8_t, 32>;
+using Hash256 = std::array<uint8_t, 16>;
 
 std::vector<FileEntry> BuildIndex(const std::filesystem::path& root, const std::optional<std::filesystem::path>& excludeAbsPath);
 Hash256 ComputeFileHash(const std::filesystem::path& path);

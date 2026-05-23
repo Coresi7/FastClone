@@ -1,11 +1,12 @@
 #include "file_index.h"
 
 #include <Windows.h>
-#include <blake3.h>
+#include <xxhash.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
@@ -194,22 +195,53 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
 }
 
 Hash256 ComputeFileHash(const fs::path& path) {
-    blake3_hasher hasher{};
-    blake3_hasher_init(&hasher);
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    XXH3_state_t* state = XXH3_createState();
+    if (state == nullptr) {
+        throw std::runtime_error("XXH3_createState failed");
+    }
+    if (XXH3_128bits_reset(state) == XXH_ERROR) {
+        XXH3_freeState(state);
+        throw std::runtime_error("XXH3_128bits_reset failed");
+    }
+    HANDLE handle = CreateFileW(path.wstring().c_str(),
+                                GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr,
+                                OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("Open file failed for hash");
     }
-    std::vector<uint8_t> buf(1 << 20);
-    while (in) {
-        in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
-        const std::streamsize got = in.gcount();
-        if (got > 0) {
-            blake3_hasher_update(&hasher, buf.data(), static_cast<size_t>(got));
+
+    thread_local std::vector<uint8_t> readBuf;
+    if (readBuf.empty()) {
+        readBuf.resize(256 * 1024);
+    }
+
+    DWORD bytesRead = 0;
+    while (ReadFile(handle, readBuf.data(), static_cast<DWORD>(readBuf.size()), &bytesRead, nullptr) != 0) {
+        if (bytesRead == 0) {
+            break;
+        }
+        if (XXH3_128bits_update(state, readBuf.data(), static_cast<size_t>(bytesRead)) == XXH_ERROR) {
+            CloseHandle(handle);
+            XXH3_freeState(state);
+            throw std::runtime_error("XXH3_128bits_update failed");
         }
     }
+
+    const DWORD readErr = GetLastError();
+    CloseHandle(handle);
+    if (readErr != ERROR_SUCCESS && readErr != ERROR_HANDLE_EOF) {
+        XXH3_freeState(state);
+        throw std::runtime_error("Read file failed for hash");
+    }
+
+    const XXH128_hash_t digest = XXH3_128bits_digest(state);
+    XXH3_freeState(state);
     Hash256 output{};
-    blake3_hasher_finalize(&hasher, output.data(), output.size());
+    std::memcpy(output.data(), &digest, output.size());
     return output;
 }
 

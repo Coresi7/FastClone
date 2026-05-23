@@ -31,7 +31,7 @@ namespace fc {
 
 namespace {
 
-constexpr const char* kProtocolVersion = "FC2";
+constexpr const char* kProtocolVersion = "FC3";
 
 bool IsDebugEnabled() {
     static const bool enabled = []() {
@@ -224,6 +224,9 @@ void EnsureHandshakeAsServer(const SocketHandle& socket, const std::string& pass
 void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& password) {
     SendSimple(socket, MsgType::Hello, kProtocolVersion);
     Frame helloBack = RecvFrame(socket);
+    if (helloBack.type == MsgType::Error) {
+        throw std::runtime_error(std::string(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size()));
+    }
     if (helloBack.type != MsgType::Hello) {
         throw std::runtime_error("Server HELLO missing");
     }
@@ -1206,6 +1209,23 @@ int RunClient(const CliOptions& options) {
     size_t lastSkipped = 0;
     size_t lastTransferred = 0;
     size_t lastDeleted = 0;
+    size_t reservedEntryCapacity = 0;
+
+    auto ensureEntryReserve = [&](size_t expectedEntries) {
+        const size_t target = expectedEntries + (expectedEntries / 2) + 1024;
+        if (target <= reservedEntryCapacity) {
+            return;
+        }
+        remoteFiles.reserve(target);
+        remoteHashes.reserve(target);
+        localHashes.reserve(target);
+        hashResolved.reserve(target);
+        hashRequested.reserve(target);
+        localHashFailed.reserve(target);
+        scheduledTransfers.reserve(target);
+        remoteDirs.reserve((target / 4) + 256);
+        reservedEntryCapacity = target;
+    };
 
     std::mutex incomingMu;
     std::condition_variable incomingCv;
@@ -1512,6 +1532,9 @@ int RunClient(const CliOptions& options) {
             }
             remoteFiles[e.relativePath] = e;
             ++enumerated;
+            if ((enumerated % 2048) == 0) {
+                ensureEntryReserve(enumerated + 2048);
+            }
             if ((compareTasksIssued.load() - compareResultsHandled.load()) >= maxInFlightCompareTasks) {
                 delayedCompareEntries.push_back(e);
             } else {
@@ -1526,6 +1549,7 @@ int RunClient(const CliOptions& options) {
         } else if (frame.type == MsgType::ManifestProgress) {
             size_t cursor = 0;
             const uint64_t serverEnumerated = ReadU64(frame.payload, cursor);
+            ensureEntryReserve(static_cast<size_t>(serverEnumerated));
             if (serverEnumerated > enumerated) {
                 enumerated = static_cast<size_t>(serverEnumerated);
             }
