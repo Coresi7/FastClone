@@ -69,6 +69,9 @@ enum class CompareAction {
     FallbackHash
 };
 
+uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
+size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
+
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
     if (!localFile.has_value()) {
         return CompareAction::TransferNow;
@@ -270,6 +273,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
 
     std::unordered_map<uint32_t, ServerStream> activeStreams;
     std::mutex mu;
@@ -432,7 +436,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         while (!done.load()) {
             bool didWork = false;
             std::vector<uint8_t> sendBatch;
-            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(options.chunkSize) * options.streamLimit));
+            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(effectiveChunkSize) * options.streamLimit));
             {
                 std::lock_guard<std::mutex> lock(mu);
                 size_t highBudget = 256;
@@ -451,7 +455,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     --manifestBudget;
                 }
                 for (auto it = activeStreams.begin(); it != activeStreams.end();) {
-                    std::vector<uint8_t> chunk(options.chunkSize);
+                    std::vector<uint8_t> chunk(effectiveChunkSize);
                     it->second.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
                     const std::streamsize got = it->second.input.gcount();
                     if (got > 0) {
@@ -528,7 +532,29 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
 struct DownloadState {
     std::ofstream output;
     std::string relPath;
+    std::vector<uint8_t> writeBuffer;
+    size_t flushThreshold = 0;
 };
+
+uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit) {
+    if (streamLimit <= 16) {
+        return std::max<uint32_t>(configuredChunkSize, 1024 * 1024);
+    }
+    if (streamLimit <= 32) {
+        return std::max<uint32_t>(configuredChunkSize, 512 * 1024);
+    }
+    return configuredChunkSize;
+}
+
+size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize) {
+    if (streamLimit <= 16) {
+        return std::max<size_t>(4 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 4);
+    }
+    if (streamLimit <= 32) {
+        return std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2);
+    }
+    return std::max<size_t>(512 * 1024, static_cast<size_t>(effectiveChunkSize));
+}
 
 void PrintClientCounters(size_t enumerated,
                          size_t compared,
@@ -588,6 +614,17 @@ void TransferFileBatch(const SocketHandle& socket,
         pending.push({streamId++, rel});
     }
 
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
+    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(options.streamLimit, effectiveChunkSize);
+
+    auto flushBufferedWrites = [&](DownloadState& d) {
+        if (d.writeBuffer.empty()) {
+            return;
+        }
+        d.output.write(reinterpret_cast<const char*>(d.writeBuffer.data()), static_cast<std::streamsize>(d.writeBuffer.size()));
+        d.writeBuffer.clear();
+    };
+
     auto openPendingStream = [&](uint32_t sid, const std::string& rel) {
         const fs::path abs = JoinRel(rootDir, rel);
         EnsureParentDir(abs);
@@ -597,6 +634,8 @@ void TransferFileBatch(const SocketHandle& socket,
         if (!d.output) {
             throw std::runtime_error("Cannot open local file for write: " + rel);
         }
+        d.flushThreshold = downloadFlushThreshold;
+        d.writeBuffer.reserve(d.flushThreshold);
         activeDownloads.emplace(sid, std::move(d));
         streamToPath.emplace(sid, rel);
         SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
@@ -616,12 +655,17 @@ void TransferFileBatch(const SocketHandle& socket,
             if (it == activeDownloads.end()) {
                 throw std::runtime_error("Received chunk for unknown stream");
             }
-            it->second.output.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
+            DownloadState& d = it->second;
+            d.writeBuffer.insert(d.writeBuffer.end(), frame.payload.begin(), frame.payload.end());
+            if (d.writeBuffer.size() >= d.flushThreshold) {
+                flushBufferedWrites(d);
+            }
         } else if (frame.type == MsgType::FileEnd) {
             auto it = activeDownloads.find(frame.streamId);
             if (it == activeDownloads.end()) {
                 throw std::runtime_error("Received end for unknown stream");
             }
+            flushBufferedWrites(it->second);
             it->second.output.flush();
             it->second.output.close();
             const std::string rel = it->second.relPath;
@@ -679,6 +723,8 @@ int RunServer(const CliOptions& options) {
 int RunClient(const CliOptions& options) {
     WsaContext wsa;
     const bool debugEnabled = IsDebugEnabled();
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
+    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(options.streamLimit, effectiveChunkSize);
     std::error_code ec;
     fs::create_directories(options.rootDir, ec);
 
@@ -921,10 +967,20 @@ int RunClient(const CliOptions& options) {
                 PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
                 continue;
             }
+            d.flushThreshold = downloadFlushThreshold;
+            d.writeBuffer.reserve(d.flushThreshold);
             activeDownloads.emplace(sid, std::move(d));
             streamToPath.emplace(sid, rel);
             SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
         }
+    };
+
+    auto flushBufferedWrites = [&](DownloadState& d) {
+        if (d.writeBuffer.empty()) {
+            return;
+        }
+        d.output.write(reinterpret_cast<const char*>(d.writeBuffer.data()), static_cast<std::streamsize>(d.writeBuffer.size()));
+        d.writeBuffer.clear();
     };
 
     auto resolveFallbackIfReady = [&]() {
@@ -1017,12 +1073,17 @@ int RunClient(const CliOptions& options) {
             if (it == activeDownloads.end()) {
                 throw std::runtime_error("Received chunk for unknown stream");
             }
-            it->second.output.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
+            DownloadState& d = it->second;
+            d.writeBuffer.insert(d.writeBuffer.end(), frame.payload.begin(), frame.payload.end());
+            if (d.writeBuffer.size() >= d.flushThreshold) {
+                flushBufferedWrites(d);
+            }
         } else if (frame.type == MsgType::FileEnd) {
             auto it = activeDownloads.find(frame.streamId);
             if (it == activeDownloads.end()) {
                 throw std::runtime_error("Received end for unknown stream");
             }
+            flushBufferedWrites(it->second);
             it->second.output.flush();
             it->second.output.close();
             const std::string rel = it->second.relPath;
@@ -1037,6 +1098,7 @@ int RunClient(const CliOptions& options) {
             auto itPath = streamToPath.find(frame.streamId);
             auto itDl = activeDownloads.find(frame.streamId);
             if (itDl != activeDownloads.end()) {
+                itDl->second.writeBuffer.clear();
                 itDl->second.output.close();
                 activeDownloads.erase(itDl);
             }
