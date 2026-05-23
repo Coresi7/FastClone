@@ -464,8 +464,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         enqueueHigh(Frame{MsgType::FileError, frame.streamId, std::vector<uint8_t>(rel.begin(), rel.end())});
                         continue;
                     }
-                    std::lock_guard<std::mutex> lock(mu);
-                    activeStreams.emplace(frame.streamId, std::move(st));
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        activeStreams.emplace(frame.streamId, std::move(st));
+                    }
+                    outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
                     done.store(true);
                     hashCv.notify_all();
@@ -485,6 +488,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
 
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
+        const size_t perStreamBurstBytes = (streamLimit <= 8)
+                                               ? std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2)
+                                               : static_cast<size_t>(effectiveChunkSize);
         while (!done.load()) {
             bool didWork = false;
             std::vector<uint8_t> sendBatch;
@@ -507,19 +513,26 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     --manifestBudget;
                 }
                 for (auto it = activeStreams.begin(); it != activeStreams.end();) {
-                    std::vector<uint8_t> chunk(effectiveChunkSize);
-                    it->second.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
-                    const std::streamsize got = it->second.input.gcount();
-                    if (got > 0) {
-                        chunk.resize(static_cast<size_t>(got));
-                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileChunk, it->first, std::move(chunk)});
-                        didWork = true;
+                    size_t burstBytes = 0;
+                    bool streamClosed = false;
+                    while (!streamClosed && burstBytes < perStreamBurstBytes) {
+                        std::vector<uint8_t> chunk(effectiveChunkSize);
+                        it->second.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                        const std::streamsize got = it->second.input.gcount();
+                        if (got > 0) {
+                            chunk.resize(static_cast<size_t>(got));
+                            burstBytes += static_cast<size_t>(got);
+                            AppendEncodedFrame(sendBatch, Frame{MsgType::FileChunk, it->first, std::move(chunk)});
+                            didWork = true;
+                        }
+                        if (!it->second.input || got == 0) {
+                            AppendEncodedFrame(sendBatch, Frame{MsgType::FileEnd, it->first, {}});
+                            it = activeStreams.erase(it);
+                            streamClosed = true;
+                            didWork = true;
+                        }
                     }
-                    if (!it->second.input || got == 0) {
-                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileEnd, it->first, {}});
-                        it = activeStreams.erase(it);
-                        didWork = true;
-                    } else {
+                    if (!streamClosed) {
                         ++it;
                     }
                 }
@@ -553,7 +566,10 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                 }
             }
             if (!didWork) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::unique_lock<std::mutex> lock(mu);
+                outboundCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+                    return done.load() || !outboundHigh.empty() || !outboundManifest.empty() || !activeStreams.empty();
+                });
             }
         }
     } catch (const std::exception& ex) {
@@ -902,6 +918,7 @@ int RunClient(const CliOptions& options) {
     size_t lastDeleted = 0;
 
     std::mutex incomingMu;
+    std::condition_variable incomingCv;
     std::deque<Frame> incomingFrames;
     std::atomic<bool> recvStop = false;
     std::atomic<bool> recvClosed = false;
@@ -910,13 +927,17 @@ int RunClient(const CliOptions& options) {
         try {
             while (!recvStop.load()) {
                 Frame f = RecvFrame(socket);
-                std::lock_guard<std::mutex> lock(incomingMu);
-                incomingFrames.push_back(std::move(f));
+                {
+                    std::lock_guard<std::mutex> lock(incomingMu);
+                    incomingFrames.push_back(std::move(f));
+                }
+                incomingCv.notify_one();
             }
         } catch (const std::exception& ex) {
             if (!recvStop.load()) {
                 recvError = ex.what();
                 recvClosed.store(true);
+                incomingCv.notify_all();
             }
         }
     });
@@ -1275,10 +1296,13 @@ int RunClient(const CliOptions& options) {
                 }
             }
             if (readyFrames.empty()) {
-                if (recvClosed.load()) {
+                std::unique_lock<std::mutex> lock(incomingMu);
+                incomingCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+                    return recvClosed.load() || !incomingFrames.empty();
+                });
+                if (recvClosed.load() && incomingFrames.empty()) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
             for (auto& frame : readyFrames) {
