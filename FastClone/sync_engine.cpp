@@ -12,8 +12,10 @@
 #include <deque>
 #include <condition_variable>
 #include <cctype>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -167,6 +169,19 @@ std::wstring Utf8ToWide(const std::string& value) {
     return output;
 }
 
+std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int len = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) {
+        throw std::runtime_error("WideCharToMultiByte failed");
+    }
+    std::string output(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), output.data(), len, nullptr, nullptr);
+    return output;
+}
+
 fs::path JoinRel(const fs::path& root, const std::string& relPath) {
     if (relPath == "." || relPath.empty()) {
         return root;
@@ -221,6 +236,112 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
     if (authResult.type != MsgType::AuthOk) {
         throw std::runtime_error("Server authentication rejected");
     }
+}
+
+int64_t FileTimeToTicks(FILETIME ft) {
+    ULARGE_INTEGER v{};
+    v.LowPart = ft.dwLowDateTime;
+    v.HighPart = ft.dwHighDateTime;
+    return static_cast<int64_t>(v.QuadPart);
+}
+
+std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry);
+
+void EnumerateManifestEntriesFast(
+    const fs::path& root,
+    const std::optional<fs::path>& selfPath,
+    const std::atomic<bool>& done,
+    const std::function<void(Frame&&)>& enqueueManifestFrame) {
+    struct PendingDir {
+        std::wstring absDir;
+        std::string relDir;
+    };
+
+    const std::wstring rootW = root.wstring();
+    const std::wstring selfW = selfPath.has_value() ? selfPath->wstring() : L"";
+
+    std::vector<PendingDir> stack;
+    stack.push_back(PendingDir{rootW, ""});
+
+    size_t fileCount = 0;
+    while (!stack.empty()) {
+        if (done.load()) {
+            return;
+        }
+        PendingDir current = std::move(stack.back());
+        stack.pop_back();
+
+        std::wstring pattern = current.absDir;
+        if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
+            pattern.push_back(L'\\');
+        }
+        pattern.append(L"*");
+
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileExW(
+            pattern.c_str(),
+            FindExInfoBasic,
+            &fd,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+
+        do {
+            if (done.load()) {
+                FindClose(hFind);
+                return;
+            }
+
+            const wchar_t* name = fd.cFileName;
+            if ((name[0] == L'.' && name[1] == L'\0') ||
+                (name[0] == L'.' && name[1] == L'.' && name[2] == L'\0')) {
+                continue;
+            }
+
+            const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            std::wstring absPath = current.absDir;
+            if (!absPath.empty() && absPath.back() != L'\\' && absPath.back() != L'/') {
+                absPath.push_back(L'\\');
+            }
+            absPath.append(name);
+
+            if (!isDir && !selfW.empty() && _wcsicmp(absPath.c_str(), selfW.c_str()) == 0) {
+                continue;
+            }
+
+            const std::string nameUtf8 = WideToUtf8(name);
+            std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
+
+            FileEntry entry;
+            entry.relativePath = relPath;
+            entry.isDirectory = isDir;
+            entry.fileSize = isDir ? 0 : (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            entry.mtimeNs = FileTimeToTicks(fd.ftLastWriteTime);
+            entry.ctimeNs = FileTimeToTicks(fd.ftCreationTime);
+            enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
+
+            if (isDir) {
+                stack.push_back(PendingDir{absPath, relPath});
+            } else {
+                ++fileCount;
+                if (fileCount % 2048 == 0) {
+                    std::vector<uint8_t> payload;
+                    AppendU64(payload, static_cast<uint64_t>(fileCount));
+                    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+                }
+            }
+        } while (FindNextFileW(hFind, &fd) != 0);
+
+        FindClose(hFind);
+    }
+
+    std::vector<uint8_t> payload;
+    AppendU64(payload, static_cast<uint64_t>(fileCount));
+    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+    enqueueManifestFrame(Frame{MsgType::ManifestEnd, 0, {}});
 }
 
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
@@ -485,48 +606,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     manifestThread = std::thread([&]() {
                         try {
-                            size_t fileCount = 0;
-                            for (const auto& item : fs::recursive_directory_iterator(options.rootDir, fs::directory_options::skip_permission_denied)) {
-                                if (done.load()) {
-                                    return;
-                                }
-                                const fs::path absPath = item.path();
-                                if (selfPath.has_value() && fs::exists(*selfPath) && absPath == *selfPath) {
-                                    continue;
-                                }
-                                if (!item.is_directory() && !item.is_regular_file()) {
-                                    continue;
-                                }
-                                FileEntry entry;
-                                entry.relativePath = NormalizeRelativePath(fs::relative(absPath, options.rootDir));
-                                entry.isDirectory = item.is_directory();
-                                if (entry.isDirectory) {
-                                    entry.fileSize = 0;
-                                } else {
-                                    std::error_code sec;
-                                    entry.fileSize = static_cast<uint64_t>(fs::file_size(absPath, sec));
-                                    if (sec) {
-                                        continue;
-                                    }
-                                    ++fileCount;
-                                }
-                                std::error_code tec;
-                                entry.mtimeNs = ToUnixNs(fs::last_write_time(absPath, tec));
-                                if (tec) {
-                                    entry.mtimeNs = 0;
-                                }
-                                entry.ctimeNs = entry.mtimeNs;
-                                enqueueManifest(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
-                                if (!entry.isDirectory && fileCount % 2048 == 0) {
-                                    std::vector<uint8_t> payload;
-                                    AppendU64(payload, static_cast<uint64_t>(fileCount));
-                                    enqueueManifest(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
-                                }
-                            }
-                            std::vector<uint8_t> payload;
-                            AppendU64(payload, static_cast<uint64_t>(fileCount));
-                            enqueueManifest(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
-                            enqueueManifest(Frame{MsgType::ManifestEnd, 0, {}});
+                            EnumerateManifestEntriesFast(options.rootDir, selfPath, done, enqueueManifest);
                         } catch (const std::exception& ex) {
                             failed.store(true);
                             done.store(true);
