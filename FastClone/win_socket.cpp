@@ -1,5 +1,6 @@
 #include "win_socket.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -148,6 +149,31 @@ void SendAll(const SocketHandle& socket, const void* data, size_t length) {
         }
         cursor += sent;
         remaining -= static_cast<size_t>(sent);
+    }
+}
+
+void SendBuffersAll(const SocketHandle& socket, const WSABUF* buffers, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    std::vector<WSABUF> pending(buffers, buffers + count);
+    size_t cursor = 0;
+    while (cursor < pending.size()) {
+        DWORD sent = 0;
+        const DWORD chunkCount = static_cast<DWORD>(std::min<size_t>(pending.size() - cursor, 1024));
+        const int rc = WSASend(socket.Get(), pending.data() + cursor, chunkCount, &sent, 0, nullptr, nullptr);
+        if (rc == SOCKET_ERROR) {
+            throw std::runtime_error(LastSocketError("WSASend failed"));
+        }
+        size_t consumed = static_cast<size_t>(sent);
+        while (cursor < pending.size() && consumed >= pending[cursor].len) {
+            consumed -= pending[cursor].len;
+            ++cursor;
+        }
+        if (cursor < pending.size() && consumed > 0) {
+            pending[cursor].buf += consumed;
+            pending[cursor].len -= static_cast<ULONG>(consumed);
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <WinSock2.h>
 #include <WS2tcpip.h>
@@ -42,6 +43,7 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port);
 SocketHandle CreateServer(uint16_t port);
 SocketHandle AcceptClient(const SocketHandle& listener);
 void SendAll(const SocketHandle& socket, const void* data, size_t length);
+void SendBuffersAll(const SocketHandle& socket, const WSABUF* buffers, size_t count);
 void RecvAll(const SocketHandle& socket, void* data, size_t length);
 
 }  // namespace fc

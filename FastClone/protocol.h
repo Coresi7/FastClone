@@ -37,6 +37,7 @@ struct Frame {
 };
 
 void SendFrame(const SocketHandle& socket, const Frame& frame);
+void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames);
 void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame);
 Frame RecvFrame(const SocketHandle& socket);
 

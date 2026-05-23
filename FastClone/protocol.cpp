@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -13,6 +14,21 @@ void Ensure(bool cond, const char* message) {
     if (!cond) {
         throw std::runtime_error(message);
     }
+}
+
+std::array<uint8_t, kHeaderSize> EncodeHeader(const Frame& frame) {
+    const uint32_t payloadLen = static_cast<uint32_t>(frame.payload.size());
+    std::array<uint8_t, kHeaderSize> header{};
+    header[0] = static_cast<uint8_t>(frame.type);
+    header[1] = static_cast<uint8_t>(frame.streamId & 0xFF);
+    header[2] = static_cast<uint8_t>((frame.streamId >> 8) & 0xFF);
+    header[3] = static_cast<uint8_t>((frame.streamId >> 16) & 0xFF);
+    header[4] = static_cast<uint8_t>((frame.streamId >> 24) & 0xFF);
+    header[5] = static_cast<uint8_t>(payloadLen & 0xFF);
+    header[6] = static_cast<uint8_t>((payloadLen >> 8) & 0xFF);
+    header[7] = static_cast<uint8_t>((payloadLen >> 16) & 0xFF);
+    header[8] = static_cast<uint8_t>((payloadLen >> 24) & 0xFF);
+    return header;
 }
 
 }  // namespace
@@ -35,9 +51,42 @@ void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame) {
 }
 
 void SendFrame(const SocketHandle& socket, const Frame& frame) {
-    std::vector<uint8_t> encoded;
-    AppendEncodedFrame(encoded, frame);
-    SendAll(socket, encoded.data(), encoded.size());
+    std::array<uint8_t, kHeaderSize> header = EncodeHeader(frame);
+    if (frame.payload.empty()) {
+        SendAll(socket, header.data(), header.size());
+        return;
+    }
+    std::array<WSABUF, 2> buffers{};
+    buffers[0].buf = reinterpret_cast<char*>(header.data());
+    buffers[0].len = static_cast<ULONG>(header.size());
+    buffers[1].buf = reinterpret_cast<char*>(const_cast<uint8_t*>(frame.payload.data()));
+    buffers[1].len = static_cast<ULONG>(frame.payload.size());
+    SendBuffersAll(socket, buffers.data(), buffers.size());
+}
+
+void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames) {
+    if (frames.empty()) {
+        return;
+    }
+    constexpr size_t kFrameChunk = 256;
+    for (size_t offset = 0; offset < frames.size(); offset += kFrameChunk) {
+        const size_t count = std::min<size_t>(kFrameChunk, frames.size() - offset);
+        std::vector<std::array<uint8_t, kHeaderSize>> headers;
+        headers.reserve(count);
+        std::vector<WSABUF> buffers;
+        buffers.reserve(count * 2);
+        for (size_t i = 0; i < count; ++i) {
+            const Frame& frame = frames[offset + i];
+            headers.push_back(EncodeHeader(frame));
+            buffers.push_back(WSABUF{static_cast<ULONG>(kHeaderSize),
+                                     reinterpret_cast<char*>(headers.back().data())});
+            if (!frame.payload.empty()) {
+                buffers.push_back(WSABUF{static_cast<ULONG>(frame.payload.size()),
+                                         reinterpret_cast<char*>(const_cast<uint8_t*>(frame.payload.data()))});
+            }
+        }
+        SendBuffersAll(socket, buffers.data(), buffers.size());
+    }
 }
 
 Frame RecvFrame(const SocketHandle& socket) {

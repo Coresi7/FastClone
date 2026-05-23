@@ -599,20 +599,20 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                                : static_cast<size_t>(effectiveChunkSize);
         while (!done.load()) {
             bool didWork = false;
-            std::vector<uint8_t> sendBatch;
-            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(effectiveChunkSize) * streamLimit));
+            std::vector<Frame> sendFrames;
+            sendFrames.reserve(std::max<size_t>(256, static_cast<size_t>(streamLimit) * 8));
             {
                 std::lock_guard<std::mutex> lock(mu);
                 size_t highBudget = 256;
                 while (!outboundHigh.empty() && highBudget > 0) {
-                    AppendEncodedFrame(sendBatch, outboundHigh.front());
+                    sendFrames.push_back(std::move(outboundHigh.front()));
                     outboundHigh.pop();
                     didWork = true;
                     --highBudget;
                 }
                 size_t manifestBudget = outboundHigh.empty() ? 8 : 0;
                 while (!outboundManifest.empty() && manifestBudget > 0) {
-                    AppendEncodedFrame(sendBatch, outboundManifest.front());
+                    sendFrames.push_back(std::move(outboundManifest.front()));
                     outboundManifest.pop();
                     outboundCv.notify_one();
                     didWork = true;
@@ -627,7 +627,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     ServerBatchStream& batch = it->second;
                     if (!batch.headerSent) {
-                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchOpen, it->first, EncodeFileBatchOpenResponse(batch.files)});
+                        sendFrames.push_back(Frame{MsgType::FileBatchOpen, it->first, EncodeFileBatchOpenResponse(batch.files)});
                         batch.headerSent = true;
                         didWork = true;
                     }
@@ -664,7 +664,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         burstBytes += static_cast<size_t>(got);
                         batchBytesSentThisRound += static_cast<size_t>(got);
                         batch.remainingBytes -= static_cast<uint64_t>(got);
-                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
+                        sendFrames.push_back(Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
                         didWork = true;
                         if (batch.remainingBytes == 0) {
                             batch.input.close();
@@ -680,7 +680,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         }
                     }
                     if (batchDone && !batch.input.is_open()) {
-                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchEnd, it->first, {}});
+                        sendFrames.push_back(Frame{MsgType::FileBatchEnd, it->first, {}});
                         it = activeBatchStreams.erase(it);
                         didWork = true;
                     } else {
@@ -698,11 +698,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         if (got > 0) {
                             chunk.resize(static_cast<size_t>(got));
                             burstBytes += static_cast<size_t>(got);
-                            AppendEncodedFrame(sendBatch, Frame{MsgType::FileChunk, it->first, std::move(chunk)});
+                            sendFrames.push_back(Frame{MsgType::FileChunk, it->first, std::move(chunk)});
                             didWork = true;
                         }
                         if (!it->second.input || got == 0) {
-                            AppendEncodedFrame(sendBatch, Frame{MsgType::FileEnd, it->first, {}});
+                            sendFrames.push_back(Frame{MsgType::FileEnd, it->first, {}});
                             it = activeStreams.erase(it);
                             streamClosed = true;
                             didWork = true;
@@ -713,8 +713,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                 }
             }
-            if (!sendBatch.empty()) {
-                SendAll(client, sendBatch.data(), sendBatch.size());
+            if (!sendFrames.empty()) {
+                SendFrameBatch(client, sendFrames);
             }
             if (debugEnabled) {
                 const auto now = std::chrono::steady_clock::now();
@@ -1256,25 +1256,25 @@ int RunClient(const CliOptions& options) {
     };
 
     auto dispatchHashRequests = [&]() {
-        std::vector<uint8_t> outboundBatch;
-        outboundBatch.reserve(256 * 1024);
+        std::vector<Frame> outboundFrames;
+        outboundFrames.reserve(256);
         while (!pendingHashRequests.empty() && (hashRequestsSent - hashResponsesReceived) < maxInFlightHashRequests) {
             const std::string rel = pendingHashRequests.front();
             pendingHashRequests.pop_front();
             ++hashRequestsSent;
-            AppendEncodedFrame(outboundBatch, Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
+            outboundFrames.push_back(Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
             {
                 std::lock_guard<std::mutex> lock(hashTaskMu);
                 hashTaskQueue.push_back(ClientHashTask{rel, JoinRel(options.rootDir, rel)});
             }
             hashTaskCv.notify_one();
-            if (outboundBatch.size() >= (1024 * 1024)) {
-                SendAll(socket, outboundBatch.data(), outboundBatch.size());
-                outboundBatch.clear();
+            if (outboundFrames.size() >= 256) {
+                SendFrameBatch(socket, outboundFrames);
+                outboundFrames.clear();
             }
         }
-        if (!outboundBatch.empty()) {
-            SendAll(socket, outboundBatch.data(), outboundBatch.size());
+        if (!outboundFrames.empty()) {
+            SendFrameBatch(socket, outboundFrames);
         }
     };
 
