@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="FastClone/FastClone.vcxproj" />
+  <Project Path="FastClone/FastClone.vcxproj" Id="6d4e0a99-a0c7-46f5-b71f-1e5d9bb1a13b" />
 </Solution>

@@ -472,16 +472,66 @@ std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8
 
 LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& exclude) {
     LocalState st;
-    const std::vector<FileEntry> all = BuildIndex(root, exclude);
-    for (const FileEntry& e : all) {
-        if (e.relativePath == ".") {
+    struct PendingDir {
+        std::wstring absDir;
+        std::string relDir;
+    };
+
+    const std::wstring rootW = root.wstring();
+    const std::wstring excludeW = exclude.has_value() ? exclude->wstring() : L"";
+    std::vector<PendingDir> stack;
+    stack.push_back(PendingDir{rootW, ""});
+
+    while (!stack.empty()) {
+        PendingDir current = std::move(stack.back());
+        stack.pop_back();
+
+        std::wstring pattern = current.absDir;
+        if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
+            pattern.push_back(L'\\');
+        }
+        pattern.append(L"*");
+
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileExW(
+            pattern.c_str(),
+            FindExInfoBasic,
+            &fd,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+        if (hFind == INVALID_HANDLE_VALUE) {
             continue;
         }
-        if (e.isDirectory) {
-            st.directories.insert(e.relativePath);
-        } else {
-            st.files.emplace(e.relativePath, e);
-        }
+
+        do {
+            const wchar_t* name = fd.cFileName;
+            if ((name[0] == L'.' && name[1] == L'\0') ||
+                (name[0] == L'.' && name[1] == L'.' && name[2] == L'\0')) {
+                continue;
+            }
+
+            std::wstring absPath = current.absDir;
+            if (!absPath.empty() && absPath.back() != L'\\' && absPath.back() != L'/') {
+                absPath.push_back(L'\\');
+            }
+            absPath.append(name);
+            if (!excludeW.empty() && _wcsicmp(absPath.c_str(), excludeW.c_str()) == 0) {
+                continue;
+            }
+
+            const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const std::string nameUtf8 = WideToUtf8(name);
+            const std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
+            if (isDir) {
+                st.directories.insert(relPath);
+                stack.push_back(PendingDir{absPath, relPath});
+            } else {
+                st.files.emplace(relPath, FileEntry{relPath, false, 0, 0, 0});
+            }
+        } while (FindNextFileW(hFind, &fd) != 0);
+
+        FindClose(hFind);
     }
     return st;
 }
@@ -1851,11 +1901,6 @@ int RunClient(const CliOptions& options) {
     compareTaskCv.notify_all();
     hashStop.store(true);
     hashTaskCv.notify_all();
-    recvStop.store(true);
-    shutdown(socket.Get(), SD_BOTH);
-    if (recvThread.joinable()) {
-        recvThread.join();
-    }
     for (auto& w : compareWorkers) {
         if (w.joinable()) {
             w.join();
@@ -1868,10 +1913,17 @@ int RunClient(const CliOptions& options) {
     }
     PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted, true);
 
+    std::cout << "Deleting obsoleted files (sync with server)..." << std::endl;
     deleted = RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath);
     compared += deleted;
+    std::cout << "Delete done, " << deleted << " files" << std::endl;
     PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted, true);
     SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
+    recvStop.store(true);
+    shutdown(socket.Get(), SD_BOTH);
+    if (recvThread.joinable()) {
+        recvThread.join();
+    }
     std::cout << "Sync completed. changed_files=" << transferred << std::endl;
     return 0;
 }
