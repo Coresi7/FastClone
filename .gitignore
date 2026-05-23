@@ -17,4 +17,4 @@ FastClone/FastClone/x64/
 *.log
 docs/
 .cursor/
-HARNESS-VERSION
+HARNESS_VERSION
