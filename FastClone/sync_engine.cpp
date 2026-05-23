@@ -11,6 +11,7 @@
 #include <chrono>
 #include <deque>
 #include <condition_variable>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,6 +28,20 @@ namespace fs = std::filesystem;
 namespace fc {
 
 namespace {
+
+bool IsDebugEnabled() {
+    static const bool enabled = []() {
+        char value[16] = {};
+        const DWORD len = GetEnvironmentVariableA("FASTCLONE_DEBUG", value, static_cast<DWORD>(sizeof(value)));
+        if (len == 0) {
+            return false;
+        }
+        std::string v(value, value + std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1)));
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v == "1" || v == "true" || v == "yes" || v == "on";
+    }();
+    return enabled;
+}
 
 struct ServerStream {
     std::ifstream input;
@@ -254,6 +269,7 @@ std::optional<fs::path> CurrentExePath() {
 void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
+    const bool debugEnabled = IsDebugEnabled();
 
     std::unordered_map<uint32_t, ServerStream> activeStreams;
     std::mutex mu;
@@ -412,6 +428,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     });
 
     try {
+        auto lastDebugPrint = std::chrono::steady_clock::now();
         while (!done.load()) {
             bool didWork = false;
             {
@@ -447,6 +464,31 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     } else {
                         ++it;
                     }
+                }
+            }
+            if (debugEnabled) {
+                const auto now = std::chrono::steady_clock::now();
+                if ((now - lastDebugPrint) >= std::chrono::seconds(1)) {
+                    size_t highQueued = 0;
+                    size_t manifestQueued = 0;
+                    size_t activeStreamCount = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        highQueued = outboundHigh.size();
+                        manifestQueued = outboundManifest.size();
+                        activeStreamCount = activeStreams.size();
+                    }
+                    size_t pendingHashes = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(hashMu);
+                        pendingHashes = hashTasks.size();
+                    }
+                    std::cerr << "[debug][server] queued_high=" << highQueued
+                              << " queued_manifest=" << manifestQueued
+                              << " pending_hash_tasks=" << pendingHashes
+                              << " active_streams=" << activeStreamCount
+                              << std::endl;
+                    lastDebugPrint = now;
                 }
             }
             if (!didWork) {
@@ -631,6 +673,7 @@ int RunServer(const CliOptions& options) {
 
 int RunClient(const CliOptions& options) {
     WsaContext wsa;
+    const bool debugEnabled = IsDebugEnabled();
     std::error_code ec;
     fs::create_directories(options.rootDir, ec);
 
@@ -660,6 +703,8 @@ int RunClient(const CliOptions& options) {
     std::unordered_set<std::string> hashRequested;
     std::deque<std::string> pendingHashRequests;
     std::unordered_set<std::string> localHashFailed;
+    std::mutex fallbackReadyMu;
+    std::deque<std::string> fallbackReadyQueue;
     struct CompareTask {
         FileEntry remote;
     };
@@ -700,11 +745,19 @@ int RunClient(const CliOptions& options) {
                 }
                 try {
                     Hash256 hash = ComputeFileSha256(task.absPath);
-                    std::lock_guard<std::mutex> lock(hashResultMu);
-                    localHashes[task.relPath] = hash;
+                    {
+                        std::lock_guard<std::mutex> lock(hashResultMu);
+                        localHashes[task.relPath] = hash;
+                    }
                 } catch (...) {
-                    std::lock_guard<std::mutex> lock(hashResultMu);
-                    localHashFailed.insert(task.relPath);
+                    {
+                        std::lock_guard<std::mutex> lock(hashResultMu);
+                        localHashFailed.insert(task.relPath);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(fallbackReadyMu);
+                    fallbackReadyQueue.push_back(task.relPath);
                 }
             }
         });
@@ -861,36 +914,34 @@ int RunClient(const CliOptions& options) {
     };
 
     auto resolveFallbackIfReady = [&]() {
-        std::vector<std::string> ready;
+        std::deque<std::string> readyCandidates;
         {
-            std::lock_guard<std::mutex> lock(hashResultMu);
-            for (const auto& kv : remoteHashes) {
-                const std::string& rel = kv.first;
-                if (hashResolved.contains(rel)) {
-                    continue;
-                }
-                if (!localHashes.contains(rel) && !localHashFailed.contains(rel)) {
-                    continue;
-                }
-                ready.push_back(rel);
-            }
+            std::lock_guard<std::mutex> lock(fallbackReadyMu);
+            readyCandidates.swap(fallbackReadyQueue);
         }
-        for (const std::string& rel : ready) {
+        for (const std::string& rel : readyCandidates) {
             if (hashResolved.contains(rel)) {
                 continue;
             }
             Hash256 localHash{};
             Hash256 remoteHash{};
+            bool remoteHashReady = false;
             bool localHashReady = false;
             bool localFailed = false;
             {
                 std::lock_guard<std::mutex> lock(hashResultMu);
+                remoteHashReady = remoteHashes.contains(rel);
+                if (remoteHashReady) {
+                    remoteHash = remoteHashes.at(rel);
+                }
                 localHashReady = localHashes.contains(rel);
                 localFailed = localHashFailed.contains(rel);
                 if (localHashReady) {
                     localHash = localHashes.at(rel);
                 }
-                remoteHash = remoteHashes.at(rel);
+            }
+            if (!remoteHashReady || (!localHashReady && !localFailed)) {
+                continue;
             }
             if (localFailed || !localHashReady || !HashEquals(localHash, remoteHash)) {
                 scheduleTransfer(rel);
@@ -906,7 +957,88 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    auto processIncomingFrame = [&](Frame& frame) {
+        if (frame.type == MsgType::ManifestEntry) {
+            FileEntry e = DecodeManifestEntry(frame.payload);
+            if (e.isDirectory) {
+                remoteDirs.insert(e.relativePath);
+                std::error_code mkec;
+                fs::create_directories(JoinRel(options.rootDir, e.relativePath), mkec);
+                return;
+            }
+            remoteFiles[e.relativePath] = e;
+            ++enumerated;
+            if ((compareTasksIssued.load() - compareResultsHandled.load()) >= maxInFlightCompareTasks) {
+                delayedCompareEntries.push_back(e);
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(compareTaskMu);
+                    compareTasks.push_back(CompareTask{e});
+                }
+                ++compareTasksIssued;
+                compareTaskCv.notify_one();
+            }
+            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+        } else if (frame.type == MsgType::ManifestProgress) {
+            size_t cursor = 0;
+            const uint64_t serverEnumerated = ReadU64(frame.payload, cursor);
+            if (serverEnumerated > enumerated) {
+                enumerated = static_cast<size_t>(serverEnumerated);
+            }
+        } else if (frame.type == MsgType::ManifestEnd) {
+            manifestDone = true;
+        } else if (frame.type == MsgType::HashResponse) {
+            auto value = DecodeHashResponse(frame.payload);
+            {
+                std::lock_guard<std::mutex> lock(hashResultMu);
+                remoteHashes[value.first] = value.second;
+            }
+            {
+                std::lock_guard<std::mutex> lock(fallbackReadyMu);
+                fallbackReadyQueue.push_back(value.first);
+            }
+            ++hashResponsesReceived;
+        } else if (frame.type == MsgType::FileChunk) {
+            auto it = activeDownloads.find(frame.streamId);
+            if (it == activeDownloads.end()) {
+                throw std::runtime_error("Received chunk for unknown stream");
+            }
+            it->second.output.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
+        } else if (frame.type == MsgType::FileEnd) {
+            auto it = activeDownloads.find(frame.streamId);
+            if (it == activeDownloads.end()) {
+                throw std::runtime_error("Received end for unknown stream");
+            }
+            it->second.output.flush();
+            it->second.output.close();
+            const std::string rel = it->second.relPath;
+            const FileEntry& meta = remoteFiles.at(rel);
+            SetFileCreateAndModifyTime(JoinRel(options.rootDir, rel), meta.ctimeNs, meta.mtimeNs);
+            activeDownloads.erase(it);
+            streamToPath.erase(frame.streamId);
+            ++compared;
+            ++transferred;
+            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+        } else if (frame.type == MsgType::FileError) {
+            auto itPath = streamToPath.find(frame.streamId);
+            auto itDl = activeDownloads.find(frame.streamId);
+            if (itDl != activeDownloads.end()) {
+                itDl->second.output.close();
+                activeDownloads.erase(itDl);
+            }
+            if (itPath != streamToPath.end()) {
+                streamToPath.erase(itPath);
+            }
+            ++compared;
+            ++skipped;
+            PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+        } else {
+            throw std::runtime_error("Unexpected frame in client stream loop");
+        }
+    };
+
     try {
+        auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
             resolveFallbackIfReady();
             dispatchHashRequests();
@@ -935,6 +1067,51 @@ int RunClient(const CliOptions& options) {
             }
             dispatchHashRequests();
 
+            if (debugEnabled) {
+                const auto now = std::chrono::steady_clock::now();
+                if ((now - lastDebugPrint) >= std::chrono::seconds(1)) {
+                    size_t readyCompareResults = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(compareResultMu);
+                        readyCompareResults = compareResults.size();
+                    }
+                    size_t queuedCompareTasks = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(compareTaskMu);
+                        queuedCompareTasks = compareTasks.size();
+                    }
+                    size_t queuedIncomingFrames = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(incomingMu);
+                        queuedIncomingFrames = incomingFrames.size();
+                    }
+                    size_t queuedHashTasks = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(hashTaskMu);
+                        queuedHashTasks = hashTaskQueue.size();
+                    }
+                    const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
+                    const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
+                    std::cerr << "[debug][client] enum=" << enumerated
+                              << " compared=" << compared
+                              << " skipped=" << skipped
+                              << " transferred=" << transferred
+                              << " in_flight_hash=" << hashInflight
+                              << " pending_hash_req=" << pendingHashRequests.size()
+                              << " pending_hash_local=" << queuedHashTasks
+                              << " in_flight_compare=" << compareInflight
+                              << " queued_compare_tasks=" << queuedCompareTasks
+                              << " ready_compare_results=" << readyCompareResults
+                              << " delayed_compare_entries=" << delayedCompareEntries.size()
+                              << " queued_incoming_frames=" << queuedIncomingFrames
+                              << " pending_transfers=" << pendingTransfers.size()
+                              << " active_downloads=" << activeDownloads.size()
+                              << " fallback_open=" << (fallbackCount - fallbackResolved)
+                              << std::endl;
+                    lastDebugPrint = now;
+                }
+            }
+
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
             if (manifestDone && allCompareDone && pendingTransfers.empty() && activeDownloads.empty() && allHashDone) {
@@ -945,96 +1122,24 @@ int RunClient(const CliOptions& options) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            Frame frame;
-            bool haveFrame = false;
+            std::deque<Frame> readyFrames;
             {
                 std::lock_guard<std::mutex> lock(incomingMu);
-                if (!incomingFrames.empty()) {
-                    frame = std::move(incomingFrames.front());
+                const size_t budget = std::min<size_t>(incomingFrames.size(), 512);
+                for (size_t i = 0; i < budget; ++i) {
+                    readyFrames.push_back(std::move(incomingFrames.front()));
                     incomingFrames.pop_front();
-                    haveFrame = true;
                 }
             }
-            if (!haveFrame) {
+            if (readyFrames.empty()) {
                 if (recvClosed.load()) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            if (frame.type == MsgType::ManifestEntry) {
-                FileEntry e = DecodeManifestEntry(frame.payload);
-                if (e.isDirectory) {
-                    remoteDirs.insert(e.relativePath);
-                    std::error_code mkec;
-                    fs::create_directories(JoinRel(options.rootDir, e.relativePath), mkec);
-                    continue;
-                }
-                remoteFiles[e.relativePath] = e;
-                ++enumerated;
-                if ((compareTasksIssued.load() - compareResultsHandled.load()) >= maxInFlightCompareTasks) {
-                    delayedCompareEntries.push_back(e);
-                } else {
-                    {
-                        std::lock_guard<std::mutex> lock(compareTaskMu);
-                        compareTasks.push_back(CompareTask{e});
-                    }
-                    ++compareTasksIssued;
-                    compareTaskCv.notify_one();
-                }
-                PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
-            } else if (frame.type == MsgType::ManifestProgress) {
-                size_t cursor = 0;
-                const uint64_t serverEnumerated = ReadU64(frame.payload, cursor);
-                if (serverEnumerated > enumerated) {
-                    enumerated = static_cast<size_t>(serverEnumerated);
-                }
-            } else if (frame.type == MsgType::ManifestEnd) {
-                manifestDone = true;
-            } else if (frame.type == MsgType::HashResponse) {
-                auto value = DecodeHashResponse(frame.payload);
-                {
-                    std::lock_guard<std::mutex> lock(hashResultMu);
-                    remoteHashes[value.first] = value.second;
-                }
-                ++hashResponsesReceived;
-            } else if (frame.type == MsgType::FileChunk) {
-                auto it = activeDownloads.find(frame.streamId);
-                if (it == activeDownloads.end()) {
-                    throw std::runtime_error("Received chunk for unknown stream");
-                }
-                it->second.output.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
-            } else if (frame.type == MsgType::FileEnd) {
-                auto it = activeDownloads.find(frame.streamId);
-                if (it == activeDownloads.end()) {
-                    throw std::runtime_error("Received end for unknown stream");
-                }
-                it->second.output.flush();
-                it->second.output.close();
-                const std::string rel = it->second.relPath;
-                const FileEntry& meta = remoteFiles.at(rel);
-                SetFileCreateAndModifyTime(JoinRel(options.rootDir, rel), meta.ctimeNs, meta.mtimeNs);
-                activeDownloads.erase(it);
-                streamToPath.erase(frame.streamId);
-                ++compared;
-                ++transferred;
-                PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
-            } else if (frame.type == MsgType::FileError) {
-                auto itPath = streamToPath.find(frame.streamId);
-                auto itDl = activeDownloads.find(frame.streamId);
-                if (itDl != activeDownloads.end()) {
-                    itDl->second.output.close();
-                    activeDownloads.erase(itDl);
-                }
-                if (itPath != streamToPath.end()) {
-                    streamToPath.erase(itPath);
-                }
-                ++compared;
-                ++skipped;
-                PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
-                continue;
-            } else {
-                throw std::runtime_error("Unexpected frame in client stream loop");
+            for (auto& frame : readyFrames) {
+                processIncomingFrame(frame);
             }
         }
     } catch (...) {
