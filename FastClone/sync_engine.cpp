@@ -48,6 +48,23 @@ struct ServerStream {
     std::string relativePath;
 };
 
+struct BatchFileRecord {
+    std::string relativePath;
+    uint64_t fileSize = 0;
+    int64_t mtimeNs = 0;
+    int64_t ctimeNs = 0;
+    bool ok = false;
+    fs::path absPath;
+};
+
+struct ServerBatchStream {
+    std::vector<BatchFileRecord> files;
+    size_t index = 0;
+    bool headerSent = false;
+    std::ifstream input;
+    uint64_t remainingBytes = 0;
+};
+
 struct LocalState {
     std::unordered_map<std::string, FileEntry> files;
     std::unordered_set<std::string> directories;
@@ -259,6 +276,65 @@ std::string DecodeFileOpen(const std::vector<uint8_t>& payload) {
     return ReadString(payload, cursor);
 }
 
+std::vector<uint8_t> EncodeFileBatchRequest(const std::vector<std::string>& relPaths) {
+    if (relPaths.size() > UINT16_MAX) {
+        throw std::runtime_error("Batch request too large");
+    }
+    std::vector<uint8_t> payload;
+    AppendU16(payload, static_cast<uint16_t>(relPaths.size()));
+    for (const std::string& rel : relPaths) {
+        AppendString(payload, rel);
+    }
+    return payload;
+}
+
+std::vector<std::string> DecodeFileBatchRequest(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    const uint16_t count = ReadU16(payload, cursor);
+    std::vector<std::string> relPaths;
+    relPaths.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        relPaths.push_back(ReadString(payload, cursor));
+    }
+    return relPaths;
+}
+
+std::vector<uint8_t> EncodeFileBatchOpenResponse(const std::vector<BatchFileRecord>& files) {
+    if (files.size() > UINT16_MAX) {
+        throw std::runtime_error("Batch response too large");
+    }
+    std::vector<uint8_t> payload;
+    AppendU16(payload, static_cast<uint16_t>(files.size()));
+    for (const auto& file : files) {
+        payload.push_back(file.ok ? 1 : 0);
+        AppendString(payload, file.relativePath);
+        AppendU64(payload, file.fileSize);
+        AppendI64(payload, file.mtimeNs);
+        AppendI64(payload, file.ctimeNs);
+    }
+    return payload;
+}
+
+std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    const uint16_t count = ReadU16(payload, cursor);
+    std::vector<BatchFileRecord> files;
+    files.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (cursor >= payload.size()) {
+            throw std::runtime_error("Batch open response invalid");
+        }
+        BatchFileRecord file;
+        file.ok = payload[cursor++] != 0;
+        file.relativePath = ReadString(payload, cursor);
+        file.fileSize = ReadU64(payload, cursor);
+        file.mtimeNs = ReadI64(payload, cursor);
+        file.ctimeNs = ReadI64(payload, cursor);
+        files.push_back(std::move(file));
+    }
+    return files;
+}
+
 LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& exclude) {
     LocalState st;
     const std::vector<FileEntry> all = BuildIndex(root, exclude);
@@ -328,6 +404,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
 
     std::unordered_map<uint32_t, ServerStream> activeStreams;
+    std::unordered_map<uint32_t, ServerBatchStream> activeBatchStreams;
     std::mutex mu;
     std::condition_variable outboundCv;
     std::mutex hashMu;
@@ -469,6 +546,35 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         activeStreams.emplace(frame.streamId, std::move(st));
                     }
                     outboundCv.notify_one();
+                } else if (frame.type == MsgType::FileBatchOpen) {
+                    std::vector<std::string> relPaths = DecodeFileBatchRequest(frame.payload);
+                    ServerBatchStream batch;
+                    batch.files.reserve(relPaths.size());
+                    for (const std::string& rel : relPaths) {
+                        BatchFileRecord record;
+                        record.relativePath = rel;
+                        record.absPath = JoinRel(options.rootDir, rel);
+                        std::error_code ec;
+                        if (fs::exists(record.absPath, ec) && !ec &&
+                            fs::is_regular_file(record.absPath, ec) && !ec) {
+                            record.fileSize = static_cast<uint64_t>(fs::file_size(record.absPath, ec));
+                            if (!ec) {
+                                std::error_code tec;
+                                record.mtimeNs = ToUnixNs(fs::last_write_time(record.absPath, tec));
+                                if (tec) {
+                                    record.mtimeNs = 0;
+                                }
+                                record.ctimeNs = record.mtimeNs;
+                                record.ok = true;
+                            }
+                        }
+                        batch.files.push_back(std::move(record));
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        activeBatchStreams.emplace(frame.streamId, std::move(batch));
+                    }
+                    outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
                     done.store(true);
                     hashCv.notify_all();
@@ -512,6 +618,69 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     didWork = true;
                     --manifestBudget;
                 }
+                for (auto it = activeBatchStreams.begin(); it != activeBatchStreams.end();) {
+                    ServerBatchStream& batch = it->second;
+                    if (!batch.headerSent) {
+                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchOpen, it->first, EncodeFileBatchOpenResponse(batch.files)});
+                        batch.headerSent = true;
+                        didWork = true;
+                    }
+
+                    size_t burstBytes = 0;
+                    while (burstBytes < perStreamBurstBytes) {
+                        while (batch.index < batch.files.size() && !batch.files[batch.index].ok) {
+                            ++batch.index;
+                        }
+                        if (batch.index >= batch.files.size()) {
+                            break;
+                        }
+                        BatchFileRecord& file = batch.files[batch.index];
+                        if (!batch.input.is_open()) {
+                            batch.input.open(file.absPath, std::ios::binary);
+                            if (!batch.input) {
+                                throw std::runtime_error("Cannot open batch file for read: " + file.relativePath);
+                            }
+                            batch.remainingBytes = file.fileSize;
+                            if (batch.remainingBytes == 0) {
+                                batch.input.close();
+                                ++batch.index;
+                                continue;
+                            }
+                        }
+                        const uint64_t toRead = std::min<uint64_t>(batch.remainingBytes, static_cast<uint64_t>(effectiveChunkSize));
+                        std::vector<uint8_t> chunk(static_cast<size_t>(toRead));
+                        batch.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                        const std::streamsize got = batch.input.gcount();
+                        if (got <= 0) {
+                            throw std::runtime_error("Failed while reading batch file: " + file.relativePath);
+                        }
+                        chunk.resize(static_cast<size_t>(got));
+                        burstBytes += static_cast<size_t>(got);
+                        batch.remainingBytes -= static_cast<uint64_t>(got);
+                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
+                        didWork = true;
+                        if (batch.remainingBytes == 0) {
+                            batch.input.close();
+                            ++batch.index;
+                        }
+                    }
+
+                    bool batchDone = true;
+                    for (size_t idx = batch.index; idx < batch.files.size(); ++idx) {
+                        if (batch.files[idx].ok) {
+                            batchDone = false;
+                            break;
+                        }
+                    }
+                    if (batchDone && !batch.input.is_open()) {
+                        AppendEncodedFrame(sendBatch, Frame{MsgType::FileBatchEnd, it->first, {}});
+                        it = activeBatchStreams.erase(it);
+                        didWork = true;
+                    } else {
+                        ++it;
+                    }
+                }
+
                 for (auto it = activeStreams.begin(); it != activeStreams.end();) {
                     size_t burstBytes = 0;
                     bool streamClosed = false;
@@ -546,11 +715,13 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     size_t highQueued = 0;
                     size_t manifestQueued = 0;
                     size_t activeStreamCount = 0;
+                    size_t activeBatchCount = 0;
                     {
                         std::lock_guard<std::mutex> lock(mu);
                         highQueued = outboundHigh.size();
                         manifestQueued = outboundManifest.size();
                         activeStreamCount = activeStreams.size();
+                        activeBatchCount = activeBatchStreams.size();
                     }
                     size_t pendingHashes = 0;
                     {
@@ -561,6 +732,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                               << " queued_manifest=" << manifestQueued
                               << " pending_hash_tasks=" << pendingHashes
                               << " active_streams=" << activeStreamCount
+                              << " active_batches=" << activeBatchCount
                               << std::endl;
                     lastDebugPrint = now;
                 }
@@ -568,7 +740,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
             if (!didWork) {
                 std::unique_lock<std::mutex> lock(mu);
                 outboundCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
-                    return done.load() || !outboundHigh.empty() || !outboundManifest.empty() || !activeStreams.empty();
+                    return done.load() || !outboundHigh.empty() || !outboundManifest.empty() || !activeStreams.empty() || !activeBatchStreams.empty();
                 });
             }
         }
@@ -602,6 +774,24 @@ struct DownloadState {
     std::string relPath;
     std::vector<uint8_t> writeBuffer;
     size_t flushThreshold = 0;
+};
+
+struct BatchDownloadEntry {
+    std::string relPath;
+    uint64_t fileSize = 0;
+    int64_t mtimeNs = 0;
+    int64_t ctimeNs = 0;
+    bool serverOk = false;
+    bool shouldWrite = false;
+    bool finalized = false;
+    uint64_t received = 0;
+    std::ofstream output;
+};
+
+struct BatchDownloadState {
+    bool headerReady = false;
+    std::vector<BatchDownloadEntry> entries;
+    size_t currentIndex = 0;
 };
 
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit) {
@@ -827,8 +1017,10 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<std::string, FileEntry> remoteFiles;
     std::unordered_set<std::string> remoteDirs;
     std::unordered_map<uint32_t, DownloadState> activeDownloads;
+    std::unordered_map<uint32_t, BatchDownloadState> activeBatchDownloads;
     std::unordered_map<uint32_t, std::string> streamToPath;
-    std::queue<std::pair<uint32_t, std::string>> pendingTransfers;
+    std::deque<std::string> pendingTransfers;
+    std::deque<std::string> pendingBatchTransfers;
     std::unordered_set<std::string> scheduledTransfers;
 
     std::unordered_map<std::string, Hash256> remoteHashes;
@@ -942,9 +1134,18 @@ int RunClient(const CliOptions& options) {
         }
     });
 
+    const uint64_t smallFileBatchThreshold = 128 * 1024;
+    const size_t smallBatchMaxFiles = 256;
+    const size_t smallBatchMaxBytes = 8 * 1024 * 1024;
     auto scheduleTransfer = [&](const std::string& rel) {
-        if (scheduledTransfers.insert(rel).second) {
-            pendingTransfers.push({nextStreamId++, rel});
+        if (!scheduledTransfers.insert(rel).second) {
+            return;
+        }
+        const auto it = remoteFiles.find(rel);
+        if (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold) {
+            pendingBatchTransfers.push_back(rel);
+        } else {
+            pendingTransfers.push_back(rel);
         }
     };
 
@@ -1041,25 +1242,59 @@ int RunClient(const CliOptions& options) {
     };
 
     auto tryStartTransfers = [&]() {
-        while (!pendingTransfers.empty() && activeDownloads.size() < streamLimit) {
-            auto [sid, rel] = pendingTransfers.front();
-            pendingTransfers.pop();
-            const fs::path abs = JoinRel(options.rootDir, rel);
-            EnsureParentDir(abs);
-            DownloadState d;
-            d.relPath = rel;
-            d.output.open(abs, std::ios::binary | std::ios::trunc);
-            if (!d.output) {
-                ++compared;
-                ++skipped;
-                PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
-                continue;
+        auto activeTransferSlots = [&]() -> size_t {
+            return activeDownloads.size() + activeBatchDownloads.size();
+        };
+        while (activeTransferSlots() < streamLimit) {
+            bool started = false;
+            if (!pendingBatchTransfers.empty()) {
+                std::vector<std::string> batchPaths;
+                batchPaths.reserve(smallBatchMaxFiles);
+                size_t batchBytes = 0;
+                while (!pendingBatchTransfers.empty() && batchPaths.size() < smallBatchMaxFiles && batchBytes < smallBatchMaxBytes) {
+                    const std::string rel = pendingBatchTransfers.front();
+                    pendingBatchTransfers.pop_front();
+                    batchPaths.push_back(rel);
+                    const auto it = remoteFiles.find(rel);
+                    if (it != remoteFiles.end()) {
+                        batchBytes += static_cast<size_t>(it->second.fileSize);
+                    }
+                    if (batchBytes >= smallBatchMaxBytes) {
+                        break;
+                    }
+                }
+                if (!batchPaths.empty()) {
+                    const uint32_t sid = nextStreamId++;
+                    BatchDownloadState batchState;
+                    activeBatchDownloads.emplace(sid, std::move(batchState));
+                    SendFrame(socket, Frame{MsgType::FileBatchOpen, sid, EncodeFileBatchRequest(batchPaths)});
+                    started = true;
+                }
+            } else if (!pendingTransfers.empty()) {
+                const std::string rel = pendingTransfers.front();
+                pendingTransfers.pop_front();
+                const fs::path abs = JoinRel(options.rootDir, rel);
+                EnsureParentDir(abs);
+                DownloadState d;
+                d.relPath = rel;
+                d.output.open(abs, std::ios::binary | std::ios::trunc);
+                if (!d.output) {
+                    ++compared;
+                    ++skipped;
+                    PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
+                } else {
+                    const uint32_t sid = nextStreamId++;
+                    d.flushThreshold = downloadFlushThreshold;
+                    d.writeBuffer.reserve(d.flushThreshold);
+                    activeDownloads.emplace(sid, std::move(d));
+                    streamToPath.emplace(sid, rel);
+                    SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
+                }
+                started = true;
             }
-            d.flushThreshold = downloadFlushThreshold;
-            d.writeBuffer.reserve(d.flushThreshold);
-            activeDownloads.emplace(sid, std::move(d));
-            streamToPath.emplace(sid, rel);
-            SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
+            if (!started) {
+                break;
+            }
         }
     };
 
@@ -1069,6 +1304,29 @@ int RunClient(const CliOptions& options) {
         }
         d.output.write(reinterpret_cast<const char*>(d.writeBuffer.data()), static_cast<std::streamsize>(d.writeBuffer.size()));
         d.writeBuffer.clear();
+    };
+
+    auto finalizeBatchEntry = [&](BatchDownloadEntry& entry) {
+        if (entry.finalized) {
+            return;
+        }
+        if (entry.shouldWrite) {
+            if (entry.output.is_open()) {
+                entry.output.flush();
+                entry.output.close();
+            }
+            SetFileCreateAndModifyTime(JoinRel(options.rootDir, entry.relPath), entry.ctimeNs, entry.mtimeNs);
+            ++compared;
+            ++transferred;
+        } else {
+            if (entry.output.is_open()) {
+                entry.output.close();
+            }
+            ++compared;
+            ++skipped;
+        }
+        entry.finalized = true;
+        PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
     };
 
     auto resolveFallbackIfReady = [&]() {
@@ -1156,6 +1414,93 @@ int RunClient(const CliOptions& options) {
                 fallbackReadyQueue.push_back(value.first);
             }
             ++hashResponsesReceived;
+        } else if (frame.type == MsgType::FileBatchOpen) {
+            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            if (itBatch == activeBatchDownloads.end()) {
+                throw std::runtime_error("Received batch open for unknown stream");
+            }
+            BatchDownloadState& batch = itBatch->second;
+            batch.entries.clear();
+            batch.currentIndex = 0;
+            std::vector<BatchFileRecord> response = DecodeFileBatchOpenResponse(frame.payload);
+            batch.entries.reserve(response.size());
+            for (auto& rec : response) {
+                BatchDownloadEntry entry;
+                entry.relPath = rec.relativePath;
+                entry.fileSize = rec.fileSize;
+                entry.mtimeNs = rec.mtimeNs;
+                entry.ctimeNs = rec.ctimeNs;
+                entry.serverOk = rec.ok;
+                entry.shouldWrite = false;
+                if (entry.serverOk) {
+                    const fs::path abs = JoinRel(options.rootDir, entry.relPath);
+                    EnsureParentDir(abs);
+                    entry.output.open(abs, std::ios::binary | std::ios::trunc);
+                    entry.shouldWrite = entry.output.good();
+                }
+                if (!entry.serverOk || (entry.fileSize == 0 && entry.serverOk)) {
+                    finalizeBatchEntry(entry);
+                }
+                batch.entries.push_back(std::move(entry));
+            }
+            while (batch.currentIndex < batch.entries.size() &&
+                   (batch.entries[batch.currentIndex].finalized || batch.entries[batch.currentIndex].fileSize == 0)) {
+                ++batch.currentIndex;
+            }
+            batch.headerReady = true;
+        } else if (frame.type == MsgType::FileBatchChunk) {
+            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            if (itBatch == activeBatchDownloads.end()) {
+                throw std::runtime_error("Received batch chunk for unknown stream");
+            }
+            BatchDownloadState& batch = itBatch->second;
+            if (!batch.headerReady) {
+                throw std::runtime_error("Received batch chunk before batch open");
+            }
+            size_t offset = 0;
+            while (offset < frame.payload.size()) {
+                while (batch.currentIndex < batch.entries.size() &&
+                       (batch.entries[batch.currentIndex].finalized || batch.entries[batch.currentIndex].fileSize == 0 ||
+                        batch.entries[batch.currentIndex].received >= batch.entries[batch.currentIndex].fileSize)) {
+                    if (batch.currentIndex < batch.entries.size() &&
+                        !batch.entries[batch.currentIndex].finalized &&
+                        batch.entries[batch.currentIndex].received >= batch.entries[batch.currentIndex].fileSize) {
+                        finalizeBatchEntry(batch.entries[batch.currentIndex]);
+                    }
+                    ++batch.currentIndex;
+                }
+                if (batch.currentIndex >= batch.entries.size()) {
+                    break;
+                }
+                BatchDownloadEntry& entry = batch.entries[batch.currentIndex];
+                const uint64_t remainingForEntry = entry.fileSize - entry.received;
+                const size_t available = frame.payload.size() - offset;
+                const size_t take = static_cast<size_t>(std::min<uint64_t>(remainingForEntry, static_cast<uint64_t>(available)));
+                if (entry.shouldWrite) {
+                    entry.output.write(reinterpret_cast<const char*>(frame.payload.data() + offset), static_cast<std::streamsize>(take));
+                }
+                entry.received += take;
+                offset += take;
+                if (entry.received >= entry.fileSize) {
+                    finalizeBatchEntry(entry);
+                    ++batch.currentIndex;
+                }
+            }
+        } else if (frame.type == MsgType::FileBatchEnd) {
+            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            if (itBatch == activeBatchDownloads.end()) {
+                throw std::runtime_error("Received batch end for unknown stream");
+            }
+            BatchDownloadState& batch = itBatch->second;
+            for (auto& entry : batch.entries) {
+                if (!entry.finalized) {
+                    if (entry.received < entry.fileSize) {
+                        entry.shouldWrite = false;
+                    }
+                    finalizeBatchEntry(entry);
+                }
+            }
+            activeBatchDownloads.erase(itBatch);
         } else if (frame.type == MsgType::FileChunk) {
             auto it = activeDownloads.find(frame.streamId);
             if (it == activeDownloads.end()) {
@@ -1183,6 +1528,17 @@ int RunClient(const CliOptions& options) {
             ++transferred;
             PrintClientCounters(enumerated, compared, skipped, transferred, deleted, lastEnum, lastCompared, lastSkipped, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::FileError) {
+            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            if (itBatch != activeBatchDownloads.end()) {
+                for (auto& entry : itBatch->second.entries) {
+                    if (!entry.finalized) {
+                        entry.shouldWrite = false;
+                        finalizeBatchEntry(entry);
+                    }
+                }
+                activeBatchDownloads.erase(itBatch);
+                return;
+            }
             auto itPath = streamToPath.find(frame.streamId);
             auto itDl = activeDownloads.find(frame.streamId);
             if (itDl != activeDownloads.end()) {
@@ -1268,8 +1624,9 @@ int RunClient(const CliOptions& options) {
                               << " ready_compare_results=" << readyCompareResults
                               << " delayed_compare_entries=" << delayedCompareEntries.size()
                               << " queued_incoming_frames=" << queuedIncomingFrames
-                              << " pending_transfers=" << pendingTransfers.size()
+                              << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size())
                               << " active_downloads=" << activeDownloads.size()
+                              << " active_batches=" << activeBatchDownloads.size()
                               << " fallback_open=" << (fallbackCount - fallbackResolved)
                               << std::endl;
                     lastDebugPrint = now;
@@ -1278,10 +1635,12 @@ int RunClient(const CliOptions& options) {
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
-            if (manifestDone && allCompareDone && pendingTransfers.empty() && activeDownloads.empty() && allHashDone) {
+            if (manifestDone && allCompareDone && pendingTransfers.empty() && pendingBatchTransfers.empty() &&
+                activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone) {
                 break;
             }
-            const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || (hashResponsesReceived < hashRequestsSent);
+            const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
+                                          (hashResponsesReceived < hashRequestsSent);
             if (!needNetworkFrame) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;

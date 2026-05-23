@@ -23,6 +23,9 @@ enum class MsgType : uint8_t {
     FileChunk = 31,
     FileEnd = 32,
     FileError = 33,
+    FileBatchOpen = 34,
+    FileBatchChunk = 35,
+    FileBatchEnd = 36,
     SyncDone = 40,
     Error = 255
 };
