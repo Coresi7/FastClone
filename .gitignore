@@ -16,3 +16,5 @@ FastClone/FastClone/x64/
 *.recipe
 *.log
 docs/
+.cursor/
+HARNESS-VERSION
