@@ -18,6 +18,8 @@ struct CliOptions {
     std::string password;
     uint32_t streamLimit = 16;
     uint32_t chunkSize = 256 * 1024;
+    bool streamAutoTune = true;
+    bool chunkAutoTune = true;
 };
 
 CliOptions ParseCli(int argc, wchar_t** argv);

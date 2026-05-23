@@ -39,7 +39,8 @@ void PrintUsage() {
     std::cerr
         << "Usage:\n"
         << "  fastclone server [--dir <path>] [--port <n>] --password <pwd>\n"
-        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]\n";
+        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]\n"
+        << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
 }
 
 std::pair<std::string, uint16_t> ParseHostPort(const std::wstring& input, uint16_t defaultPort) {
@@ -107,12 +108,14 @@ CliOptions ParseCli(int argc, wchar_t** argv) {
                 throw std::runtime_error("Invalid --streams");
             }
             options.streamLimit = static_cast<uint32_t>(streams);
+            options.streamAutoTune = false;
         } else if (arg == L"--chunk-kb") {
             const long chunkKb = std::wcstol(ArgAt(args, ++i).c_str(), nullptr, 10);
-            if (chunkKb <= 0 || chunkKb > 4096) {
+            if (chunkKb <= 0 || chunkKb > 65536) {
                 throw std::runtime_error("Invalid --chunk-kb");
             }
             options.chunkSize = static_cast<uint32_t>(chunkKb * 1024);
+            options.chunkAutoTune = false;
         } else {
             throw std::runtime_error("Unknown argument: " + ToUtf8(arg));
         }

@@ -69,6 +69,56 @@ enum class CompareAction {
     FallbackHash
 };
 
+struct TunedTransferOptions {
+    uint32_t streamLimit = 16;
+    uint32_t chunkSize = 256 * 1024;
+};
+
+TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
+    TunedTransferOptions tuned;
+    tuned.streamLimit = options.streamLimit;
+    tuned.chunkSize = options.chunkSize;
+
+    const uint32_t hw = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+
+    if (options.streamAutoTune) {
+        if (options.chunkAutoTune) {
+            tuned.streamLimit = std::clamp<uint32_t>(hw * 2, 8, 24);
+        } else {
+            const uint32_t chunkKb = tuned.chunkSize / 1024;
+            if (chunkKb >= 8192) {
+                tuned.streamLimit = 8;
+            } else if (chunkKb >= 4096) {
+                tuned.streamLimit = 10;
+            } else if (chunkKb >= 2048) {
+                tuned.streamLimit = 12;
+            } else if (chunkKb >= 1024) {
+                tuned.streamLimit = 16;
+            } else {
+                tuned.streamLimit = 24;
+            }
+        }
+    }
+
+    if (options.chunkAutoTune) {
+        if (tuned.streamLimit <= 8) {
+            tuned.chunkSize = 4 * 1024 * 1024;
+        } else if (tuned.streamLimit <= 16) {
+            tuned.chunkSize = 2 * 1024 * 1024;
+        } else if (tuned.streamLimit <= 32) {
+            tuned.chunkSize = 1024 * 1024;
+        } else if (tuned.streamLimit <= 64) {
+            tuned.chunkSize = 512 * 1024;
+        } else {
+            tuned.chunkSize = 256 * 1024;
+        }
+    }
+
+    tuned.streamLimit = std::clamp<uint32_t>(tuned.streamLimit, 1, 1024);
+    tuned.chunkSize = std::clamp<uint32_t>(tuned.chunkSize, 64 * 1024, 64 * 1024 * 1024);
+    return tuned;
+}
+
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
 
@@ -273,7 +323,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
-    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
+    const TunedTransferOptions tuned = ResolveTransferOptions(options);
+    const uint32_t streamLimit = tuned.streamLimit;
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
 
     std::unordered_map<uint32_t, ServerStream> activeStreams;
     std::mutex mu;
@@ -436,7 +488,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         while (!done.load()) {
             bool didWork = false;
             std::vector<uint8_t> sendBatch;
-            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(effectiveChunkSize) * options.streamLimit));
+            sendBatch.reserve(std::max<size_t>(1024 * 1024, static_cast<size_t>(effectiveChunkSize) * streamLimit));
             {
                 std::lock_guard<std::mutex> lock(mu);
                 size_t highBudget = 256;
@@ -614,8 +666,10 @@ void TransferFileBatch(const SocketHandle& socket,
         pending.push({streamId++, rel});
     }
 
-    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
-    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(options.streamLimit, effectiveChunkSize);
+    const TunedTransferOptions tuned = ResolveTransferOptions(options);
+    const uint32_t streamLimit = tuned.streamLimit;
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
+    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(streamLimit, effectiveChunkSize);
 
     auto flushBufferedWrites = [&](DownloadState& d) {
         if (d.writeBuffer.empty()) {
@@ -641,7 +695,7 @@ void TransferFileBatch(const SocketHandle& socket,
         SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
     };
 
-    while (!pending.empty() && activeDownloads.size() < options.streamLimit) {
+    while (!pending.empty() && activeDownloads.size() < streamLimit) {
         auto [sid, rel] = pending.front();
         pending.pop();
         openPendingStream(sid, rel);
@@ -697,7 +751,13 @@ void TransferFileBatch(const SocketHandle& socket,
 
 int RunServer(const CliOptions& options) {
     WsaContext wsa;
+    const TunedTransferOptions tuned = ResolveTransferOptions(options);
     std::cout << "FastClone server root=" << options.rootDir.string() << " port=" << options.port << std::endl;
+    if (options.streamAutoTune || options.chunkAutoTune) {
+        std::cout << "[auto-tune] streams=" << tuned.streamLimit
+                  << " chunk-kb=" << (tuned.chunkSize / 1024)
+                  << std::endl;
+    }
     SocketHandle listener = CreateServer(options.port);
     std::atomic<uint64_t> sessionIdCounter{0};
     std::atomic<uint32_t> activeSessions{0};
@@ -723,8 +783,10 @@ int RunServer(const CliOptions& options) {
 int RunClient(const CliOptions& options) {
     WsaContext wsa;
     const bool debugEnabled = IsDebugEnabled();
-    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(options.chunkSize, options.streamLimit);
-    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(options.streamLimit, effectiveChunkSize);
+    const TunedTransferOptions tuned = ResolveTransferOptions(options);
+    const uint32_t streamLimit = tuned.streamLimit;
+    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
+    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(streamLimit, effectiveChunkSize);
     std::error_code ec;
     fs::create_directories(options.rootDir, ec);
 
@@ -739,6 +801,11 @@ int RunClient(const CliOptions& options) {
 
     SocketHandle socket = ConnectTo(options.host, options.port);
     EnsureHandshakeAsClient(socket, options.password);
+    if (options.streamAutoTune || options.chunkAutoTune) {
+        std::cout << "[auto-tune] streams=" << streamLimit
+                  << " chunk-kb=" << (tuned.chunkSize / 1024)
+                  << std::endl;
+    }
 
     SendFrame(socket, Frame{MsgType::ManifestRequest, 0, {}});
     std::unordered_map<std::string, FileEntry> remoteFiles;
@@ -827,7 +894,7 @@ int RunClient(const CliOptions& options) {
     size_t fallbackResolved = 0;
     size_t hashRequestsSent = 0;
     size_t hashResponsesReceived = 0;
-    const size_t maxInFlightHashRequests = std::max<size_t>(256, static_cast<size_t>(options.streamLimit) * 32);
+    const size_t maxInFlightHashRequests = std::max<size_t>(256, static_cast<size_t>(streamLimit) * 32);
     size_t lastEnum = 0;
     size_t lastCompared = 0;
     size_t lastSkipped = 0;
@@ -953,7 +1020,7 @@ int RunClient(const CliOptions& options) {
     };
 
     auto tryStartTransfers = [&]() {
-        while (!pendingTransfers.empty() && activeDownloads.size() < options.streamLimit) {
+        while (!pendingTransfers.empty() && activeDownloads.size() < streamLimit) {
             auto [sid, rel] = pendingTransfers.front();
             pendingTransfers.pop();
             const fs::path abs = JoinRel(options.rootDir, rel);
