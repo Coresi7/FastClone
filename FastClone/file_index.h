@@ -21,7 +21,7 @@ struct FileEntry {
 using Hash256 = std::array<uint8_t, 32>;
 
 std::vector<FileEntry> BuildIndex(const std::filesystem::path& root, const std::optional<std::filesystem::path>& excludeAbsPath);
-Hash256 ComputeFileSha256(const std::filesystem::path& path);
+Hash256 ComputeFileHash(const std::filesystem::path& path);
 bool HashEquals(const Hash256& a, const Hash256& b);
 std::string NormalizeRelativePath(const std::filesystem::path& relativePath);
 int64_t ToUnixNs(const std::filesystem::file_time_type& value);

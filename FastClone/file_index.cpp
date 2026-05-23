@@ -1,7 +1,7 @@
 #include "file_index.h"
 
 #include <Windows.h>
-#include <bcrypt.h>
+#include <blake3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -11,8 +11,6 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
-
-#pragma comment(lib, "Bcrypt.lib")
 
 namespace fs = std::filesystem;
 
@@ -195,35 +193,11 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
     return output;
 }
 
-Hash256 ComputeFileSha256(const fs::path& path) {
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD hashObjectLen = 0;
-    DWORD hashLen = 0;
-    DWORD bytesDone = 0;
-
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
-        throw std::runtime_error("BCryptOpenAlgorithmProvider failed");
-    }
-    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjectLen), sizeof(hashObjectLen), &bytesDone, 0) < 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("BCryptGetProperty OBJECT_LENGTH failed");
-    }
-    if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLen), sizeof(hashLen), &bytesDone, 0) < 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("BCryptGetProperty HASH_LENGTH failed");
-    }
-
-    std::vector<uint8_t> hashObject(hashObjectLen);
-    if (BCryptCreateHash(alg, &hash, hashObject.data(), hashObjectLen, nullptr, 0, 0) < 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("BCryptCreateHash failed");
-    }
-
+Hash256 ComputeFileHash(const fs::path& path) {
+    blake3_hasher hasher{};
+    blake3_hasher_init(&hasher);
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(alg, 0);
         throw std::runtime_error("Open file failed for hash");
     }
     std::vector<uint8_t> buf(1 << 20);
@@ -231,26 +205,11 @@ Hash256 ComputeFileSha256(const fs::path& path) {
         in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
         const std::streamsize got = in.gcount();
         if (got > 0) {
-            if (BCryptHashData(hash, buf.data(), static_cast<ULONG>(got), 0) < 0) {
-                BCryptDestroyHash(hash);
-                BCryptCloseAlgorithmProvider(alg, 0);
-                throw std::runtime_error("BCryptHashData failed");
-            }
+            blake3_hasher_update(&hasher, buf.data(), static_cast<size_t>(got));
         }
     }
     Hash256 output{};
-    if (hashLen != output.size()) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("Unexpected SHA256 length");
-    }
-    if (BCryptFinishHash(hash, output.data(), static_cast<ULONG>(output.size()), 0) < 0) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(alg, 0);
-        throw std::runtime_error("BCryptFinishHash failed");
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
+    blake3_hasher_finalize(&hasher, output.data(), output.size());
     return output;
 }
 

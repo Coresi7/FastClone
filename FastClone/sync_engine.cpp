@@ -29,6 +29,8 @@ namespace fc {
 
 namespace {
 
+constexpr const char* kProtocolVersion = "FC2";
+
 bool IsDebugEnabled() {
     static const bool enabled = []() {
         char value[16] = {};
@@ -185,7 +187,12 @@ void EnsureHandshakeAsServer(const SocketHandle& socket, const std::string& pass
     if (hello.type != MsgType::Hello) {
         throw std::runtime_error("Expected HELLO");
     }
-    SendSimple(socket, MsgType::Hello, "FC1");
+    const std::string clientVersion(reinterpret_cast<const char*>(hello.payload.data()), hello.payload.size());
+    if (clientVersion != kProtocolVersion) {
+        SendSimple(socket, MsgType::Error, "Protocol version mismatch: server=" + std::string(kProtocolVersion) + " client=" + clientVersion);
+        throw std::runtime_error("Protocol version mismatch: server=" + std::string(kProtocolVersion) + " client=" + clientVersion);
+    }
+    SendSimple(socket, MsgType::Hello, kProtocolVersion);
 
     const Frame auth = RecvFrame(socket);
     if (auth.type != MsgType::Auth) {
@@ -200,10 +207,14 @@ void EnsureHandshakeAsServer(const SocketHandle& socket, const std::string& pass
 }
 
 void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& password) {
-    SendSimple(socket, MsgType::Hello, "FC1");
+    SendSimple(socket, MsgType::Hello, kProtocolVersion);
     Frame helloBack = RecvFrame(socket);
     if (helloBack.type != MsgType::Hello) {
         throw std::runtime_error("Server HELLO missing");
+    }
+    const std::string serverVersion(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size());
+    if (serverVersion != kProtocolVersion) {
+        throw std::runtime_error("Protocol version mismatch: client=" + std::string(kProtocolVersion) + " server=" + serverVersion);
     }
     SendSimple(socket, MsgType::Auth, password);
     Frame authResult = RecvFrame(socket);
@@ -453,7 +464,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     hashTasks.pop_front();
                 }
                 try {
-                    Hash256 hash = ComputeFileSha256(task.absPath);
+                    Hash256 hash = ComputeFileHash(task.absPath);
                     enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(task.relPath, hash)});
                 } catch (...) {
                     Hash256 fallbackHash{};
@@ -1077,7 +1088,7 @@ int RunClient(const CliOptions& options) {
                     hashTaskQueue.pop_front();
                 }
                 try {
-                    Hash256 hash = ComputeFileSha256(task.absPath);
+                    Hash256 hash = ComputeFileHash(task.absPath);
                     {
                         std::lock_guard<std::mutex> lock(hashResultMu);
                         localHashes[task.relPath] = hash;
