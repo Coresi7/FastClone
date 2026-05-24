@@ -70,7 +70,50 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 依赖：
 - C++20 编译器
 - CMake 3.16+
-- xxhash 开发包（例如 Debian/Ubuntu: `libxxhash-dev`）
+- xxhash 开发包（不同发行版包名不同）
+
+安装 xxhash 开发包（Linux）：
+
+- Debian / Ubuntu
+
+```bash
+sudo apt update
+sudo apt install -y libxxhash-dev
+```
+
+- Fedora / RHEL / Rocky / Alma / CentOS Stream
+
+```bash
+sudo dnf install -y xxhash-devel
+```
+
+如果 `xxhash-devel` 找不到，先启用额外仓库后重试：
+
+```bash
+sudo dnf install -y epel-release
+sudo dnf config-manager --set-enabled crb
+sudo dnf makecache
+sudo dnf install -y xxhash-devel
+```
+
+- Arch / Manjaro
+
+```bash
+sudo pacman -S --needed xxhash
+```
+
+- openSUSE
+
+```bash
+sudo zypper install -y xxhash-devel
+```
+
+可选自检（确认头文件和 pkg-config 可见）：
+
+```bash
+pkg-config --modversion libxxhash
+pkg-config --cflags --libs libxxhash
+```
 
 构建：
 
