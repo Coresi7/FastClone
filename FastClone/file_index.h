@@ -18,6 +18,7 @@ struct FileEntry {
     int64_t ctimeNs = 0;
 };
 
+// Protocol name is kept as Hash256 for compatibility, but value is XXH3_128 (16 bytes).
 using Hash256 = std::array<uint8_t, 16>;
 
 std::vector<FileEntry> BuildIndex(const std::filesystem::path& root, const std::optional<std::filesystem::path>& excludeAbsPath);

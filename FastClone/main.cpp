@@ -4,7 +4,11 @@
 #include <exception>
 #include <iostream>
 
+#if defined(_WIN32) && defined(_MSC_VER)
 int wmain(int argc, wchar_t** argv) {
+#else
+int main(int argc, char** argv) {
+#endif
     try {
         const fc::CliOptions options = fc::ParseCli(argc, argv);
         if (options.mode == fc::Mode::Server) {

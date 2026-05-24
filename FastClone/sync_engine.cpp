@@ -1,18 +1,26 @@
 #include "sync_engine.h"
 
 #include "file_index.h"
+#include "path_utils.h"
 #include "protocol.h"
 #include "win_socket.h"
 
+#ifdef _WIN32
 #include <Windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <unistd.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <deque>
+#include <cstdlib>
 #include <condition_variable>
 #include <cctype>
-#include <cwchar>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -24,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -33,14 +42,33 @@ namespace {
 
 constexpr const char* kProtocolVersion = "FC3";
 
+std::optional<std::string> ReadEnvVar(const char* name) {
+#if defined(_WIN32) && defined(_MSC_VER)
+    char* raw = nullptr;
+    size_t len = 0;
+    const errno_t rc = _dupenv_s(&raw, &len, name);
+    if (rc != 0 || raw == nullptr) {
+        return std::nullopt;
+    }
+    std::string value(raw);
+    std::free(raw);
+    return value;
+#else
+    const char* env = std::getenv(name);
+    if (env == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(env);
+#endif
+}
+
 bool IsDebugEnabled() {
     static const bool enabled = []() {
-        char value[16] = {};
-        const DWORD len = GetEnvironmentVariableA("FASTCLONE_DEBUG", value, static_cast<DWORD>(sizeof(value)));
-        if (len == 0) {
+        const std::optional<std::string> env = ReadEnvVar("FASTCLONE_DEBUG");
+        if (!env.has_value()) {
             return false;
         }
-        std::string v(value, value + std::min<DWORD>(len, static_cast<DWORD>(sizeof(value) - 1)));
+        std::string v = *env;
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return v == "1" || v == "true" || v == "yes" || v == "on";
     }();
@@ -143,6 +171,7 @@ CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, con
     return CompareAction::FallbackHash;
 }
 
+#ifdef _WIN32
 std::wstring Utf8ToWide(const std::string& value) {
     if (value.empty()) {
         return {};
@@ -168,12 +197,17 @@ std::string WideToUtf8(const std::wstring& value) {
     WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), output.data(), len, nullptr, nullptr);
     return output;
 }
+#endif
 
 fs::path JoinRel(const fs::path& root, const std::string& relPath) {
     if (relPath == "." || relPath.empty()) {
         return root;
     }
+#ifdef _WIN32
     return root / fs::path(Utf8ToWide(relPath));
+#else
+    return root / fs::path(relPath);
+#endif
 }
 
 void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {}) {
@@ -228,13 +262,6 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
     }
 }
 
-int64_t FileTimeToTicks(FILETIME ft) {
-    ULARGE_INTEGER v{};
-    v.LowPart = ft.dwLowDateTime;
-    v.HighPart = ft.dwHighDateTime;
-    return static_cast<int64_t>(v.QuadPart);
-}
-
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry);
 
 void EnumerateManifestEntriesFast(
@@ -242,6 +269,14 @@ void EnumerateManifestEntriesFast(
     const std::optional<fs::path>& selfPath,
     const std::atomic<bool>& done,
     const std::function<void(Frame&&)>& enqueueManifestFrame) {
+#ifdef _WIN32
+    auto FileTimeToTicks = [](FILETIME ft) -> int64_t {
+        ULARGE_INTEGER v{};
+        v.LowPart = ft.dwLowDateTime;
+        v.HighPart = ft.dwHighDateTime;
+        return static_cast<int64_t>(v.QuadPart);
+    };
+
     struct PendingDir {
         std::wstring absDir;
         std::string relDir;
@@ -332,6 +367,78 @@ void EnumerateManifestEntriesFast(
     AppendU64(payload, static_cast<uint64_t>(fileCount));
     enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
     enqueueManifestFrame(Frame{MsgType::ManifestEnd, 0, {}});
+#else
+    size_t fileCount = 0;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end;
+         it.increment(ec)) {
+        if (done.load()) {
+            return;
+        }
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::path absPath = it->path();
+        if (selfPath.has_value()) {
+            std::error_code eqec;
+            if (fs::equivalent(absPath, *selfPath, eqec) && !eqec) {
+                continue;
+            }
+        }
+
+        const bool isDir = it->is_directory(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        const bool isRegular = it->is_regular_file(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!isDir && !isRegular) {
+            continue;
+        }
+
+        FileEntry entry;
+        entry.relativePath = NormalizeRelativePath(fs::relative(absPath, root, ec));
+        if (ec || entry.relativePath.empty()) {
+            ec.clear();
+            continue;
+        }
+        entry.isDirectory = isDir;
+        if (isDir) {
+            entry.fileSize = 0;
+        } else {
+            entry.fileSize = static_cast<uint64_t>(fs::file_size(absPath, ec));
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            ++fileCount;
+            if (fileCount % 2048 == 0) {
+                std::vector<uint8_t> payload;
+                AppendU64(payload, static_cast<uint64_t>(fileCount));
+                enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+            }
+        }
+        entry.mtimeNs = ToUnixNs(fs::last_write_time(absPath, ec));
+        if (ec) {
+            entry.mtimeNs = 0;
+            ec.clear();
+        }
+        entry.ctimeNs = entry.mtimeNs;
+        enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
+    }
+
+    std::vector<uint8_t> payload;
+    AppendU64(payload, static_cast<uint64_t>(fileCount));
+    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+    enqueueManifestFrame(Frame{MsgType::ManifestEnd, 0, {}});
+#endif
 }
 
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
@@ -459,6 +566,7 @@ std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8
 
 LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& exclude) {
     LocalState st;
+#ifdef _WIN32
     struct PendingDir {
         std::wstring absDir;
         std::string relDir;
@@ -520,6 +628,48 @@ LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& 
 
         FindClose(hFind);
     }
+#else
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end;
+         it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        const fs::path absPath = it->path();
+        if (exclude.has_value()) {
+            std::error_code eqec;
+            if (fs::equivalent(absPath, *exclude, eqec) && !eqec) {
+                continue;
+            }
+        }
+
+        const bool isDir = it->is_directory(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        const bool isRegular = it->is_regular_file(ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!isDir && !isRegular) {
+            continue;
+        }
+        const std::string relPath = NormalizeRelativePath(fs::relative(absPath, root, ec));
+        if (ec || relPath.empty()) {
+            ec.clear();
+            continue;
+        }
+        if (isDir) {
+            st.directories.insert(relPath);
+        } else {
+            st.files.emplace(relPath, FileEntry{relPath, false, 0, 0, 0});
+        }
+    }
+#endif
     return st;
 }
 
@@ -570,12 +720,35 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
 }
 
 std::optional<fs::path> CurrentExePath() {
+#ifdef _WIN32
     wchar_t pathBuf[MAX_PATH];
     const DWORD len = GetModuleFileNameW(nullptr, pathBuf, MAX_PATH);
     if (len == 0 || len >= MAX_PATH) {
         return std::nullopt;
     }
     return fs::weakly_canonical(fs::path(pathBuf));
+#elif defined(__linux__)
+    std::vector<char> buf(4096);
+    const ssize_t len = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+    if (len <= 0) {
+        return std::nullopt;
+    }
+    buf[static_cast<size_t>(len)] = '\0';
+    return fs::weakly_canonical(fs::path(buf.data()));
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    if (size == 0) {
+        return std::nullopt;
+    }
+    std::vector<char> buf(size + 1, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+        return std::nullopt;
+    }
+    return fs::weakly_canonical(fs::path(buf.data()));
+#else
+    return std::nullopt;
+#endif
 }
 
 void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
@@ -1152,10 +1325,17 @@ int RunClient(const CliOptions& options) {
 
     std::optional<fs::path> selfPath = CurrentExePath();
     if (selfPath.has_value()) {
-        if (!selfPath->empty() && selfPath->native().find(options.rootDir.native()) != std::wstring::npos) {
-            selfPath = fs::weakly_canonical(*selfPath);
-        } else {
+        std::error_code sec;
+        const fs::path canonicalRoot = fs::weakly_canonical(options.rootDir, sec);
+        if (sec) {
             selfPath = std::nullopt;
+        } else {
+            const fs::path canonicalSelf = fs::weakly_canonical(*selfPath, sec);
+            if (sec || !IsPathUnderRoot(canonicalRoot, canonicalSelf)) {
+                selfPath = std::nullopt;
+            } else {
+                selfPath = canonicalSelf;
+            }
         }
     }
 
@@ -1345,15 +1525,24 @@ int RunClient(const CliOptions& options) {
         enqueueTransfer(rel, false);
     };
 
-    auto markTransferFailed = [&](const std::string&) {
+    auto markTransferFailed = [&](const std::string& rel) {
         ++compared;
         ++failed;
+        if (debugEnabled) {
+            std::cerr << "[debug][client] transfer_failed path=" << rel << std::endl;
+        }
     };
 
     auto retryOrFail = [&](const std::string& rel) {
         uint8_t& retries = transferRetryCounts[rel];
         if (retries < kMaxTransferRetries) {
             ++retries;
+            if (debugEnabled) {
+                std::cerr << "[debug][client] transfer_retry path=" << rel
+                          << " attempt=" << static_cast<uint32_t>(retries)
+                          << "/" << static_cast<uint32_t>(kMaxTransferRetries)
+                          << std::endl;
+            }
             enqueueTransfer(rel, true);
         } else {
             markTransferFailed(rel);
@@ -1576,7 +1765,13 @@ int RunClient(const CliOptions& options) {
             if (entry.output.is_open()) {
                 entry.output.close();
             }
-            retryOrFail(entry.relPath);
+            if (!entry.serverOk) {
+                // Server explicitly reported this entry as unavailable; retrying won't help.
+                markTransferFailed(entry.relPath);
+                transferRetryCounts.erase(entry.relPath);
+            } else {
+                retryOrFail(entry.relPath);
+            }
         }
         entry.finalized = true;
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
@@ -1814,7 +2009,11 @@ int RunClient(const CliOptions& options) {
             if (hasRelPath) {
                 retryOrFail(relPath);
             } else {
-                markTransferFailed("<unknown>");
+                ++compared;
+                ++failed;
+                if (debugEnabled) {
+                    std::cerr << "[debug][client] transfer_failed path=<unknown> stream=" << frame.streamId << std::endl;
+                }
             }
             PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else {
@@ -1943,7 +2142,7 @@ int RunClient(const CliOptions& options) {
         }
     } catch (...) {
         recvStop.store(true);
-        shutdown(socket.Get(), SD_BOTH);
+        ShutdownBoth(socket);
         compareStop.store(true);
         compareTaskCv.notify_all();
         hashStop.store(true);
@@ -1990,7 +2189,7 @@ int RunClient(const CliOptions& options) {
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
     SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
     recvStop.store(true);
-    shutdown(socket.Get(), SD_BOTH);
+    ShutdownBoth(socket);
     if (recvThread.joinable()) {
         recvThread.join();
     }

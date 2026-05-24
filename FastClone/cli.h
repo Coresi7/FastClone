@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -22,6 +23,10 @@ struct CliOptions {
     bool chunkAutoTune = true;
 };
 
+#if defined(_WIN32) && defined(_MSC_VER)
 CliOptions ParseCli(int argc, wchar_t** argv);
+#else
+CliOptions ParseCli(int argc, char** argv);
+#endif
 
 }  // namespace fc

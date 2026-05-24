@@ -1,6 +1,10 @@
 # FastClone
 
-`FastClone.exe` 是一个单文件、单连接的高吞吐目录同步工具，针对 Unity/Unreal 等海量碎文件场景做了优化。
+`FastClone` 是一个单文件、单连接的高吞吐目录同步工具，针对 Unity/Unreal 等海量碎文件场景做了优化。
+
+现在支持：
+- Windows：使用 WinAPI 快路径（更高性能）
+- GNU/Linux / macOS：使用跨平台通用实现（功能可用，性能可能略低于 Windows）
 
 ## 核心特性
 
@@ -19,7 +23,7 @@
 ### 服务端
 
 ```bash
-FastClone.exe server [--dir <path>] [--port <n>] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] --password <pwd>
 ```
 
 - `--dir`：服务根目录；默认当前目录
@@ -29,7 +33,7 @@ FastClone.exe server [--dir <path>] [--port <n>] --password <pwd>
 ### 客户端
 
 ```bash
-FastClone.exe client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]
+FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）
@@ -54,4 +58,24 @@ FastClone.exe client --server <host[:port]> --target <path> --password <pwd> [--
 - 当前为明文 TCP + 口令，建议只在可信网络使用
 - 镜像模式会删除客户端多余文件/目录
 - 不支持断点续传，中断后需重跑
+
+## 退出码
+
+- `0`：同步成功（无失败文件）
+- `1`：参数错误或运行时异常
+- `2`：同步完成但存在失败文件（可结合 `--streams` 降低并发后重试）
+
+## 跨平台构建（Linux/macOS）
+
+依赖：
+- C++20 编译器
+- CMake 3.16+
+- xxhash 开发包（例如 Debian/Ubuntu: `libxxhash-dev`）
+
+构建：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 

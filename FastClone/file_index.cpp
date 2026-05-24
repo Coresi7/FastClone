@@ -1,6 +1,9 @@
 #include "file_index.h"
+#include "path_utils.h"
 
+#ifdef _WIN32
 #include <Windows.h>
+#endif
 #include <xxhash.h>
 
 #include <algorithm>
@@ -8,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -19,21 +23,7 @@ namespace fc {
 
 namespace {
 
-bool IsUnderRoot(const fs::path& root, const fs::path& path) {
-    const fs::path canonicalRoot = fs::weakly_canonical(root);
-    const fs::path canonicalPath = fs::weakly_canonical(path);
-    auto rootIt = canonicalRoot.begin();
-    auto pathIt = canonicalPath.begin();
-    while (rootIt != canonicalRoot.end() && pathIt != canonicalPath.end()) {
-        if (*rootIt != *pathIt) {
-            return false;
-        }
-        ++rootIt;
-        ++pathIt;
-    }
-    return rootIt == canonicalRoot.end();
-}
-
+#ifdef _WIN32
 int64_t ToNsFromFileTime(FILETIME ft) {
     ULARGE_INTEGER v{};
     v.LowPart = ft.dwLowDateTime;
@@ -57,6 +47,7 @@ FILETIME ToFileTimeFromNs(int64_t unixNs) {
     ft.dwHighDateTime = v.HighPart;
     return ft;
 }
+#endif
 
 }  // namespace
 
@@ -106,7 +97,7 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
         if (canonicalExclude.has_value() && fs::exists(*canonicalExclude) && absPath == *canonicalExclude) {
             continue;
         }
-        if (canonicalExclude.has_value() && item.is_directory() && IsUnderRoot(absPath, *canonicalExclude)) {
+        if (canonicalExclude.has_value() && item.is_directory() && IsPathUnderRoot(absPath, *canonicalExclude)) {
             continue;
         }
         if (!item.is_directory() && !item.is_regular_file()) {
@@ -134,6 +125,7 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
 
                 if (c.isDirectory) {
                     entry.fileSize = 0;
+#ifdef _WIN32
                     HANDLE handle = CreateFileW(c.absPath.wstring().c_str(), GENERIC_READ,
                                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                 nullptr, OPEN_EXISTING,
@@ -150,12 +142,21 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                         entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
                         entry.ctimeNs = entry.mtimeNs;
                     }
+#else
+                    std::error_code tec;
+                    entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath, tec));
+                    if (tec) {
+                        entry.mtimeNs = 0;
+                    }
+                    entry.ctimeNs = entry.mtimeNs;
+#endif
                 } else if (c.isRegular) {
                     std::error_code sec;
                     entry.fileSize = static_cast<uint64_t>(fs::file_size(c.absPath, sec));
                     if (sec) {
                         continue;
                     }
+#ifdef _WIN32
                     HANDLE handle = CreateFileW(c.absPath.wstring().c_str(), GENERIC_READ,
                                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -173,6 +174,14 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                         entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
                         entry.ctimeNs = entry.mtimeNs;
                     }
+#else
+                    std::error_code tec;
+                    entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath, tec));
+                    if (tec) {
+                        entry.mtimeNs = 0;
+                    }
+                    entry.ctimeNs = entry.mtimeNs;
+#endif
                 } else {
                     continue;
                 }
@@ -203,6 +212,7 @@ Hash256 ComputeFileHash(const fs::path& path) {
         XXH3_freeState(state);
         throw std::runtime_error("XXH3_128bits_reset failed");
     }
+#ifdef _WIN32
     HANDLE handle = CreateFileW(path.wstring().c_str(),
                                 GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -237,6 +247,32 @@ Hash256 ComputeFileHash(const fs::path& path) {
         XXH3_freeState(state);
         throw std::runtime_error("Read file failed for hash");
     }
+#else
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        XXH3_freeState(state);
+        throw std::runtime_error("Open file failed for hash");
+    }
+    thread_local std::vector<uint8_t> readBuf;
+    if (readBuf.empty()) {
+        readBuf.resize(256 * 1024);
+    }
+    while (input) {
+        input.read(reinterpret_cast<char*>(readBuf.data()), static_cast<std::streamsize>(readBuf.size()));
+        const std::streamsize got = input.gcount();
+        if (got <= 0) {
+            break;
+        }
+        if (XXH3_128bits_update(state, readBuf.data(), static_cast<size_t>(got)) == XXH_ERROR) {
+            XXH3_freeState(state);
+            throw std::runtime_error("XXH3_128bits_update failed");
+        }
+    }
+    if (!input.eof() && input.fail()) {
+        XXH3_freeState(state);
+        throw std::runtime_error("Read file failed for hash");
+    }
+#endif
 
     const XXH128_hash_t digest = XXH3_128bits_digest(state);
     XXH3_freeState(state);
@@ -250,6 +286,7 @@ bool HashEquals(const Hash256& a, const Hash256& b) {
 }
 
 void SetFileCreateAndModifyTime(const fs::path& path, int64_t createNs, int64_t modifyNs) {
+#ifdef _WIN32
     HANDLE handle = CreateFileW(path.wstring().c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
@@ -260,6 +297,16 @@ void SetFileCreateAndModifyTime(const fs::path& path, int64_t createNs, int64_t 
     SetFileTime(handle, nullptr, nullptr, &writeFt);
     SetFileTime(handle, &createFt, nullptr, nullptr);
     CloseHandle(handle);
+#else
+    if (createNs != modifyNs) {
+        const char* debugEnv = std::getenv("FASTCLONE_DEBUG");
+        if (debugEnv != nullptr) {
+            std::cerr << "[debug][time] create time unsupported on this platform: " << path.string() << std::endl;
+        }
+    }
+    std::error_code ec;
+    fs::last_write_time(path, FromUnixNs(modifyNs), ec);
+#endif
 }
 
 }  // namespace fc

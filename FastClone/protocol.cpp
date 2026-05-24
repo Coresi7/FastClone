@@ -56,11 +56,11 @@ void SendFrame(const SocketHandle& socket, const Frame& frame) {
         SendAll(socket, header.data(), header.size());
         return;
     }
-    std::array<WSABUF, 2> buffers{};
-    buffers[0].buf = reinterpret_cast<char*>(header.data());
-    buffers[0].len = static_cast<ULONG>(header.size());
-    buffers[1].buf = reinterpret_cast<char*>(const_cast<uint8_t*>(frame.payload.data()));
-    buffers[1].len = static_cast<ULONG>(frame.payload.size());
+    std::array<SocketBuffer, 2> buffers{};
+    buffers[0].data = header.data();
+    buffers[0].len = header.size();
+    buffers[1].data = frame.payload.data();
+    buffers[1].len = frame.payload.size();
     SendBuffersAll(socket, buffers.data(), buffers.size());
 }
 
@@ -73,16 +73,14 @@ void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames
         const size_t count = std::min<size_t>(kFrameChunk, frames.size() - offset);
         std::vector<std::array<uint8_t, kHeaderSize>> headers;
         headers.reserve(count);
-        std::vector<WSABUF> buffers;
+        std::vector<SocketBuffer> buffers;
         buffers.reserve(count * 2);
         for (size_t i = 0; i < count; ++i) {
             const Frame& frame = frames[offset + i];
             headers.push_back(EncodeHeader(frame));
-            buffers.push_back(WSABUF{static_cast<ULONG>(kHeaderSize),
-                                     reinterpret_cast<char*>(headers.back().data())});
+            buffers.push_back(SocketBuffer{headers.back().data(), kHeaderSize});
             if (!frame.payload.empty()) {
-                buffers.push_back(WSABUF{static_cast<ULONG>(frame.payload.size()),
-                                         reinterpret_cast<char*>(const_cast<uint8_t*>(frame.payload.data()))});
+                buffers.push_back(SocketBuffer{frame.payload.data(), frame.payload.size()});
             }
         }
         SendBuffersAll(socket, buffers.data(), buffers.size());
