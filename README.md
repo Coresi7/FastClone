@@ -57,7 +57,7 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 
 - 当前为明文 TCP + 口令，建议只在可信网络使用
 - 镜像模式会删除客户端多余文件/目录
-- 不支持断点续传，中断后需重跑
+- 不支持断点续传，中断后需重跑（但重跑可自动对比，相同文件无需二次传输）
 
 ## 退出码
 
