@@ -11,7 +11,6 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -89,7 +88,7 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
     if (!fs::exists(canonicalRoot)) {
         throw std::runtime_error("Root directory does not exist");
     }
-    output.push_back(FileEntry{".", true, 0, 0, 0});
+    output.push_back(FileEntry{".", true, 0, 0});
 
     struct Candidate {
         fs::path absPath;
@@ -136,16 +135,14 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                                                 nullptr, OPEN_EXISTING,
                                                 FILE_FLAG_BACKUP_SEMANTICS, nullptr);
                     if (handle != INVALID_HANDLE_VALUE) {
-                        FILETIME createFt{}, accessFt{}, writeFt{};
-                        if (GetFileTime(handle, &createFt, &accessFt, &writeFt) != 0) {
-                            entry.ctimeNs = ToNsFromFileTime(createFt);
+                        FILETIME accessFt{}, writeFt{};
+                        if (GetFileTime(handle, nullptr, &accessFt, &writeFt) != 0) {
                             entry.mtimeNs = ToNsFromFileTime(writeFt);
                         }
                         CloseHandle(handle);
                     }
                     if (entry.mtimeNs == 0) {
                         entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                        entry.ctimeNs = entry.mtimeNs;
                     }
 #else
                     std::error_code tec;
@@ -153,7 +150,6 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                     if (tec) {
                         entry.mtimeNs = 0;
                     }
-                    entry.ctimeNs = entry.mtimeNs;
 #endif
                 } else if (c.isRegular) {
                     std::error_code sec;
@@ -166,18 +162,15 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                     if (handle != INVALID_HANDLE_VALUE) {
-                        FILETIME createFt{}, accessFt{}, writeFt{};
-                        if (GetFileTime(handle, &createFt, &accessFt, &writeFt) != 0) {
-                            entry.ctimeNs = ToNsFromFileTime(createFt);
+                        FILETIME accessFt{}, writeFt{};
+                        if (GetFileTime(handle, nullptr, &accessFt, &writeFt) != 0) {
                             entry.mtimeNs = ToNsFromFileTime(writeFt);
                         } else {
                             entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                            entry.ctimeNs = entry.mtimeNs;
                         }
                         CloseHandle(handle);
                     } else {
                         entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                        entry.ctimeNs = entry.mtimeNs;
                     }
 #else
                     std::error_code tec;
@@ -185,7 +178,6 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                     if (tec) {
                         entry.mtimeNs = 0;
                     }
-                    entry.ctimeNs = entry.mtimeNs;
 #endif
                 } else {
                     continue;
@@ -290,29 +282,17 @@ bool HashEquals(const Hash256& a, const Hash256& b) {
     return std::equal(a.begin(), a.end(), b.begin(), b.end());
 }
 
-void SetFileCreateAndModifyTime(const fs::path& path, int64_t createNs, int64_t modifyNs) {
+void SetFileModifyTime(const fs::path& path, int64_t modifyNs) {
 #ifdef _WIN32
     HANDLE handle = CreateFileW(path.wstring().c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         return;
     }
-    const FILETIME createFt = ToFileTimeFromNs(createNs);
     const FILETIME writeFt = ToFileTimeFromNs(modifyNs);
     SetFileTime(handle, nullptr, nullptr, &writeFt);
-    SetFileTime(handle, &createFt, nullptr, nullptr);
     CloseHandle(handle);
 #else
-    if (createNs != modifyNs) {
-        const char* debugEnv = std::getenv("FASTCLONE_DEBUG");
-        if (debugEnv != nullptr) {
-            static std::atomic<bool> warnedOnce = false;
-            if (!warnedOnce.exchange(true)) {
-                std::cerr << "[debug][time] create time unsupported on this platform; "
-                          << "future logs suppressed. first_path=" << path.string() << std::endl;
-            }
-        }
-    }
     std::error_code ec;
     fs::last_write_time(path, FromUnixNs(modifyNs), ec);
 #endif

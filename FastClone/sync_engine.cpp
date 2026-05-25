@@ -40,7 +40,7 @@ namespace fc {
 
 namespace {
 
-constexpr const char* kProtocolVersion = "FC3";
+constexpr const char* kProtocolVersion = "FC4";
 
 std::optional<std::string> ReadEnvVar(const char* name) {
 #if defined(_WIN32) && defined(_MSC_VER)
@@ -84,7 +84,6 @@ struct BatchFileRecord {
     std::string relativePath;
     uint64_t fileSize = 0;
     int64_t mtimeNs = 0;
-    int64_t ctimeNs = 0;
     bool ok = false;
     fs::path absPath;
 };
@@ -345,7 +344,6 @@ void EnumerateManifestEntriesFast(
             entry.isDirectory = isDir;
             entry.fileSize = isDir ? 0 : (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
             entry.mtimeNs = FileTimeToTicks(fd.ftLastWriteTime);
-            entry.ctimeNs = FileTimeToTicks(fd.ftCreationTime);
             enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
 
             if (isDir) {
@@ -430,7 +428,6 @@ void EnumerateManifestEntriesFast(
             entry.mtimeNs = 0;
             ec.clear();
         }
-        entry.ctimeNs = entry.mtimeNs;
         enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
     }
 
@@ -447,7 +444,6 @@ std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
     AppendString(payload, entry.relativePath);
     AppendU64(payload, entry.fileSize);
     AppendI64(payload, entry.mtimeNs);
-    AppendI64(payload, entry.ctimeNs);
     return payload;
 }
 
@@ -461,7 +457,6 @@ FileEntry DecodeManifestEntry(const std::vector<uint8_t>& payload) {
     entry.relativePath = ReadString(payload, cursor);
     entry.fileSize = ReadU64(payload, cursor);
     entry.mtimeNs = ReadI64(payload, cursor);
-    entry.ctimeNs = ReadI64(payload, cursor);
     return entry;
 }
 
@@ -539,7 +534,6 @@ std::vector<uint8_t> EncodeFileBatchOpenResponse(const std::vector<BatchFileReco
         AppendString(payload, file.relativePath);
         AppendU64(payload, file.fileSize);
         AppendI64(payload, file.mtimeNs);
-        AppendI64(payload, file.ctimeNs);
     }
     return payload;
 }
@@ -558,7 +552,6 @@ std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8
         file.relativePath = ReadString(payload, cursor);
         file.fileSize = ReadU64(payload, cursor);
         file.mtimeNs = ReadI64(payload, cursor);
-        file.ctimeNs = ReadI64(payload, cursor);
         files.push_back(std::move(file));
     }
     return files;
@@ -622,7 +615,7 @@ LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& 
                 st.directories.insert(relPath);
                 stack.push_back(PendingDir{absPath, relPath});
             } else {
-                st.files.emplace(relPath, FileEntry{relPath, false, 0, 0, 0});
+                st.files.emplace(relPath, FileEntry{relPath, false, 0, 0});
             }
         } while (FindNextFileW(hFind, &fd) != 0);
 
@@ -666,7 +659,7 @@ LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& 
         if (isDir) {
             st.directories.insert(relPath);
         } else {
-            st.files.emplace(relPath, FileEntry{relPath, false, 0, 0, 0});
+            st.files.emplace(relPath, FileEntry{relPath, false, 0, 0});
         }
     }
 #endif
@@ -879,7 +872,6 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                 if (tec) {
                                     record.mtimeNs = 0;
                                 }
-                                record.ctimeNs = record.mtimeNs;
                                 record.ok = true;
                             }
                         }
@@ -1102,7 +1094,6 @@ struct BatchDownloadEntry {
     std::string relPath;
     uint64_t fileSize = 0;
     int64_t mtimeNs = 0;
-    int64_t ctimeNs = 0;
     bool serverOk = false;
     bool shouldWrite = false;
     bool finalized = false;
@@ -1257,7 +1248,7 @@ void TransferFileBatch(const SocketHandle& socket,
             it->second.output.close();
             const std::string rel = it->second.relPath;
             const FileEntry& meta = remoteFiles.at(rel);
-            SetFileCreateAndModifyTime(JoinRel(rootDir, rel), meta.ctimeNs, meta.mtimeNs);
+            SetFileModifyTime(JoinRel(rootDir, rel), meta.mtimeNs);
             activeDownloads.erase(it);
             streamToPath.erase(frame.streamId);
             ++completed;
@@ -1615,7 +1606,6 @@ int RunClient(const CliOptions& options) {
         if (ec) {
             entry.mtimeNs = 0;
         }
-        entry.ctimeNs = entry.mtimeNs;
         return entry;
     };
 
@@ -1772,7 +1762,7 @@ int RunClient(const CliOptions& options) {
                 entry.output.flush();
                 entry.output.close();
             }
-            SetFileCreateAndModifyTime(JoinRel(options.rootDir, entry.relPath), entry.ctimeNs, entry.mtimeNs);
+            SetFileModifyTime(JoinRel(options.rootDir, entry.relPath), entry.mtimeNs);
             ++compared;
             ++transferred;
             transferRetryCounts.erase(entry.relPath);
@@ -1826,7 +1816,7 @@ int RunClient(const CliOptions& options) {
                 scheduleTransfer(rel);
             } else {
                 const FileEntry& meta = remoteFiles.at(rel);
-                SetFileCreateAndModifyTime(JoinRel(options.rootDir, rel), meta.ctimeNs, meta.mtimeNs);
+                SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
                 ++compared;
                 ++unchanged;
             }
@@ -1896,7 +1886,6 @@ int RunClient(const CliOptions& options) {
                 entry.relPath = rec.relativePath;
                 entry.fileSize = rec.fileSize;
                 entry.mtimeNs = rec.mtimeNs;
-                entry.ctimeNs = rec.ctimeNs;
                 entry.serverOk = rec.ok;
                 entry.shouldWrite = entry.serverOk;
                 if (entry.serverOk && entry.fileSize == 0) {
@@ -1998,7 +1987,7 @@ int RunClient(const CliOptions& options) {
             it->second.output.close();
             const std::string rel = it->second.relPath;
             const FileEntry& meta = remoteFiles.at(rel);
-            SetFileCreateAndModifyTime(JoinRel(options.rootDir, rel), meta.ctimeNs, meta.mtimeNs);
+            SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
             activeDownloads.erase(it);
             streamToPath.erase(frame.streamId);
             ++compared;

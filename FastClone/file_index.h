@@ -15,7 +15,6 @@ struct FileEntry {
     bool isDirectory = false;
     uint64_t fileSize = 0;
     int64_t mtimeNs = 0;
-    int64_t ctimeNs = 0;
 };
 
 // Protocol name is kept as Hash256 for compatibility, but value is XXH3_128 (16 bytes).
@@ -27,6 +26,6 @@ bool HashEquals(const Hash256& a, const Hash256& b);
 std::string NormalizeRelativePath(const std::filesystem::path& relativePath);
 int64_t ToUnixNs(const std::filesystem::file_time_type& value);
 std::filesystem::file_time_type FromUnixNs(int64_t valueNs);
-void SetFileCreateAndModifyTime(const std::filesystem::path& path, int64_t createNs, int64_t modifyNs);
+void SetFileModifyTime(const std::filesystem::path& path, int64_t modifyNs);
 
 }  // namespace fc
