@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(FastClone LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -46,3 +48,7 @@ if(WIN32)
     target_compile_definitions(FastClone PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(FastClone PRIVATE ws2_32)
 endif()
+
+install(TARGETS FastClone
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)

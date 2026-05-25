@@ -122,3 +122,21 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+安装到系统路径（类似 `make install`）：
+
+```bash
+cmake --install build
+```
+
+自定义安装前缀（示例）：
+
+```bash
+cmake --install build --prefix /usr/local
+```
+
+安装后可直接在任意路径调用：
+
+```bash
+FastClone --help
+```
+
