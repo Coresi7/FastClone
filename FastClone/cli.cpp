@@ -84,7 +84,7 @@ uint64_t ParseSizeBytesStrict(const std::string& value, const char* name) {
         throw std::runtime_error(std::string("Invalid ") + name + ", expected suffix [K|M|G]");
     }
 
-    const unsigned long long maxValue = std::numeric_limits<uint64_t>::max() / multiplier;
+    const unsigned long long maxValue = (std::numeric_limits<uint64_t>::max)() / multiplier;
     if (base > maxValue) {
         throw std::runtime_error(std::string(name) + " is too large");
     }
