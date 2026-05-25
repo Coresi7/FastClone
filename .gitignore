@@ -18,3 +18,5 @@ FastClone/FastClone/x64/
 docs/
 .cursor/
 HARNESS_VERSION
+build/
+

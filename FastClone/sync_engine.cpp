@@ -1474,7 +1474,12 @@ int RunClient(const CliOptions& options) {
 
     std::mutex incomingMu;
     std::condition_variable incomingCv;
-    std::deque<Frame> incomingFrames;
+    std::deque<Frame> incomingPriorityFrames;
+    std::deque<Frame> incomingManifestFrames;
+    constexpr size_t kMaxQueuedIncomingFrames = 65536;
+    auto isManifestFrame = [](MsgType t) -> bool {
+        return t == MsgType::ManifestEntry || t == MsgType::ManifestProgress || t == MsgType::ManifestEnd;
+    };
     std::atomic<bool> recvStop = false;
     std::atomic<bool> recvClosed = false;
     std::string recvError;
@@ -1482,10 +1487,20 @@ int RunClient(const CliOptions& options) {
         try {
             while (!recvStop.load()) {
                 Frame f = RecvFrame(socket);
-                {
-                    std::lock_guard<std::mutex> lock(incomingMu);
-                    incomingFrames.push_back(std::move(f));
+                std::unique_lock<std::mutex> lock(incomingMu);
+                incomingCv.wait(lock, [&]() {
+                    return recvStop.load() ||
+                           (incomingPriorityFrames.size() + incomingManifestFrames.size()) < kMaxQueuedIncomingFrames;
+                });
+                if (recvStop.load()) {
+                    break;
                 }
+                if (isManifestFrame(f.type)) {
+                    incomingManifestFrames.push_back(std::move(f));
+                } else {
+                    incomingPriorityFrames.push_back(std::move(f));
+                }
+                lock.unlock();
                 incomingCv.notify_one();
             }
         } catch (const std::exception& ex) {
@@ -1883,12 +1898,12 @@ int RunClient(const CliOptions& options) {
                 entry.mtimeNs = rec.mtimeNs;
                 entry.ctimeNs = rec.ctimeNs;
                 entry.serverOk = rec.ok;
-                entry.shouldWrite = false;
-                if (entry.serverOk) {
+                entry.shouldWrite = entry.serverOk;
+                if (entry.serverOk && entry.fileSize == 0) {
                     const fs::path abs = JoinRel(options.rootDir, entry.relPath);
                     EnsureParentDir(abs);
-                    entry.output.open(abs, std::ios::binary | std::ios::trunc);
-                    entry.shouldWrite = entry.output.good();
+                    std::ofstream out(abs, std::ios::binary | std::ios::trunc);
+                    entry.shouldWrite = out.good();
                 }
                 if (!entry.serverOk || (entry.fileSize == 0 && entry.serverOk)) {
                     finalizeBatchEntry(entry);
@@ -1929,7 +1944,17 @@ int RunClient(const CliOptions& options) {
                 const size_t available = frame.payload.size() - offset;
                 const size_t take = static_cast<size_t>(std::min<uint64_t>(remainingForEntry, static_cast<uint64_t>(available)));
                 if (entry.shouldWrite) {
-                    entry.output.write(reinterpret_cast<const char*>(frame.payload.data() + offset), static_cast<std::streamsize>(take));
+                    if (!entry.output.is_open()) {
+                        const fs::path abs = JoinRel(options.rootDir, entry.relPath);
+                        EnsureParentDir(abs);
+                        entry.output.open(abs, std::ios::binary | std::ios::trunc);
+                        if (!entry.output.good()) {
+                            entry.shouldWrite = false;
+                        }
+                    }
+                    if (entry.shouldWrite) {
+                        entry.output.write(reinterpret_cast<const char*>(frame.payload.data() + offset), static_cast<std::streamsize>(take));
+                    }
                 }
                 entry.received += take;
                 offset += take;
@@ -2066,9 +2091,13 @@ int RunClient(const CliOptions& options) {
                         queuedCompareTasks = compareTasks.size();
                     }
                     size_t queuedIncomingFrames = 0;
+                    size_t queuedIncomingPriorityFrames = 0;
+                    size_t queuedIncomingManifestFrames = 0;
                     {
                         std::lock_guard<std::mutex> lock(incomingMu);
-                        queuedIncomingFrames = incomingFrames.size();
+                        queuedIncomingPriorityFrames = incomingPriorityFrames.size();
+                        queuedIncomingManifestFrames = incomingManifestFrames.size();
+                        queuedIncomingFrames = queuedIncomingPriorityFrames + queuedIncomingManifestFrames;
                     }
                     size_t queuedHashTasks = 0;
                     {
@@ -2090,6 +2119,8 @@ int RunClient(const CliOptions& options) {
                               << " ready_compare_results=" << readyCompareResults
                               << " delayed_compare_entries=" << delayedCompareEntries.size()
                               << " queued_incoming_frames=" << queuedIncomingFrames
+                              << " queued_incoming_prio=" << queuedIncomingPriorityFrames
+                              << " queued_incoming_manifest=" << queuedIncomingManifestFrames
                               << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size() +
                                                            pendingRetryTransfers.size() + pendingRetryBatchTransfers.size())
                               << " active_downloads=" << activeDownloads.size()
@@ -2118,20 +2149,33 @@ int RunClient(const CliOptions& options) {
                 continue;
             }
             std::deque<Frame> readyFrames;
+            bool releasedIncomingSlots = false;
             {
                 std::lock_guard<std::mutex> lock(incomingMu);
-                const size_t budget = std::min<size_t>(incomingFrames.size(), 512);
-                for (size_t i = 0; i < budget; ++i) {
-                    readyFrames.push_back(std::move(incomingFrames.front()));
-                    incomingFrames.pop_front();
+                constexpr size_t kDrainBudget = 512;
+                constexpr size_t kPriorityBudget = 384;
+                const size_t prioCount = std::min<size_t>(incomingPriorityFrames.size(), kPriorityBudget);
+                for (size_t i = 0; i < prioCount; ++i) {
+                    readyFrames.push_back(std::move(incomingPriorityFrames.front()));
+                    incomingPriorityFrames.pop_front();
                 }
+                const size_t remaining = kDrainBudget - readyFrames.size();
+                const size_t manifestCount = std::min<size_t>(incomingManifestFrames.size(), remaining);
+                for (size_t i = 0; i < manifestCount; ++i) {
+                    readyFrames.push_back(std::move(incomingManifestFrames.front()));
+                    incomingManifestFrames.pop_front();
+                }
+                releasedIncomingSlots = (prioCount + manifestCount) > 0;
+            }
+            if (releasedIncomingSlots) {
+                incomingCv.notify_one();
             }
             if (readyFrames.empty()) {
                 std::unique_lock<std::mutex> lock(incomingMu);
                 incomingCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
-                    return recvClosed.load() || !incomingFrames.empty();
+                    return recvClosed.load() || !incomingPriorityFrames.empty() || !incomingManifestFrames.empty();
                 });
-                if (recvClosed.load() && incomingFrames.empty()) {
+                if (recvClosed.load() && incomingPriorityFrames.empty() && incomingManifestFrames.empty()) {
                     break;
                 }
                 continue;
@@ -2142,6 +2186,7 @@ int RunClient(const CliOptions& options) {
         }
     } catch (...) {
         recvStop.store(true);
+        incomingCv.notify_all();
         ShutdownBoth(socket);
         compareStop.store(true);
         compareTaskCv.notify_all();
@@ -2189,6 +2234,7 @@ int RunClient(const CliOptions& options) {
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
     SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
     recvStop.store(true);
+    incomingCv.notify_all();
     ShutdownBoth(socket);
     if (recvThread.joinable()) {
         recvThread.join();

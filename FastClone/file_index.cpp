@@ -67,13 +67,18 @@ std::string NormalizeRelativePath(const fs::path& relativePath) {
 
 int64_t ToUnixNs(const fs::file_time_type& value) {
     using namespace std::chrono;
-    return duration_cast<nanoseconds>(value.time_since_epoch()).count();
+    const auto fileNow = fs::file_time_type::clock::now();
+    const auto sysNow = system_clock::now();
+    const auto sysTp = time_point_cast<system_clock::duration>(value - fileNow + sysNow);
+    return duration_cast<nanoseconds>(sysTp.time_since_epoch()).count();
 }
 
 fs::file_time_type FromUnixNs(int64_t valueNs) {
     using namespace std::chrono;
-    const auto d = duration_cast<fs::file_time_type::duration>(nanoseconds(valueNs));
-    return fs::file_time_type(d);
+    const auto unixNs = time_point<system_clock, nanoseconds>(nanoseconds(valueNs));
+    const auto fileNow = fs::file_time_type::clock::now();
+    const auto sysNow = system_clock::now();
+    return time_point_cast<fs::file_time_type::duration>(unixNs - sysNow + fileNow);
 }
 
 std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::path>& excludeAbsPath) {
@@ -301,7 +306,11 @@ void SetFileCreateAndModifyTime(const fs::path& path, int64_t createNs, int64_t 
     if (createNs != modifyNs) {
         const char* debugEnv = std::getenv("FASTCLONE_DEBUG");
         if (debugEnv != nullptr) {
-            std::cerr << "[debug][time] create time unsupported on this platform: " << path.string() << std::endl;
+            static std::atomic<bool> warnedOnce = false;
+            if (!warnedOnce.exchange(true)) {
+                std::cerr << "[debug][time] create time unsupported on this platform; "
+                          << "future logs suppressed. first_path=" << path.string() << std::endl;
+            }
         }
     }
     std::error_code ec;
