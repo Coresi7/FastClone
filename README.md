@@ -34,7 +34,7 @@ FastClone server [--dir <path>] [--port <n>] --password <pwd>
 ### Client
 
 ```bash
-FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]
+FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]
 ```
 
 - `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted)
@@ -42,6 +42,7 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `--password`: password (must match server)
 - `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`, and explicit values above `8` print a reliability warning)
 - `--chunk-kb`: chunk size in KB; auto-tuned when omitted, valid range `1..65536`
+- `--queued-file-size`: soft receive-queue memory target for adaptive throttling (default: `5G`, range: `256M..64G`, supports suffixes `K/M/G`)
 
 ## Progress Counters
 

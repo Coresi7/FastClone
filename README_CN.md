@@ -33,7 +33,7 @@ FastClone server [--dir <path>] [--port <n>] --password <pwd>
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]
+FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）
@@ -41,6 +41,7 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `--password`：口令（与服务端一致）
 - `--streams`：并发 stream 数；不传走 auto-tune（默认按 `4`，显式设置大于 `8` 会打印失败率风险警告）
 - `--chunk-kb`：块大小（KB）；不传走 auto-tune，范围 `1..65536`
+- `--queued-file-size`：接收队列内存软目标（用于自适应限速）；默认 `5G`，范围 `256M..64G`，支持 `K/M/G` 后缀
 
 ## 进度输出
 
