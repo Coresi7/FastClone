@@ -1467,6 +1467,11 @@ int RunClient(const CliOptions& options) {
     std::condition_variable incomingDataCv;
     std::deque<Frame> incomingPriorityFrames;
     std::deque<Frame> incomingManifestFrames;
+    uint64_t incomingQueuedBytes = 0;
+    const uint64_t incomingSoftLimitBytes = std::max<uint64_t>(256ULL * 1024ULL * 1024ULL, options.queuedFileSizeBytes);
+    auto frameWireBytes = [](const Frame& f) -> uint64_t {
+        return 9ULL + static_cast<uint64_t>(f.payload.size());
+    };
     auto isManifestFrame = [](MsgType t) -> bool {
         return t == MsgType::ManifestEntry || t == MsgType::ManifestProgress || t == MsgType::ManifestEnd;
     };
@@ -1477,15 +1482,34 @@ int RunClient(const CliOptions& options) {
         try {
             while (!recvStop.load()) {
                 Frame f = RecvFrame(socket);
+                const bool manifestFrame = isManifestFrame(f.type);
+                uint64_t queuedBytesSnapshot = 0;
                 {
                     std::lock_guard<std::mutex> lock(incomingMu);
-                    if (isManifestFrame(f.type)) {
+                    if (manifestFrame) {
                         incomingManifestFrames.push_back(std::move(f));
                     } else {
                         incomingPriorityFrames.push_back(std::move(f));
                     }
+                    incomingQueuedBytes += frameWireBytes(manifestFrame ? incomingManifestFrames.back() : incomingPriorityFrames.back());
+                    queuedBytesSnapshot = incomingQueuedBytes;
                 }
                 incomingDataCv.notify_one();
+
+                if (queuedBytesSnapshot > incomingSoftLimitBytes) {
+                    const uint64_t over = queuedBytesSnapshot - incomingSoftLimitBytes;
+                    uint64_t sleepUs = 300;
+                    if (over > incomingSoftLimitBytes * 2) {
+                        sleepUs = 5000;
+                    } else if (over > incomingSoftLimitBytes) {
+                        sleepUs = 3000;
+                    } else if (over > (incomingSoftLimitBytes / 2)) {
+                        sleepUs = 1500;
+                    } else if (over > (incomingSoftLimitBytes / 4)) {
+                        sleepUs = 700;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+                }
             }
         } catch (const std::exception& ex) {
             if (!recvStop.load()) {
@@ -2075,11 +2099,13 @@ int RunClient(const CliOptions& options) {
                     size_t queuedIncomingFrames = 0;
                     size_t queuedIncomingPriorityFrames = 0;
                     size_t queuedIncomingManifestFrames = 0;
+                    uint64_t queuedIncomingBytes = 0;
                     {
                         std::lock_guard<std::mutex> lock(incomingMu);
                         queuedIncomingPriorityFrames = incomingPriorityFrames.size();
                         queuedIncomingManifestFrames = incomingManifestFrames.size();
                         queuedIncomingFrames = queuedIncomingPriorityFrames + queuedIncomingManifestFrames;
+                        queuedIncomingBytes = incomingQueuedBytes;
                     }
                     size_t queuedHashTasks = 0;
                     {
@@ -2103,6 +2129,8 @@ int RunClient(const CliOptions& options) {
                               << " queued_incoming_frames=" << queuedIncomingFrames
                               << " queued_incoming_prio=" << queuedIncomingPriorityFrames
                               << " queued_incoming_manifest=" << queuedIncomingManifestFrames
+                              << " queued_incoming_mb=" << (queuedIncomingBytes / (1024ULL * 1024ULL))
+                              << " queued_limit_mb=" << (incomingSoftLimitBytes / (1024ULL * 1024ULL))
                               << " pending_transfers=" << (pendingTransfers.size() + pendingBatchTransfers.size() +
                                                            pendingRetryTransfers.size() + pendingRetryBatchTransfers.size())
                               << " active_downloads=" << activeDownloads.size()
@@ -2133,18 +2161,33 @@ int RunClient(const CliOptions& options) {
             std::deque<Frame> readyFrames;
             {
                 std::lock_guard<std::mutex> lock(incomingMu);
-                constexpr size_t kDrainBudget = 512;
-                constexpr size_t kPriorityBudget = 384;
+                size_t kDrainBudget = 512;
+                if (incomingQueuedBytes > incomingSoftLimitBytes * 3) {
+                    kDrainBudget = 4096;
+                } else if (incomingQueuedBytes > incomingSoftLimitBytes * 2) {
+                    kDrainBudget = 3072;
+                } else if (incomingQueuedBytes > incomingSoftLimitBytes) {
+                    kDrainBudget = 2048;
+                } else if (incomingQueuedBytes > (incomingSoftLimitBytes / 2)) {
+                    kDrainBudget = 1024;
+                }
+                const size_t kPriorityBudget = (kDrainBudget * 3) / 4;
                 const size_t prioCount = std::min<size_t>(incomingPriorityFrames.size(), kPriorityBudget);
                 for (size_t i = 0; i < prioCount; ++i) {
-                    readyFrames.push_back(std::move(incomingPriorityFrames.front()));
+                    Frame frame = std::move(incomingPriorityFrames.front());
                     incomingPriorityFrames.pop_front();
+                    const uint64_t sz = frameWireBytes(frame);
+                    incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
+                    readyFrames.push_back(std::move(frame));
                 }
                 const size_t remaining = kDrainBudget - readyFrames.size();
                 const size_t manifestCount = std::min<size_t>(incomingManifestFrames.size(), remaining);
                 for (size_t i = 0; i < manifestCount; ++i) {
-                    readyFrames.push_back(std::move(incomingManifestFrames.front()));
+                    Frame frame = std::move(incomingManifestFrames.front());
                     incomingManifestFrames.pop_front();
+                    const uint64_t sz = frameWireBytes(frame);
+                    incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
+                    readyFrames.push_back(std::move(frame));
                 }
             }
             if (readyFrames.empty()) {

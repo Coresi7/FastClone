@@ -19,6 +19,7 @@ struct CliOptions {
     std::string password;
     uint32_t streamLimit = 16;
     uint32_t chunkSize = 256 * 1024;
+    uint64_t queuedFileSizeBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
 };

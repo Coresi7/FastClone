@@ -5,7 +5,9 @@
 #endif
 
 #include <cstdlib>
+#include <cctype>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -42,7 +44,7 @@ void PrintUsage() {
     std::cerr
         << "Usage:\n"
         << "  fastclone server [--dir <path>] [--port <n>] --password <pwd>\n"
-        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>]\n"
+        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
 }
 
@@ -56,6 +58,37 @@ long ParseLongStrict(const std::string& value, const char* name) {
         throw std::runtime_error(std::string("Invalid ") + name);
     }
     return parsed;
+}
+
+uint64_t ParseSizeBytesStrict(const std::string& value, const char* name) {
+    if (value.empty()) {
+        throw std::runtime_error(std::string(name) + " is empty");
+    }
+    size_t idx = 0;
+    const unsigned long long base = std::stoull(value, &idx, 10);
+    std::string suffix = value.substr(idx);
+    for (char& c : suffix) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    uint64_t multiplier = 1;
+    if (suffix.empty() || suffix == "b") {
+        multiplier = 1;
+    } else if (suffix == "k" || suffix == "kb") {
+        multiplier = 1024ULL;
+    } else if (suffix == "m" || suffix == "mb") {
+        multiplier = 1024ULL * 1024ULL;
+    } else if (suffix == "g" || suffix == "gb") {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;
+    } else {
+        throw std::runtime_error(std::string("Invalid ") + name + ", expected suffix [K|M|G]");
+    }
+
+    const unsigned long long maxValue = std::numeric_limits<uint64_t>::max() / multiplier;
+    if (base > maxValue) {
+        throw std::runtime_error(std::string(name) + " is too large");
+    }
+    return static_cast<uint64_t>(base * multiplier);
 }
 
 std::pair<std::string, uint16_t> ParseHostPort(const std::string& input, uint16_t defaultPort) {
@@ -128,6 +161,14 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             }
             options.chunkSize = static_cast<uint32_t>(chunkKb * 1024);
             options.chunkAutoTune = false;
+        } else if (arg == "--queued-file-size") {
+            const uint64_t sizeBytes = ParseSizeBytesStrict(ArgAt(args, ++i), "--queued-file-size");
+            constexpr uint64_t kMin = 256ULL * 1024ULL * 1024ULL;
+            constexpr uint64_t kMax = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+            if (sizeBytes < kMin || sizeBytes > kMax) {
+                throw std::runtime_error("Invalid --queued-file-size (range: 256M..64G)");
+            }
+            options.queuedFileSizeBytes = sizeBytes;
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
