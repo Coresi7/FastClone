@@ -917,7 +917,14 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     didWork = true;
                     --highBudget;
                 }
-                size_t manifestBudget = outboundHigh.empty() ? 8 : 0;
+                size_t manifestBudget = 0;
+                if (!outboundManifest.empty()) {
+                    // Keep manifest draining even under hash/file pressure so ManifestEnd is not starved.
+                    manifestBudget = outboundHigh.empty() ? 16 : 4;
+                    if (outboundManifest.size() > (maxQueuedManifestFrames / 2)) {
+                        manifestBudget = outboundHigh.empty() ? 32 : 8;
+                    }
+                }
                 while (!outboundManifest.empty() && manifestBudget > 0) {
                     sendFrames.push_back(std::move(outboundManifest.front()));
                     outboundManifest.pop();
@@ -1445,6 +1452,18 @@ int RunClient(const CliOptions& options) {
     size_t lastTransferred = 0;
     size_t lastDeleted = 0;
     size_t reservedEntryCapacity = 0;
+    using steady_clock = std::chrono::steady_clock;
+    const auto stallWarnThreshold = std::chrono::minutes(1);
+    auto lastForwardProgressAt = steady_clock::now();
+    auto lastStallWarnAt = steady_clock::time_point{};
+    size_t lastProgressEnumerated = 0;
+    size_t lastProgressCompared = 0;
+    size_t lastProgressUnchanged = 0;
+    size_t lastProgressFailed = 0;
+    size_t lastProgressTransferred = 0;
+    size_t lastProgressFallbackResolved = 0;
+    size_t lastProgressHashResponses = 0;
+    size_t lastProgressCompareHandled = 0;
 
     auto ensureEntryReserve = [&](size_t expectedEntries) {
         const size_t target = expectedEntries + (expectedEntries / 2) + 1024;
@@ -2052,9 +2071,118 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    auto updateStallWatchdog = [&](bool loopHadForwardProgress) {
+        const size_t compareHandledNow = compareResultsHandled.load();
+        const bool countersAdvanced = loopHadForwardProgress ||
+                                      (enumerated != lastProgressEnumerated) ||
+                                      (compared != lastProgressCompared) ||
+                                      (unchanged != lastProgressUnchanged) ||
+                                      (failed != lastProgressFailed) ||
+                                      (transferred != lastProgressTransferred) ||
+                                      (fallbackResolved != lastProgressFallbackResolved) ||
+                                      (hashResponsesReceived != lastProgressHashResponses) ||
+                                      (compareHandledNow != lastProgressCompareHandled);
+        const auto now = steady_clock::now();
+        if (countersAdvanced) {
+            lastForwardProgressAt = now;
+            lastProgressEnumerated = enumerated;
+            lastProgressCompared = compared;
+            lastProgressUnchanged = unchanged;
+            lastProgressFailed = failed;
+            lastProgressTransferred = transferred;
+            lastProgressFallbackResolved = fallbackResolved;
+            lastProgressHashResponses = hashResponsesReceived;
+            lastProgressCompareHandled = compareHandledNow;
+            lastStallWarnAt = steady_clock::time_point{};
+            return;
+        }
+        const bool enoughToWarn = (now - lastForwardProgressAt) >= stallWarnThreshold;
+        const bool warnCooldownPassed =
+            (lastStallWarnAt == steady_clock::time_point{}) || ((now - lastStallWarnAt) >= stallWarnThreshold);
+        if (!enoughToWarn || !warnCooldownPassed) {
+            return;
+        }
+        size_t queuedIncomingPriorityFrames = 0;
+        size_t queuedIncomingManifestFrames = 0;
+        uint64_t queuedIncomingBytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(incomingMu);
+            queuedIncomingPriorityFrames = incomingPriorityFrames.size();
+            queuedIncomingManifestFrames = incomingManifestFrames.size();
+            queuedIncomingBytes = incomingQueuedBytes;
+        }
+        size_t queuedCompareTasks = 0;
+        {
+            std::lock_guard<std::mutex> lock(compareTaskMu);
+            queuedCompareTasks = compareTasks.size();
+        }
+        size_t queuedHashTasks = 0;
+        {
+            std::lock_guard<std::mutex> lock(hashTaskMu);
+            queuedHashTasks = hashTaskQueue.size();
+        }
+        const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
+        const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
+        const size_t pendingTransfersTotal = pendingTransfers.size() + pendingBatchTransfers.size() +
+                                             pendingRetryTransfers.size() + pendingRetryBatchTransfers.size();
+        std::string stallClass;
+        auto addStallTag = [&](const char* tag) {
+            if (!stallClass.empty()) {
+                stallClass.push_back('|');
+            }
+            stallClass += tag;
+        };
+        const size_t fallbackOpen = fallbackCount - fallbackResolved;
+        if (pendingTransfersTotal > 0 || !activeDownloads.empty() || !activeBatchDownloads.empty()) {
+            addStallTag("transfer_backlog");
+        }
+        if (compareInflight > 0 || queuedCompareTasks > 0 || !delayedCompareEntries.empty()) {
+            addStallTag("compare_backlog");
+        }
+        if (fallbackOpen > 0 || hashInflight > 0 || queuedHashTasks > 0 || !pendingHashRequests.empty()) {
+            addStallTag("hash_wait");
+        }
+        if (!manifestDone || queuedIncomingManifestFrames > 0) {
+            addStallTag("manifest_wait");
+        }
+        const bool waitingForNetwork = (!manifestDone) || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
+                                       (hashResponsesReceived < hashRequestsSent);
+        const bool incomingEmpty = (queuedIncomingPriorityFrames == 0 && queuedIncomingManifestFrames == 0);
+        if (waitingForNetwork && incomingEmpty) {
+            addStallTag("network_idle");
+        }
+        if (stallClass.empty()) {
+            addStallTag("unknown");
+        }
+        std::cerr << "[warn][client] suspected_stall stall_s="
+                  << std::chrono::duration_cast<std::chrono::seconds>(now - lastForwardProgressAt).count()
+                  << " stall_class=" << stallClass
+                  << " enum=" << enumerated
+                  << " compared=" << compared
+                  << " unchanged=" << unchanged
+                  << " failed=" << failed
+                  << " transferred=" << transferred
+                  << " manifest_done=" << (manifestDone ? 1 : 0)
+                  << " compare_inflight=" << compareInflight
+                  << " compare_queued=" << queuedCompareTasks
+                  << " hash_inflight=" << hashInflight
+                  << " hash_local_queued=" << queuedHashTasks
+                  << " hash_pending_req=" << pendingHashRequests.size()
+                  << " fallback_open=" << fallbackOpen
+                  << " pending_transfers=" << pendingTransfersTotal
+                  << " active_downloads=" << activeDownloads.size()
+                  << " active_batches=" << activeBatchDownloads.size()
+                  << " queued_incoming_prio=" << queuedIncomingPriorityFrames
+                  << " queued_incoming_manifest=" << queuedIncomingManifestFrames
+                  << " queued_incoming_mb=" << (queuedIncomingBytes / (1024ULL * 1024ULL))
+                  << std::endl;
+        lastStallWarnAt = now;
+    };
+
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
+            bool loopHadForwardProgress = false;
             resolveFallbackIfReady();
             dispatchHashRequests();
             refreshSmallBatchTuning();
@@ -2068,6 +2196,9 @@ int RunClient(const CliOptions& options) {
                 for (const auto& r : ready) {
                     handleCompareResult(r);
                     ++compareResultsHandled;
+                }
+                if (!ready.empty()) {
+                    loopHadForwardProgress = true;
                 }
             }
             while (!delayedCompareEntries.empty() &&
@@ -2155,6 +2286,7 @@ int RunClient(const CliOptions& options) {
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
                                           (hashResponsesReceived < hashRequestsSent);
             if (!needNetworkFrame) {
+                updateStallWatchdog(loopHadForwardProgress);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -2198,11 +2330,16 @@ int RunClient(const CliOptions& options) {
                 if (recvClosed.load() && incomingPriorityFrames.empty() && incomingManifestFrames.empty()) {
                     break;
                 }
+                updateStallWatchdog(loopHadForwardProgress);
                 continue;
             }
             for (auto& frame : readyFrames) {
                 processIncomingFrame(frame);
             }
+            if (!readyFrames.empty()) {
+                loopHadForwardProgress = true;
+            }
+            updateStallWatchdog(loopHadForwardProgress);
         }
     } catch (...) {
         recvStop.store(true);

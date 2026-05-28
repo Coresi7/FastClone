@@ -170,7 +170,7 @@ SocketHandle CreateServer(uint16_t port) {
     if (bind(listener.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         throw std::runtime_error(LastSocketError("bind failed"));
     }
-    if (listen(listener.Get(), 1) != 0) {
+    if (listen(listener.Get(), SOMAXCONN) != 0) {
         throw std::runtime_error(LastSocketError("listen failed"));
     }
     return listener;
