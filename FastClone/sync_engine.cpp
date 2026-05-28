@@ -1639,13 +1639,18 @@ int RunClient(const CliOptions& options) {
         }
         remoteFiles.reserve(target);
         remoteHashes.reserve(target);
-        localHashes.reserve(target);
         hashResolved.reserve(target);
         hashRequested.reserve(target);
-        localHashFailed.reserve(target);
         scheduledTransfers.reserve(target);
         transferRetryCounts.reserve(target);
         remoteDirs.reserve((target / 4) + 256);
+        {
+            // localHashes/localHashFailed are also updated by hash worker threads,
+            // so reserve must hold the same mutex to avoid concurrent rehash UB.
+            std::lock_guard<std::mutex> lock(hashResultMu);
+            localHashes.reserve(target);
+            localHashFailed.reserve(target);
+        }
         reservedEntryCapacity = target;
     };
 
