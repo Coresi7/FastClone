@@ -154,13 +154,15 @@ uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t str
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
 
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
+    constexpr int64_t kMtimeToleranceNs = 2LL * 1000LL * 1000LL;  // 2ms tolerance
     if (!localFile.has_value()) {
         return CompareAction::TransferNow;
     }
     if (localFile->fileSize != remoteFile.fileSize) {
         return CompareAction::TransferNow;
     }
-    if (localFile->mtimeNs == remoteFile.mtimeNs) {
+    const int64_t mtimeDelta = std::llabs(static_cast<long long>(localFile->mtimeNs - remoteFile.mtimeNs));
+    if (mtimeDelta <= kMtimeToleranceNs) {
         return CompareAction::Skip;
     }
     return CompareAction::FallbackHash;
@@ -1607,7 +1609,8 @@ int RunClient(const CliOptions& options) {
     size_t fallbackResolved = 0;
     size_t hashRequestsSent = 0;
     size_t hashResponsesReceived = 0;
-    const size_t maxInFlightHashRequests = std::max<size_t>(256, static_cast<size_t>(streamLimit) * 32);
+    const size_t maxInFlightHashRequests = std::clamp<size_t>(
+        std::max<size_t>(1024, static_cast<size_t>(streamLimit) * 256), 1024, 8192);
     constexpr uint8_t kMaxTransferRetries = 3;
     size_t lastEnum = 0;
     size_t lastCompared = 0;
