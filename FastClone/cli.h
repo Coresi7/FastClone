@@ -20,6 +20,7 @@ struct CliOptions {
     uint32_t streamLimit = 16;
     uint32_t chunkSize = 256 * 1024;
     uint64_t queuedFileSizeBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    uint32_t serverHashWorkers = 0;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
 };

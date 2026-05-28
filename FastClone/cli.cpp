@@ -43,7 +43,7 @@ const std::string& ArgAt(const std::vector<std::string>& args, size_t index) {
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
-        << "  fastclone server [--dir <path>] [--port <n>] --password <pwd>\n"
+        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] --password <pwd>\n"
         << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
 }
@@ -169,6 +169,12 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --queued-file-size (range: 256M..64G)");
             }
             options.queuedFileSizeBytes = sizeBytes;
+        } else if (arg == "--server-hash-workers") {
+            const long workers = ParseLongStrict(ArgAt(args, ++i), "--server-hash-workers");
+            if (workers < 0 || workers > 512) {
+                throw std::runtime_error("Invalid --server-hash-workers (range: 0..512)");
+            }
+            options.serverHashWorkers = static_cast<uint32_t>(workers);
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
@@ -179,6 +185,9 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     }
     if (options.rootDir.empty()) {
         throw std::runtime_error("Directory path is required");
+    }
+    if (options.mode == Mode::Client && options.serverHashWorkers != 0) {
+        throw std::runtime_error("--server-hash-workers is server-only");
     }
     options.rootDir = fs::weakly_canonical(options.rootDir);
     return options;

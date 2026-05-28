@@ -744,6 +744,104 @@ std::optional<fs::path> CurrentExePath() {
 #endif
 }
 
+uint32_t ResolveServerHashWorkerCount(const CliOptions& options) {
+    if (options.serverHashWorkers != 0) {
+        return options.serverHashWorkers;
+    }
+    const uint32_t hw = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+    uint32_t workers = hw / 2;
+    if (workers == 0) {
+        workers = 1;
+    }
+    if (workers < 2 && hw > 1) {
+        workers = 2;
+    }
+    workers = std::min<uint32_t>(workers, 16);
+    return workers;
+}
+
+class ServerHashThreadPool {
+public:
+    ~ServerHashThreadPool() {
+        Stop();
+    }
+
+    void Configure(uint32_t workerCount) {
+        if (workerCount == 0) {
+            throw std::runtime_error("Server hash worker count must be > 0");
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!workers_.empty()) {
+            if (configuredWorkers_ != workerCount) {
+                throw std::runtime_error("Server hash pool already configured with different worker count");
+            }
+            return;
+        }
+        configuredWorkers_ = workerCount;
+        stop_ = false;
+        for (uint32_t i = 0; i < workerCount; ++i) {
+            workers_.emplace_back([this]() {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mu_);
+                        cv_.wait(lock, [&]() { return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks_.front());
+                        tasks_.pop_front();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    void Enqueue(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (workers_.empty()) {
+                throw std::runtime_error("Server hash pool is not configured");
+            }
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+    size_t PendingTasks() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return tasks_.size();
+    }
+
+private:
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+    }
+
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    uint32_t configuredWorkers_ = 0;
+    bool stop_ = false;
+};
+
+ServerHashThreadPool& GetServerHashPool() {
+    static ServerHashThreadPool pool;
+    return pool;
+}
+
 void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
@@ -756,9 +854,6 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     std::unordered_map<uint32_t, ServerBatchStream> activeBatchStreams;
     std::mutex mu;
     std::condition_variable outboundCv;
-    std::mutex hashMu;
-    std::condition_variable hashCv;
-    std::deque<HashTask> hashTasks;
     std::queue<Frame> outboundHigh;
     std::queue<Frame> outboundManifest;
     const size_t maxQueuedManifestFrames = 512;
@@ -767,6 +862,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     std::string errorText;
     std::thread manifestThread;
     std::atomic<bool> manifestStarted = false;
+    std::mutex sessionHashMu;
+    std::condition_variable sessionHashCv;
+    size_t sessionPendingHashJobs = 0;
 
     auto enqueueHigh = [&](Frame frame) {
         std::lock_guard<std::mutex> lock(mu);
@@ -785,34 +883,6 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         outboundCv.notify_one();
     };
 
-    const uint32_t hashWorkerCount = std::max<uint32_t>(1, std::thread::hardware_concurrency());
-    std::vector<std::thread> hashWorkers;
-    hashWorkers.reserve(hashWorkerCount);
-    for (uint32_t i = 0; i < hashWorkerCount; ++i) {
-        hashWorkers.emplace_back([&]() {
-            while (true) {
-                HashTask task;
-                {
-                    std::unique_lock<std::mutex> lock(hashMu);
-                    hashCv.wait(lock, [&]() { return done.load() || !hashTasks.empty(); });
-                    if (done.load()) {
-                        return;
-                    }
-                    task = std::move(hashTasks.front());
-                    hashTasks.pop_front();
-                }
-                try {
-                    Hash256 hash = ComputeFileHash(task.absPath);
-                    enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(task.relPath, hash)});
-                } catch (...) {
-                    Hash256 fallbackHash{};
-                    fallbackHash.fill(0xFF);
-                    enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(task.relPath, fallbackHash)});
-                }
-            }
-        });
-    }
-
     std::thread receiver([&]() {
         try {
             while (!done.load()) {
@@ -827,7 +897,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         } catch (const std::exception& ex) {
                             failed.store(true);
                             done.store(true);
-                            hashCv.notify_all();
+                            sessionHashCv.notify_all();
                             errorText = ex.what();
                         }
                     });
@@ -835,10 +905,44 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     const std::string rel = DecodeHashRequest(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, rel);
                     {
-                        std::lock_guard<std::mutex> lock(hashMu);
-                        hashTasks.push_back(HashTask{rel, abs});
+                        std::lock_guard<std::mutex> lock(sessionHashMu);
+                        ++sessionPendingHashJobs;
                     }
-                    hashCv.notify_one();
+                    try {
+                        GetServerHashPool().Enqueue([&, rel, abs]() {
+                            Hash256 hash{};
+                            try {
+                                hash = ComputeFileHash(abs);
+                            } catch (...) {
+                                hash.fill(0xFF);
+                            }
+                            if (!done.load()) {
+                                try {
+                                    enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(rel, hash)});
+                                } catch (...) {
+                                    failed.store(true);
+                                    done.store(true);
+                                    outboundCv.notify_all();
+                                }
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(sessionHashMu);
+                                if (sessionPendingHashJobs > 0) {
+                                    --sessionPendingHashJobs;
+                                }
+                            }
+                            sessionHashCv.notify_all();
+                        });
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(sessionHashMu);
+                            if (sessionPendingHashJobs > 0) {
+                                --sessionPendingHashJobs;
+                            }
+                        }
+                        sessionHashCv.notify_all();
+                        throw;
+                    }
                 } else if (frame.type == MsgType::FileOpen) {
                     const std::string rel = DecodeFileOpen(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, rel);
@@ -884,7 +988,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
                     done.store(true);
-                    hashCv.notify_all();
+                    sessionHashCv.notify_all();
                     outboundCv.notify_all();
                 } else {
                     throw std::runtime_error("Unknown message in server session");
@@ -893,7 +997,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         } catch (const std::exception& ex) {
             failed.store(true);
             done.store(true);
-            hashCv.notify_all();
+            sessionHashCv.notify_all();
             outboundCv.notify_all();
             errorText = ex.what();
         }
@@ -1046,12 +1150,14 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     size_t pendingHashes = 0;
                     {
-                        std::lock_guard<std::mutex> lock(hashMu);
-                        pendingHashes = hashTasks.size();
+                        std::lock_guard<std::mutex> lock(sessionHashMu);
+                        pendingHashes = sessionPendingHashJobs;
                     }
+                    const size_t globalPendingHashes = GetServerHashPool().PendingTasks();
                     std::cerr << "[debug][server] queued_high=" << highQueued
                               << " queued_manifest=" << manifestQueued
-                              << " pending_hash_tasks=" << pendingHashes
+                              << " pending_hash_jobs=" << pendingHashes
+                              << " global_hash_queue=" << globalPendingHashes
                               << " active_streams=" << activeStreamCount
                               << " active_batches=" << activeBatchCount
                               << std::endl;
@@ -1068,7 +1174,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     } catch (const std::exception& ex) {
         failed.store(true);
         done.store(true);
-        hashCv.notify_all();
+        sessionHashCv.notify_all();
         outboundCv.notify_all();
         errorText = ex.what();
     }
@@ -1079,11 +1185,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     if (manifestThread.joinable()) {
         manifestThread.join();
     }
-    hashCv.notify_all();
-    for (auto& worker : hashWorkers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
+    {
+        std::unique_lock<std::mutex> lock(sessionHashMu);
+        sessionHashCv.wait(lock, [&]() { return sessionPendingHashJobs == 0; });
     }
     if (failed.load()) {
         throw std::runtime_error("Server session failed: " + errorText);
@@ -1283,7 +1387,12 @@ void TransferFileBatch(const SocketHandle& socket,
 int RunServer(const CliOptions& options) {
     WsaContext wsa;
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
+    const uint32_t hashWorkerCount = ResolveServerHashWorkerCount(options);
+    GetServerHashPool().Configure(hashWorkerCount);
     std::cout << "FastClone server root=" << options.rootDir.string() << " port=" << options.port << std::endl;
+    std::cout << "[hash-pool] workers=" << hashWorkerCount
+              << (options.serverHashWorkers == 0 ? " (auto)" : " (manual)")
+              << std::endl;
     if (options.streamAutoTune || options.chunkAutoTune) {
         std::cout << "[auto-tune] streams=" << tuned.streamLimit
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
