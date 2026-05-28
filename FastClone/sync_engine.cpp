@@ -1553,6 +1553,7 @@ int RunClient(const CliOptions& options) {
     std::condition_variable hashTaskCv;
     std::deque<ClientHashTask> hashTaskQueue;
     std::atomic<bool> hashStop = false;
+    std::atomic<size_t> localHashInFlight = 0;
 
     const uint32_t workerCount = std::max<uint32_t>(1, std::thread::hardware_concurrency());
     std::vector<std::thread> hashWorkers;
@@ -1570,6 +1571,7 @@ int RunClient(const CliOptions& options) {
                     task = std::move(hashTaskQueue.front());
                     hashTaskQueue.pop_front();
                 }
+                localHashInFlight.fetch_add(1, std::memory_order_relaxed);
                 try {
                     Hash256 hash = ComputeFileHash(task.absPath);
                     {
@@ -1582,6 +1584,7 @@ int RunClient(const CliOptions& options) {
                         localHashFailed.insert(task.relPath);
                     }
                 }
+                localHashInFlight.fetch_sub(1, std::memory_order_relaxed);
                 {
                     std::lock_guard<std::mutex> lock(fallbackReadyMu);
                     fallbackReadyQueue.push_back(task.relPath);
@@ -2023,6 +2026,63 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    auto sweepUnresolvedFallbackIfQuiescent = [&]() {
+        if (fallbackResolved >= fallbackCount) {
+            return;
+        }
+        if (!pendingHashRequests.empty()) {
+            return;
+        }
+        if (hashRequestsSent != hashResponsesReceived) {
+            return;
+        }
+        if (localHashInFlight.load(std::memory_order_relaxed) != 0) {
+            return;
+        }
+        std::vector<std::string> unresolved;
+        unresolved.reserve(hashRequested.size());
+        for (const std::string& rel : hashRequested) {
+            if (!hashResolved.contains(rel)) {
+                unresolved.push_back(rel);
+            }
+        }
+        if (unresolved.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(fallbackReadyMu);
+            for (const std::string& rel : unresolved) {
+                fallbackReadyQueue.push_back(rel);
+            }
+        }
+        resolveFallbackIfReady();
+
+        std::vector<std::string> stillUnresolved;
+        stillUnresolved.reserve(unresolved.size());
+        for (const std::string& rel : unresolved) {
+            if (!hashResolved.contains(rel)) {
+                stillUnresolved.push_back(rel);
+            }
+        }
+        if (stillUnresolved.empty()) {
+            return;
+        }
+
+        for (const std::string& rel : stillUnresolved) {
+            if (hashResolved.contains(rel)) {
+                continue;
+            }
+            // Fail-safe: if fallback cannot make progress in a fully quiescent state,
+            // force transfer to guarantee forward progress and avoid infinite stall.
+            scheduleTransfer(rel);
+            hashResolved.insert(rel);
+            ++fallbackResolved;
+            std::cerr << "[warn][client] fallback_force_transfer path=" << rel << std::endl;
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+                                lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+        }
+    };
+
     auto processIncomingFrame = [&](Frame& frame) {
         if (frame.type == MsgType::ManifestEntry) {
             FileEntry e = DecodeManifestEntry(frame.payload);
@@ -2282,6 +2342,7 @@ int RunClient(const CliOptions& options) {
             std::lock_guard<std::mutex> lock(hashTaskMu);
             queuedHashTasks = hashTaskQueue.size();
         }
+        const size_t hashLocalInflight = localHashInFlight.load(std::memory_order_relaxed);
         const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
         const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
         const size_t pendingTransfersTotal = pendingTransfers.size() + pendingBatchTransfers.size() +
@@ -2300,8 +2361,11 @@ int RunClient(const CliOptions& options) {
         if (compareInflight > 0 || queuedCompareTasks > 0 || !delayedCompareEntries.empty()) {
             addStallTag("compare_backlog");
         }
-        if (fallbackOpen > 0 || hashInflight > 0 || queuedHashTasks > 0 || !pendingHashRequests.empty()) {
+        if (fallbackOpen > 0 || hashInflight > 0 || queuedHashTasks > 0 || hashLocalInflight > 0 || !pendingHashRequests.empty()) {
             addStallTag("hash_wait");
+        }
+        if (hashLocalInflight > 0) {
+            addStallTag("hash_local_compute");
         }
         if (!manifestDone || queuedIncomingManifestFrames > 0) {
             addStallTag("manifest_wait");
@@ -2328,6 +2392,7 @@ int RunClient(const CliOptions& options) {
                   << " compare_queued=" << queuedCompareTasks
                   << " hash_inflight=" << hashInflight
                   << " hash_local_queued=" << queuedHashTasks
+                  << " hash_local_inflight=" << hashLocalInflight
                   << " hash_pending_req=" << pendingHashRequests.size()
                   << " fallback_open=" << fallbackOpen
                   << " pending_transfers=" << pendingTransfersTotal
@@ -2406,6 +2471,7 @@ int RunClient(const CliOptions& options) {
                     }
                     const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
                     const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
+                    const size_t hashLocalInflight = localHashInFlight.load(std::memory_order_relaxed);
                     std::cerr << "[debug][client] enum=" << enumerated
                               << " compared=" << compared
                               << " unchanged=" << unchanged
@@ -2414,6 +2480,7 @@ int RunClient(const CliOptions& options) {
                               << " in_flight_hash=" << hashInflight
                               << " pending_hash_req=" << pendingHashRequests.size()
                               << " pending_hash_local=" << queuedHashTasks
+                              << " in_flight_hash_local=" << hashLocalInflight
                               << " in_flight_compare=" << compareInflight
                               << " queued_compare_tasks=" << queuedCompareTasks
                               << " ready_compare_results=" << readyCompareResults
@@ -2446,6 +2513,7 @@ int RunClient(const CliOptions& options) {
             }
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
                                           (hashResponsesReceived < hashRequestsSent);
+            sweepUnresolvedFallbackIfQuiescent();
             if (!needNetworkFrame) {
                 updateStallWatchdog(loopHadForwardProgress);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
