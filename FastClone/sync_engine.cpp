@@ -1,6 +1,7 @@
 #include "sync_engine.h"
 
 #include "file_index.h"
+#include "hash_memcache.h"
 #include "path_utils.h"
 #include "protocol.h"
 #include "win_socket.h"
@@ -99,11 +100,6 @@ struct ServerBatchStream {
 struct LocalState {
     std::unordered_map<std::string, FileEntry> files;
     std::unordered_set<std::string> directories;
-};
-
-struct HashTask {
-    std::string relPath;
-    fs::path absPath;
 };
 
 struct ClientHashTask {
@@ -842,10 +838,37 @@ ServerHashThreadPool& GetServerHashPool() {
     return pool;
 }
 
+bool TryReadHashFingerprint(const fs::path& absPath, HashFingerprint& out) {
+    std::error_code ec;
+    if (!fs::exists(absPath, ec) || ec) {
+        return false;
+    }
+    if (!fs::is_regular_file(absPath, ec) || ec) {
+        return false;
+    }
+    const uint64_t size = static_cast<uint64_t>(fs::file_size(absPath, ec));
+    if (ec) {
+        return false;
+    }
+    const int64_t mtimeNs = ToUnixNs(fs::last_write_time(absPath, ec));
+    if (ec) {
+        return false;
+    }
+    out.fileSize = size;
+    out.mtimeNs = mtimeNs;
+    return true;
+}
+
+ServerHashMemCache& GetServerHashMemCache() {
+    static ServerHashMemCache cache;
+    return cache;
+}
+
 void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
+    const bool hashMemcacheEnabled = GetServerHashMemCache().Enabled();
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t streamLimit = tuned.streamLimit;
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
@@ -904,17 +927,37 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                 } else if (frame.type == MsgType::HashRequest) {
                     const std::string rel = DecodeHashRequest(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, rel);
+                    HashFingerprint fingerprint;
+                    const bool fingerprintValid = TryReadHashFingerprint(abs, fingerprint);
+                    if (hashMemcacheEnabled && fingerprintValid) {
+                        Hash256 cachedHash{};
+                        if (GetServerHashMemCache().TryGet(rel, fingerprint, cachedHash)) {
+                            enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(rel, cachedHash)});
+                            continue;
+                        }
+                    }
                     {
                         std::lock_guard<std::mutex> lock(sessionHashMu);
                         ++sessionPendingHashJobs;
                     }
                     try {
-                        GetServerHashPool().Enqueue([&, rel, abs]() {
+                        GetServerHashPool().Enqueue([&, rel, abs, fingerprint, fingerprintValid]() {
                             Hash256 hash{};
+                            bool hashOk = true;
                             try {
                                 hash = ComputeFileHash(abs);
                             } catch (...) {
+                                hashOk = false;
                                 hash.fill(0xFF);
+                            }
+                            if (hashMemcacheEnabled && hashOk) {
+                                HashFingerprint afterFingerprint;
+                                if (TryReadHashFingerprint(abs, afterFingerprint) &&
+                                    (!fingerprintValid ||
+                                     (afterFingerprint.fileSize == fingerprint.fileSize &&
+                                      afterFingerprint.mtimeNs == fingerprint.mtimeNs))) {
+                                    GetServerHashMemCache().Upsert(rel, afterFingerprint, hash);
+                                }
                             }
                             if (!done.load()) {
                                 try {
@@ -1154,10 +1197,17 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         pendingHashes = sessionPendingHashJobs;
                     }
                     const size_t globalPendingHashes = GetServerHashPool().PendingTasks();
+                    const size_t hashMemcacheEntries = GetServerHashMemCache().EntryCount();
+                    const uint64_t hashMemcacheHits = GetServerHashMemCache().HitCount();
+                    const uint64_t hashMemcacheMisses = GetServerHashMemCache().MissCount();
                     std::cerr << "[debug][server] queued_high=" << highQueued
                               << " queued_manifest=" << manifestQueued
                               << " pending_hash_jobs=" << pendingHashes
                               << " global_hash_queue=" << globalPendingHashes
+                              << " hash_memcache=" << (hashMemcacheEnabled ? 1 : 0)
+                              << " hash_memcache_entries=" << hashMemcacheEntries
+                              << " hash_memcache_hits=" << hashMemcacheHits
+                              << " hash_memcache_misses=" << hashMemcacheMisses
                               << " active_streams=" << activeStreamCount
                               << " active_batches=" << activeBatchCount
                               << std::endl;
@@ -1389,10 +1439,12 @@ int RunServer(const CliOptions& options) {
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t hashWorkerCount = ResolveServerHashWorkerCount(options);
     GetServerHashPool().Configure(hashWorkerCount);
+    GetServerHashMemCache().Configure(options.enableHashMemcache);
     std::cout << "FastClone server root=" << options.rootDir.string() << " port=" << options.port << std::endl;
     std::cout << "[hash-pool] workers=" << hashWorkerCount
               << (options.serverHashWorkers == 0 ? " (auto)" : " (manual)")
               << std::endl;
+    std::cout << "[hash-memcache] enabled=" << (options.enableHashMemcache ? 1 : 0) << std::endl;
     if (options.streamAutoTune || options.chunkAutoTune) {
         std::cout << "[auto-tune] streams=" << tuned.streamLimit
                   << " chunk-kb=" << (tuned.chunkSize / 1024)

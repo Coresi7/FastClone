@@ -21,6 +21,7 @@ struct CliOptions {
     uint32_t chunkSize = 256 * 1024;
     uint64_t queuedFileSizeBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     uint32_t serverHashWorkers = 0;
+    bool enableHashMemcache = false;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
 };

@@ -146,6 +146,7 @@
   <ItemGroup>
     <ClInclude Include="cli.h" />
     <ClInclude Include="file_index.h" />
+    <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="sync_engine.h" />
     <ClInclude Include="win_socket.h" />
@@ -153,6 +154,7 @@
   <ItemGroup>
     <ClCompile Include="cli.cpp" />
     <ClCompile Include="file_index.cpp" />
+    <ClCompile Include="hash_memcache.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="sync_engine.cpp" />

@@ -10,6 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(FastClone
     FastClone/cli.cpp
     FastClone/file_index.cpp
+    FastClone/hash_memcache.cpp
     FastClone/main.cpp
     FastClone/protocol.cpp
     FastClone/sync_engine.cpp
@@ -48,6 +49,22 @@ if(WIN32)
     target_compile_definitions(FastClone PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(FastClone PRIVATE ws2_32)
 endif()
+
+enable_testing()
+
+add_executable(FastCloneTests
+    FastClone/cli.cpp
+    FastClone/hash_memcache.cpp
+    tests/test_main.cpp
+    tests/test_cli.cpp
+    tests/test_hash_memcache.cpp
+)
+target_include_directories(FastCloneTests PRIVATE FastClone)
+target_link_libraries(FastCloneTests PRIVATE Threads::Threads)
+if(WIN32)
+    target_compile_definitions(FastCloneTests PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+add_test(NAME FastCloneTests COMMAND FastCloneTests)
 
 install(TARGETS FastClone
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

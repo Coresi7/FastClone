@@ -24,11 +24,13 @@ Supported platforms:
 ### Server
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>
 ```
 
 - `--dir`: server root directory (default: current directory)
 - `--port`: listening port (default: `27842`)
+- `--server-hash-workers`: global hash worker threads for all sessions (`0` = auto, range `0..512`, default auto)
+- `--enable-hash-memcache`: enable in-memory hash cache on server; reuses hash when `path + mtime + size` match
 - `--password`: pre-shared password (required)
 
 ### Client

@@ -23,11 +23,13 @@
 ### 服务端
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>
 ```
 
 - `--dir`：服务根目录；默认当前目录
 - `--port`：监听端口；默认 `27842`
+- `--server-hash-workers`：服务进程级 hash 线程数（对所有 session 生效）；`0` 表示自动，范围 `0..512`
+- `--enable-hash-memcache`：启用服务端内存 hash 缓存；当 `path + mtime + size` 一致时复用缓存 hash
 - `--password`：预共享口令（必填）
 
 ### 客户端
