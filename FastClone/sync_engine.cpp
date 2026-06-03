@@ -1909,9 +1909,9 @@ int RunClient(const CliOptions& options) {
         }
     });
 
-    uint64_t smallFileBatchThreshold = 128 * 1024;
-    size_t smallBatchMaxFiles = 256;
-    size_t smallBatchMaxBytes = 8 * 1024 * 1024;
+    uint64_t smallFileBatchThreshold = 192 * 1024;
+    size_t smallBatchMaxFiles = 768;
+    size_t smallBatchMaxBytes = 32 * 1024 * 1024;
     auto enqueueTransfer = [&](const std::string& rel, bool isRetry) {
         const auto it = remoteFiles.find(rel);
         const bool useBatch = (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold);
@@ -1963,33 +1963,79 @@ int RunClient(const CliOptions& options) {
     };
 
     auto refreshSmallBatchTuning = [&]() {
-        const size_t backlog = pendingBatchTransfers.size();
-        uint64_t threshold = 128 * 1024;
-        size_t maxFiles = 256;
-        size_t maxBytes = 8 * 1024 * 1024;
+        const size_t backlogBatch = pendingBatchTransfers.size() + pendingRetryBatchTransfers.size();
+        const size_t backlogRegular = pendingTransfers.size() + pendingRetryTransfers.size();
+        const size_t backlog = backlogBatch + backlogRegular;
+        uint64_t threshold = 192 * 1024;
+        size_t maxFiles = 768;
+        size_t maxBytes = 32 * 1024 * 1024;
 
-        if (backlog > 40000) {
+        if (backlog > 120000) {
+            threshold = 512 * 1024;
+            maxFiles = 2048;
+            maxBytes = 96 * 1024 * 1024;
+        } else if (backlog > 60000) {
+            threshold = 384 * 1024;
+            maxFiles = 1536;
+            maxBytes = 64 * 1024 * 1024;
+        } else if (backlog > 16000) {
             threshold = 256 * 1024;
-            maxFiles = 512;
-            maxBytes = 16 * 1024 * 1024;
-        } else if (backlog > 12000) {
-            threshold = 192 * 1024;
-            maxFiles = 384;
-            maxBytes = 12 * 1024 * 1024;
+            maxFiles = 1024;
+            maxBytes = 48 * 1024 * 1024;
         } else if (backlog < 1000) {
-            threshold = 96 * 1024;
-            maxFiles = 192;
-            maxBytes = 6 * 1024 * 1024;
+            threshold = 128 * 1024;
+            maxFiles = 512;
+            maxBytes = 20 * 1024 * 1024;
         }
 
+        // Low stream mode needs larger per-batch payload to amortize per-file
+        // transaction overhead (open/end/mtime) without raising stream count.
         if (streamLimit <= 8) {
-            maxBytes = std::max<size_t>(maxBytes, 16 * 1024 * 1024);
-            maxFiles = std::max<size_t>(maxFiles, 384);
+            threshold = std::max<uint64_t>(threshold, 320 * 1024);
+            maxBytes = std::max<size_t>(maxBytes, 64 * 1024 * 1024);
+            maxFiles = std::max<size_t>(maxFiles, 1280);
         }
 
         smallFileBatchThreshold = threshold;
         smallBatchMaxFiles = maxFiles;
         smallBatchMaxBytes = maxBytes;
+    };
+
+    auto rebalanceTransfersTowardBatch = [&]() {
+        // Reclassify part of regular queues into batch queues based on current
+        // dynamic threshold. This fixes early queueing decisions when threshold
+        // increases later under heavy backlog.
+        auto moveEligible = [&](std::deque<std::string>& from, std::deque<std::string>& to, size_t budget) {
+            if (from.empty() || budget == 0) {
+                return size_t{0};
+            }
+            std::deque<std::string> remain;
+            size_t moved = 0;
+            while (!from.empty()) {
+                std::string rel = std::move(from.front());
+                from.pop_front();
+                bool eligible = false;
+                const auto it = remoteFiles.find(rel);
+                if (it != remoteFiles.end()) {
+                    eligible = (it->second.fileSize <= smallFileBatchThreshold);
+                }
+                if (eligible && moved < budget) {
+                    to.push_back(std::move(rel));
+                    ++moved;
+                } else {
+                    remain.push_back(std::move(rel));
+                }
+            }
+            from.swap(remain);
+            return moved;
+        };
+
+        // Keep per-loop reclassification bounded.
+        const size_t moveBudget = std::max<size_t>(512, smallBatchMaxFiles);
+        const size_t moved = moveEligible(pendingTransfers, pendingBatchTransfers, moveBudget);
+        const size_t retryBudgetBase = std::max<size_t>(moveBudget / 2, size_t{256});
+        const size_t retryBudget = (moved >= retryBudgetBase) ? size_t{0} : (retryBudgetBase - moved);
+        moveEligible(pendingRetryTransfers, pendingRetryBatchTransfers, retryBudget);
     };
 
     auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
@@ -2008,13 +2054,20 @@ int RunClient(const CliOptions& options) {
         if (ec) {
             return std::nullopt;
         }
-        // Use the canonical reader so Windows compares manifest FILETIME ticks against
-        // local FILETIME ticks (same unit/epoch) instead of mismatched Unix ns.
-        entry.mtimeNs = ReadFileMtimeCanonical(abs);
+        // Compare hot path: use last_write_time directly to avoid per-file handle
+        // open/close overhead from ReadFileMtimeCanonical on huge unchanged sets.
+        // DecideCompareAction() already normalizes Unix-ns vs FILETIME ticks before
+        // applying tolerance, so cross-platform correctness is preserved.
+        entry.mtimeNs = ToUnixNs(fs::last_write_time(abs, ec));
+        if (ec) {
+            return std::nullopt;
+        }
         return entry;
     };
 
-    const uint32_t compareWorkerCount = std::min<uint32_t>(16, std::max<uint32_t>(4, workerCount));
+    // Compare workers follow logical CPU concurrency (hardware_concurrency),
+    // with a small safety floor for low-core machines.
+    const uint32_t compareWorkerCount = std::max<uint32_t>(4, workerCount);
     const size_t maxInFlightCompareTasks = std::max<size_t>(1024, static_cast<size_t>(compareWorkerCount) * 64);
     std::vector<std::thread> compareWorkers;
     compareWorkers.reserve(compareWorkerCount);
@@ -2626,6 +2679,7 @@ int RunClient(const CliOptions& options) {
             resolveFallbackIfReady();
             dispatchHashRequests();
             refreshSmallBatchTuning();
+            rebalanceTransfersTowardBatch();
             tryStartTransfers();
             {
                 std::deque<CompareResult> ready;
