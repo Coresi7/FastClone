@@ -1740,6 +1740,7 @@ int RunClient(const CliOptions& options) {
     std::condition_variable compareTaskCv;
     std::deque<CompareTask> compareTasks;
     std::mutex compareResultMu;
+    std::condition_variable compareResultCv;
     std::deque<CompareResult> compareResults;
     // Diagnostics-only: |local.mtimeNs - remote.mtimeNs| samples for size-equal files.
     std::mutex mtimeDeltaMu;
@@ -1867,37 +1868,79 @@ int RunClient(const CliOptions& options) {
     std::atomic<bool> recvStop = false;
     std::atomic<bool> recvClosed = false;
     std::string recvError;
+    auto applyRecvBackpressure = [&](uint64_t queuedBytesSnapshot) {
+        if (queuedBytesSnapshot <= incomingSoftLimitBytes) {
+            return;
+        }
+        const uint64_t over = queuedBytesSnapshot - incomingSoftLimitBytes;
+        uint64_t sleepUs = 300;
+        if (over > incomingSoftLimitBytes * 2) {
+            sleepUs = 5000;
+        } else if (over > incomingSoftLimitBytes) {
+            sleepUs = 3000;
+        } else if (over > (incomingSoftLimitBytes / 2)) {
+            sleepUs = 1500;
+        } else if (over > (incomingSoftLimitBytes / 4)) {
+            sleepUs = 700;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+    };
     std::thread recvThread([&]() {
+        // Manifest frames are tiny and arrive in a continuous flood; pushing each one
+        // under incomingMu (with a notify) made the receiver monopolise the lock and
+        // starve the single consumer (main loop), capping enumeration throughput.
+        // Accumulate manifest frames locally and hand them off in batches under ONE
+        // lock + one notify. Priority frames (file/hash traffic) are still flushed
+        // immediately to keep transfer latency low.
+        constexpr size_t kRecvManifestBatchFrames = 1024;
+        constexpr uint64_t kRecvManifestBatchBytes = 4ULL * 1024ULL * 1024ULL;
+        std::vector<Frame> manifestBatch;
+        manifestBatch.reserve(kRecvManifestBatchFrames);
+        uint64_t manifestBatchBytes = 0;
         try {
-            while (!recvStop.load()) {
-                Frame f = RecvFrame(socket);
-                const bool manifestFrame = isManifestFrame(f.type);
+            auto flushManifestBatch = [&]() {
+                if (manifestBatch.empty()) {
+                    return;
+                }
                 uint64_t queuedBytesSnapshot = 0;
                 {
                     std::lock_guard<std::mutex> lock(incomingMu);
-                    if (manifestFrame) {
-                        incomingManifestFrames.push_back(std::move(f));
-                    } else {
-                        incomingPriorityFrames.push_back(std::move(f));
+                    for (Frame& mf : manifestBatch) {
+                        incomingManifestFrames.push_back(std::move(mf));
                     }
-                    incomingQueuedBytes += frameWireBytes(manifestFrame ? incomingManifestFrames.back() : incomingPriorityFrames.back());
+                    incomingQueuedBytes += manifestBatchBytes;
                     queuedBytesSnapshot = incomingQueuedBytes;
                 }
                 incomingDataCv.notify_one();
+                manifestBatch.clear();
+                manifestBatchBytes = 0;
+                applyRecvBackpressure(queuedBytesSnapshot);
+            };
 
-                if (queuedBytesSnapshot > incomingSoftLimitBytes) {
-                    const uint64_t over = queuedBytesSnapshot - incomingSoftLimitBytes;
-                    uint64_t sleepUs = 300;
-                    if (over > incomingSoftLimitBytes * 2) {
-                        sleepUs = 5000;
-                    } else if (over > incomingSoftLimitBytes) {
-                        sleepUs = 3000;
-                    } else if (over > (incomingSoftLimitBytes / 2)) {
-                        sleepUs = 1500;
-                    } else if (over > (incomingSoftLimitBytes / 4)) {
-                        sleepUs = 700;
+            while (!recvStop.load()) {
+                Frame f = RecvFrame(socket);
+                if (isManifestFrame(f.type)) {
+                    const bool forceFlush = (f.type == MsgType::ManifestEnd);
+                    manifestBatchBytes += frameWireBytes(f);
+                    manifestBatch.push_back(std::move(f));
+                    if (forceFlush || manifestBatch.size() >= kRecvManifestBatchFrames ||
+                        manifestBatchBytes >= kRecvManifestBatchBytes) {
+                        flushManifestBatch();
                     }
-                    std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+                } else {
+                    // Keep any buffered manifest frames ahead of nothing in particular,
+                    // but flush them first so queue accounting stays monotonic, then
+                    // push the priority frame immediately.
+                    flushManifestBatch();
+                    uint64_t queuedBytesSnapshot = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(incomingMu);
+                        incomingPriorityFrames.push_back(std::move(f));
+                        incomingQueuedBytes += frameWireBytes(incomingPriorityFrames.back());
+                        queuedBytesSnapshot = incomingQueuedBytes;
+                    }
+                    incomingDataCv.notify_one();
+                    applyRecvBackpressure(queuedBytesSnapshot);
                 }
             }
         } catch (const std::exception& ex) {
@@ -2095,7 +2138,9 @@ int RunClient(const CliOptions& options) {
     // Compare workers follow logical CPU concurrency (hardware_concurrency),
     // with a small safety floor for low-core machines.
     const uint32_t compareWorkerCount = std::max<uint32_t>(4, workerCount);
-    const size_t maxInFlightCompareTasks = std::max<size_t>(1024, static_cast<size_t>(compareWorkerCount) * 64);
+    // Keep a deep in-flight window so the compare workers do not run dry while the
+    // single main thread is busy ingesting a burst of manifest frames between refills.
+    const size_t maxInFlightCompareTasks = std::max<size_t>(8192, static_cast<size_t>(compareWorkerCount) * 256);
     constexpr size_t kCompareBatchPop = 32;
     std::vector<std::thread> compareWorkers;
     compareWorkers.reserve(compareWorkerCount);
@@ -2132,10 +2177,16 @@ int RunClient(const CliOptions& options) {
                     resultBatch.push_back(std::move(result));
                 }
                 if (!resultBatch.empty()) {
-                    std::lock_guard<std::mutex> lock(compareResultMu);
-                    for (CompareResult& result : resultBatch) {
-                        compareResults.push_back(std::move(result));
+                    {
+                        std::lock_guard<std::mutex> lock(compareResultMu);
+                        for (CompareResult& result : resultBatch) {
+                            compareResults.push_back(std::move(result));
+                        }
                     }
+                    // Wake the main loop promptly so it can drain results and refill the
+                    // worker queue; without this the loop only polls once per iteration
+                    // and workers idle after exhausting the in-flight batch.
+                    compareResultCv.notify_one();
                 }
             }
             if (diagnostics && !localMtimeDeltas.empty()) {
@@ -2745,6 +2796,16 @@ int RunClient(const CliOptions& options) {
         lastStallWarnAt = now;
     };
 
+    // Compare-buffer backpressure (hysteresis). The single main thread time-shares
+    // between ingesting manifest (-> delayedCompareEntries) and servicing compare
+    // (drain results + refill workers). Letting ingestion run flat out buries the
+    // thread, starves the workers, and balloons delayedCompareEntries in RAM. So once
+    // the buffer is comfortably deep we pause manifest ingestion and hand the thread
+    // to compare until the buffer drains below the low-water mark.
+    const size_t kDelayedHighWater = 512 * 1024;
+    const size_t kDelayedLowWater = 256 * 1024;
+    bool ingestPaused = false;
+
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
@@ -2856,6 +2917,17 @@ int RunClient(const CliOptions& options) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            // Update the ingest pause state (hysteresis) from the current compare
+            // buffer depth before deciding how much manifest to pull this iteration.
+            const size_t delayedBacklog = delayedCompareEntries.size();
+            if (ingestPaused) {
+                if (delayedBacklog <= kDelayedLowWater) {
+                    ingestPaused = false;
+                }
+            } else if (delayedBacklog >= kDelayedHighWater) {
+                ingestPaused = true;
+            }
+
             std::deque<Frame> readyFrames;
             {
                 std::lock_guard<std::mutex> lock(incomingMu);
@@ -2869,6 +2941,21 @@ int RunClient(const CliOptions& options) {
                 } else if (incomingQueuedBytes > (incomingSoftLimitBytes / 2)) {
                     kDrainBudget = 1024;
                 }
+                // Manifest frames are tiny, so the byte thresholds above badly
+                // under-count a huge frame backlog. Scale the budget by queued FRAME
+                // COUNT too, but keep the per-iteration manifest chunk MODERATE so the
+                // loop cycles back to service compare (drain results + refill workers)
+                // frequently instead of burying the thread in one giant decode burst.
+                const size_t queuedFrames = incomingPriorityFrames.size() + incomingManifestFrames.size();
+                size_t frameBudget = 512;
+                if (queuedFrames > 50000) {
+                    frameBudget = 8192;
+                } else if (queuedFrames > 8000) {
+                    frameBudget = 4096;
+                } else if (queuedFrames > 2000) {
+                    frameBudget = 2048;
+                }
+                kDrainBudget = std::max<size_t>(kDrainBudget, frameBudget);
                 const size_t kPriorityBudget = (kDrainBudget * 3) / 4;
                 const size_t prioCount = std::min<size_t>(incomingPriorityFrames.size(), kPriorityBudget);
                 for (size_t i = 0; i < prioCount; ++i) {
@@ -2878,17 +2965,36 @@ int RunClient(const CliOptions& options) {
                     incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
                     readyFrames.push_back(std::move(frame));
                 }
-                const size_t remaining = kDrainBudget - readyFrames.size();
-                const size_t manifestCount = std::min<size_t>(incomingManifestFrames.size(), remaining);
-                for (size_t i = 0; i < manifestCount; ++i) {
-                    Frame frame = std::move(incomingManifestFrames.front());
-                    incomingManifestFrames.pop_front();
-                    const uint64_t sz = frameWireBytes(frame);
-                    incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
-                    readyFrames.push_back(std::move(frame));
+                // While ingest is paused, only priority frames (file/hash) are pulled;
+                // manifest stays buffered so the thread can drain the compare backlog.
+                if (!ingestPaused) {
+                    const size_t remaining = kDrainBudget - readyFrames.size();
+                    const size_t manifestCount = std::min<size_t>(incomingManifestFrames.size(), remaining);
+                    for (size_t i = 0; i < manifestCount; ++i) {
+                        Frame frame = std::move(incomingManifestFrames.front());
+                        incomingManifestFrames.pop_front();
+                        const uint64_t sz = frameWireBytes(frame);
+                        incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
+                        readyFrames.push_back(std::move(frame));
+                    }
                 }
             }
             if (readyFrames.empty()) {
+                // Two distinct idle reasons:
+                //  (a) compare work still in flight (or ingest deliberately paused to
+                //      drain the buffer): wait briefly on compare results so we refill
+                //      the workers promptly instead of sleeping on incoming frames.
+                //  (b) genuinely nothing to do: wait on incoming frames.
+                const bool compareWorkPending =
+                    (compareTasksIssued.load() != compareResultsHandled.load()) || !delayedCompareEntries.empty();
+                if (ingestPaused || compareWorkPending) {
+                    std::unique_lock<std::mutex> lock(compareResultMu);
+                    compareResultCv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+                        return !compareResults.empty();
+                    });
+                    updateStallWatchdog(loopHadForwardProgress);
+                    continue;
+                }
                 std::unique_lock<std::mutex> lock(incomingMu);
                 incomingDataCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
                     return recvClosed.load() || !incomingPriorityFrames.empty() || !incomingManifestFrames.empty();
