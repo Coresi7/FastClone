@@ -85,6 +85,34 @@ fs::file_time_type FromUnixNs(int64_t valueNs) {
     return fs::file_time_type(sysDur - kFileToSystemDelta);
 }
 
+int64_t ReadFileMtimeCanonical(const fs::path& path) {
+#ifdef _WIN32
+    // FILE_FLAG_BACKUP_SEMANTICS lets a single open path serve both regular files
+    // and directories, returning FILETIME ticks consistent with the manifest writer.
+    HANDLE handle = CreateFileW(path.wstring().c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+        FILETIME accessFt{}, writeFt{};
+        const BOOL ok = GetFileTime(handle, nullptr, &accessFt, &writeFt);
+        CloseHandle(handle);
+        if (ok != 0) {
+            return ToNsFromFileTime(writeFt);
+        }
+    }
+    // Fallback keeps the previous best-effort behavior; individual files that fall
+    // back may diverge in unit and merely re-enter FallbackHash (correct, slower).
+    std::error_code ec;
+    const int64_t ns = ToUnixNs(fs::last_write_time(path, ec));
+    return ec ? 0 : ns;
+#else
+    std::error_code ec;
+    const int64_t ns = ToUnixNs(fs::last_write_time(path, ec));
+    return ec ? 0 : ns;
+#endif
+}
+
 std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::path>& excludeAbsPath) {
     std::vector<FileEntry> output;
     const fs::path canonicalRoot = fs::weakly_canonical(root);
@@ -134,56 +162,14 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
 
                 if (c.isDirectory) {
                     entry.fileSize = 0;
-#ifdef _WIN32
-                    HANDLE handle = CreateFileW(c.absPath.wstring().c_str(), GENERIC_READ,
-                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                                nullptr, OPEN_EXISTING,
-                                                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-                    if (handle != INVALID_HANDLE_VALUE) {
-                        FILETIME accessFt{}, writeFt{};
-                        if (GetFileTime(handle, nullptr, &accessFt, &writeFt) != 0) {
-                            entry.mtimeNs = ToNsFromFileTime(writeFt);
-                        }
-                        CloseHandle(handle);
-                    }
-                    if (entry.mtimeNs == 0) {
-                        entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                    }
-#else
-                    std::error_code tec;
-                    entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath, tec));
-                    if (tec) {
-                        entry.mtimeNs = 0;
-                    }
-#endif
+                    entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else if (c.isRegular) {
                     std::error_code sec;
                     entry.fileSize = static_cast<uint64_t>(fs::file_size(c.absPath, sec));
                     if (sec) {
                         continue;
                     }
-#ifdef _WIN32
-                    HANDLE handle = CreateFileW(c.absPath.wstring().c_str(), GENERIC_READ,
-                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                    if (handle != INVALID_HANDLE_VALUE) {
-                        FILETIME accessFt{}, writeFt{};
-                        if (GetFileTime(handle, nullptr, &accessFt, &writeFt) != 0) {
-                            entry.mtimeNs = ToNsFromFileTime(writeFt);
-                        } else {
-                            entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                        }
-                        CloseHandle(handle);
-                    } else {
-                        entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath));
-                    }
-#else
-                    std::error_code tec;
-                    entry.mtimeNs = ToUnixNs(fs::last_write_time(c.absPath, tec));
-                    if (tec) {
-                        entry.mtimeNs = 0;
-                    }
-#endif
+                    entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else {
                     continue;
                 }

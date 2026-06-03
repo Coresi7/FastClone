@@ -24,6 +24,7 @@ struct CliOptions {
     bool enableHashMemcache = false;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
+    bool diagnostics = false;
 };
 
 #if defined(_WIN32) && defined(_MSC_VER)

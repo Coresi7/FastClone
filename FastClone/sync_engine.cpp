@@ -26,6 +26,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -63,16 +64,25 @@ std::optional<std::string> ReadEnvVar(const char* name) {
 #endif
 }
 
+bool ParseBoolEnv(const char* name) {
+    const std::optional<std::string> env = ReadEnvVar(name);
+    if (!env.has_value()) {
+        return false;
+    }
+    std::string v = *env;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
 bool IsDebugEnabled() {
-    static const bool enabled = []() {
-        const std::optional<std::string> env = ReadEnvVar("FASTCLONE_DEBUG");
-        if (!env.has_value()) {
-            return false;
-        }
-        std::string v = *env;
-        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return v == "1" || v == "true" || v == "yes" || v == "on";
-    }();
+    static const bool enabled = ParseBoolEnv("FASTCLONE_DEBUG");
+    return enabled;
+}
+
+// Design §A.3: --diag must also honour the FASTCLONE_DIAG environment variable,
+// reusing the same boolean parsing as FASTCLONE_DEBUG.
+bool IsDiagEnabled() {
+    static const bool enabled = ParseBoolEnv("FASTCLONE_DIAG");
     return enabled;
 }
 
@@ -153,17 +163,57 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
 
+bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs) {
+    // Heuristic shared with file_index.cpp compatibility logic:
+    // values above this threshold are very likely Unix nanoseconds.
+    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
+    // 1970-01-01 UTC offset in FILETIME 100ns ticks since 1601-01-01.
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
+
+    if (rawMtime > kLikelyUnixNsThreshold) {
+        outUnixNs = rawMtime;
+        return true;
+    }
+    // Treat lower values as FILETIME ticks. If conversion is not meaningful
+    // (e.g. unknown/legacy sentinel), caller can fall back to raw compare.
+    if (rawMtime < kWindowsEpochDiff100ns) {
+        return false;
+    }
+    const int64_t ticksSinceUnixEpoch = rawMtime - kWindowsEpochDiff100ns;
+    if (ticksSinceUnixEpoch > (std::numeric_limits<int64_t>::max)() / 100LL ||
+        ticksSinceUnixEpoch < (std::numeric_limits<int64_t>::min)() / 100LL) {
+        return false;
+    }
+    outUnixNs = ticksSinceUnixEpoch * 100LL;
+    return true;
+}
+
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
     constexpr int64_t kMtimeToleranceNs = 2LL * 1000LL * 1000LL;  // 2ms tolerance
+    constexpr int64_t kLegacyRawTolerance = 2LL * 1000LL * 1000LL;
     if (!localFile.has_value()) {
         return CompareAction::TransferNow;
     }
     if (localFile->fileSize != remoteFile.fileSize) {
         return CompareAction::TransferNow;
     }
-    const int64_t mtimeDelta = std::llabs(static_cast<long long>(localFile->mtimeNs - remoteFile.mtimeNs));
-    if (mtimeDelta <= kMtimeToleranceNs) {
-        return CompareAction::Skip;
+
+    // Cross-platform compare: normalize both sides to Unix ns before tolerance check.
+    int64_t localUnixNs = 0;
+    int64_t remoteUnixNs = 0;
+    const bool localNormalized = TryNormalizeMtimeToUnixNs(localFile->mtimeNs, localUnixNs);
+    const bool remoteNormalized = TryNormalizeMtimeToUnixNs(remoteFile.mtimeNs, remoteUnixNs);
+    if (localNormalized && remoteNormalized) {
+        const int64_t mtimeDeltaNs = std::llabs(static_cast<long long>(localUnixNs - remoteUnixNs));
+        if (mtimeDeltaNs <= kMtimeToleranceNs) {
+            return CompareAction::Skip;
+        }
+    } else {
+        // Compatibility fallback for legacy/invalid timestamp payloads.
+        const int64_t rawDelta = std::llabs(static_cast<long long>(localFile->mtimeNs - remoteFile.mtimeNs));
+        if (rawDelta <= kLegacyRawTolerance) {
+            return CompareAction::Skip;
+        }
     }
     return CompareAction::FallbackHash;
 }
@@ -875,19 +925,33 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     const uint32_t streamLimit = tuned.streamLimit;
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
 
-    std::unordered_map<uint32_t, ServerStream> activeStreams;
-    std::unordered_map<uint32_t, ServerBatchStream> activeBatchStreams;
+    static std::atomic<uint64_t> g_sessionIdCounter{0};
+    const uint64_t sessionId = g_sessionIdCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Lock ordering (must never nest in the other direction):
+    //   mu  >  sessionHashMu
+    // i.e. it is forbidden to acquire sessionHashMu while holding mu, or vice versa.
+    // `mu` protects only the outbound queues and the hand-off queues below; it must
+    // NOT cover file I/O. The active*Streams containers are owned exclusively by the
+    // main send loop thread (adopted from pendingNew*Streams) and are accessed without
+    // mu, so all open()/read() happens outside any lock.
+    std::unordered_map<uint32_t, ServerStream> activeStreams;        // main-loop private
+    std::unordered_map<uint32_t, ServerBatchStream> activeBatchStreams;  // main-loop private
     std::mutex mu;
     std::condition_variable outboundCv;
     std::queue<Frame> outboundHigh;
     std::queue<Frame> outboundManifest;
+    // Hand-off queues: receiver pushes newly opened streams here (cheap move under mu);
+    // the main loop adopts them into its private containers, then does I/O lock-free.
+    std::vector<std::pair<uint32_t, ServerStream>> pendingNewStreams;
+    std::vector<std::pair<uint32_t, ServerBatchStream>> pendingNewBatchStreams;
     const size_t maxQueuedManifestFrames = 512;
     std::atomic<bool> done = false;
     std::atomic<bool> failed = false;
     std::string errorText;
     std::thread manifestThread;
     std::atomic<bool> manifestStarted = false;
-    std::mutex sessionHashMu;
+    std::mutex sessionHashMu;  // lock order: acquire only when NOT holding mu (mu > sessionHashMu)
     std::condition_variable sessionHashCv;
     size_t sessionPendingHashJobs = 0;
 
@@ -1000,7 +1064,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     {
                         std::lock_guard<std::mutex> lock(mu);
-                        activeStreams.emplace(frame.streamId, std::move(st));
+                        pendingNewStreams.emplace_back(frame.streamId, std::move(st));
                     }
                     outboundCv.notify_one();
                 } else if (frame.type == MsgType::FileBatchOpen) {
@@ -1016,11 +1080,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             fs::is_regular_file(record.absPath, ec) && !ec) {
                             record.fileSize = static_cast<uint64_t>(fs::file_size(record.absPath, ec));
                             if (!ec) {
-                                std::error_code tec;
-                                record.mtimeNs = ToUnixNs(fs::last_write_time(record.absPath, tec));
-                                if (tec) {
-                                    record.mtimeNs = 0;
-                                }
+                                // Same canonical mtime unit as the manifest path.
+                                record.mtimeNs = ReadFileMtimeCanonical(record.absPath);
                                 record.ok = true;
                             }
                         }
@@ -1028,7 +1089,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     {
                         std::lock_guard<std::mutex> lock(mu);
-                        activeBatchStreams.emplace(frame.streamId, std::move(batch));
+                        pendingNewBatchStreams.emplace_back(frame.streamId, std::move(batch));
                     }
                     outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
@@ -1048,6 +1109,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         }
     });
 
+    // Diagnostics-only lock metrics (samples since last debug print), gated by debugEnabled.
+    // Declared at function scope so the exception-window snapshot below (AC-B3) can summarise
+    // the most recent lock-wait / critical-section samples after the main loop unwinds.
+    std::vector<int64_t> muWaitUs;
+    std::vector<int64_t> muHoldUs;
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         const size_t perStreamBurstBytes = (streamLimit <= 8)
@@ -1057,8 +1123,14 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
             bool didWork = false;
             std::vector<Frame> sendFrames;
             sendFrames.reserve(std::max<size_t>(256, static_cast<size_t>(streamLimit) * 8));
+            // Critical section: drain outbound queues and adopt newly opened streams only.
+            // No file I/O happens under `mu` (see lock-ordering note at declarations).
             {
-                std::lock_guard<std::mutex> lock(mu);
+                const auto muWaitStart = debugEnabled ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+                std::unique_lock<std::mutex> lock(mu);
+                const auto muAcquired = debugEnabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
                 size_t highBudget = 256;
                 while (!outboundHigh.empty() && highBudget > 0) {
                     sendFrames.push_back(std::move(outboundHigh.front()));
@@ -1081,6 +1153,25 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     didWork = true;
                     --manifestBudget;
                 }
+                // Adopt any newly opened streams into main-loop-private containers.
+                for (auto& kv : pendingNewStreams) {
+                    activeStreams.emplace(kv.first, std::move(kv.second));
+                    didWork = true;
+                }
+                pendingNewStreams.clear();
+                for (auto& kv : pendingNewBatchStreams) {
+                    activeBatchStreams.emplace(kv.first, std::move(kv.second));
+                    didWork = true;
+                }
+                pendingNewBatchStreams.clear();
+                if (debugEnabled) {
+                    muWaitUs.push_back(std::chrono::duration_cast<std::chrono::microseconds>(muAcquired - muWaitStart).count());
+                    const auto muReleased = std::chrono::steady_clock::now();
+                    muHoldUs.push_back(std::chrono::duration_cast<std::chrono::microseconds>(muReleased - muAcquired).count());
+                }
+            }
+            // ---- Lock-free section: all file open()/read() runs without holding mu ----
+            {
                 const bool hasRegularStreams = !activeStreams.empty();
                 const size_t batchSendQuotaBytes = (streamLimit <= 8) ? (24 * 1024 * 1024) : (12 * 1024 * 1024);
                 size_t batchBytesSentThisRound = 0;
@@ -1184,15 +1275,16 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                 if ((now - lastDebugPrint) >= std::chrono::seconds(1)) {
                     size_t highQueued = 0;
                     size_t manifestQueued = 0;
-                    size_t activeStreamCount = 0;
-                    size_t activeBatchCount = 0;
+                    size_t pendingAdopt = 0;
                     {
                         std::lock_guard<std::mutex> lock(mu);
                         highQueued = outboundHigh.size();
                         manifestQueued = outboundManifest.size();
-                        activeStreamCount = activeStreams.size();
-                        activeBatchCount = activeBatchStreams.size();
+                        pendingAdopt = pendingNewStreams.size() + pendingNewBatchStreams.size();
                     }
+                    // active*Streams are main-loop private; safe to read without mu.
+                    const size_t activeStreamCount = activeStreams.size();
+                    const size_t activeBatchCount = activeBatchStreams.size();
                     size_t pendingHashes = 0;
                     {
                         std::lock_guard<std::mutex> lock(sessionHashMu);
@@ -1202,8 +1294,26 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     const size_t hashMemcacheEntries = GetServerHashMemCache().EntryCount();
                     const uint64_t hashMemcacheHits = GetServerHashMemCache().HitCount();
                     const uint64_t hashMemcacheMisses = GetServerHashMemCache().MissCount();
-                    std::cerr << "[debug][server] queued_high=" << highQueued
+                    auto pct = [](std::vector<int64_t>& v, double p) -> int64_t {
+                        if (v.empty()) {
+                            return 0;
+                        }
+                        std::sort(v.begin(), v.end());
+                        size_t idx = static_cast<size_t>(p * static_cast<double>(v.size() - 1) + 0.5);
+                        if (idx >= v.size()) {
+                            idx = v.size() - 1;
+                        }
+                        return v[idx];
+                    };
+                    const int64_t muWaitP50 = pct(muWaitUs, 0.50);
+                    const int64_t muWaitP95 = pct(muWaitUs, 0.95);
+                    const int64_t muWaitP99 = pct(muWaitUs, 0.99);
+                    const int64_t critHoldP50 = pct(muHoldUs, 0.50);
+                    const int64_t critHoldP95 = pct(muHoldUs, 0.95);
+                    const int64_t critHoldP99 = pct(muHoldUs, 0.99);
+                    std::cerr << "[debug][server][sid=" << sessionId << "] queued_high=" << highQueued
                               << " queued_manifest=" << manifestQueued
+                              << " pending_adopt=" << pendingAdopt
                               << " pending_hash_jobs=" << pendingHashes
                               << " global_hash_queue=" << globalPendingHashes
                               << " hash_memcache=" << (hashMemcacheEnabled ? 1 : 0)
@@ -1212,14 +1322,23 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                               << " hash_memcache_misses=" << hashMemcacheMisses
                               << " active_streams=" << activeStreamCount
                               << " active_batches=" << activeBatchCount
+                              << " mu_wait_us_p50=" << muWaitP50
+                              << " mu_wait_us_p95=" << muWaitP95
+                              << " mu_wait_us_p99=" << muWaitP99
+                              << " crit_hold_us_p50=" << critHoldP50
+                              << " crit_hold_us_p95=" << critHoldP95
+                              << " crit_hold_us_p99=" << critHoldP99
                               << std::endl;
+                    muWaitUs.clear();
+                    muHoldUs.clear();
                     lastDebugPrint = now;
                 }
             }
             if (!didWork) {
                 std::unique_lock<std::mutex> lock(mu);
                 outboundCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
-                    return done.load() || !outboundHigh.empty() || !outboundManifest.empty() || !activeStreams.empty() || !activeBatchStreams.empty();
+                    return done.load() || !outboundHigh.empty() || !outboundManifest.empty() ||
+                           !pendingNewStreams.empty() || !pendingNewBatchStreams.empty();
                 });
             }
         }
@@ -1231,6 +1350,68 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         errorText = ex.what();
     }
 
+    if (debugEnabled && failed.load()) {
+        // Exception-window context snapshot for post-mortem (AC-B3 / design §B.4):
+        // session id + lock-wait/critical-section stats + outbound & hash queues + in-flight tasks.
+        size_t highQueued = 0, manifestQueued = 0, pendingAdopt = 0, pendingHashes = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            highQueued = outboundHigh.size();
+            manifestQueued = outboundManifest.size();
+            pendingAdopt = pendingNewStreams.size() + pendingNewBatchStreams.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(sessionHashMu);
+            pendingHashes = sessionPendingHashJobs;
+        }
+        const size_t globalPendingHashes = GetServerHashPool().PendingTasks();
+        const size_t activeStreamCount = activeStreams.size();
+        const size_t activeBatchCount = activeBatchStreams.size();
+        // In-flight tasks: active transfer streams + batch streams + pending hash jobs.
+        const size_t inFlight = activeStreamCount + activeBatchCount + pendingHashes;
+        auto pct = [](std::vector<int64_t>& v, double p) -> int64_t {
+            if (v.empty()) {
+                return 0;
+            }
+            std::sort(v.begin(), v.end());
+            size_t idx = static_cast<size_t>(p * static_cast<double>(v.size() - 1) + 0.5);
+            if (idx >= v.size()) {
+                idx = v.size() - 1;
+            }
+            return v[idx];
+        };
+        const int64_t muWaitP50 = pct(muWaitUs, 0.50);
+        const int64_t muWaitP95 = pct(muWaitUs, 0.95);
+        const int64_t muWaitP99 = pct(muWaitUs, 0.99);
+        const int64_t critHoldP50 = pct(muHoldUs, 0.50);
+        const int64_t critHoldP95 = pct(muHoldUs, 0.95);
+        const int64_t critHoldP99 = pct(muHoldUs, 0.99);
+        std::cerr << "[debug][server][sid=" << sessionId << "] session_failed=1"
+                  << " error=\"" << errorText << "\""
+                  << " queued_high=" << highQueued
+                  << " queued_manifest=" << manifestQueued
+                  << " pending_adopt=" << pendingAdopt
+                  << " pending_hash_jobs=" << pendingHashes
+                  << " global_hash_queue=" << globalPendingHashes
+                  << " active_streams=" << activeStreamCount
+                  << " active_batches=" << activeBatchCount
+                  << " in_flight=" << inFlight
+                  << " mu_wait_us_p50=" << muWaitP50
+                  << " mu_wait_us_p95=" << muWaitP95
+                  << " mu_wait_us_p99=" << muWaitP99
+                  << " crit_hold_us_p50=" << critHoldP50
+                  << " crit_hold_us_p95=" << critHoldP95
+                  << " crit_hold_us_p99=" << critHoldP99
+                  << std::endl;
+    }
+
+    // FR-05 / AC-B2: bound receiver teardown. If the main loop failed while the
+    // receiver thread is blocked in RecvFrame, joining it could wait unbounded for
+    // the peer. Shutting down the socket forces the blocking recv to return so the
+    // receiver loop observes `done` and exits promptly (bounded convergence).
+    if (failed.load()) {
+        ShutdownBoth(client);
+    }
     if (receiver.joinable()) {
         receiver.join();
     }
@@ -1238,8 +1419,22 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         manifestThread.join();
     }
     {
+        // Bounded wait so a leaked/stuck hash job can never produce an unbounded hang
+        // (FR-05 / AC-B2). On timeout we converge as a controlled failure.
+        constexpr auto kHashDrainTimeout = std::chrono::minutes(10);
         std::unique_lock<std::mutex> lock(sessionHashMu);
-        sessionHashCv.wait(lock, [&]() { return sessionPendingHashJobs == 0; });
+        const bool drained = sessionHashCv.wait_for(lock, kHashDrainTimeout,
+                                                    [&]() { return sessionPendingHashJobs == 0; });
+        if (!drained) {
+            failed.store(true);
+            if (errorText.empty()) {
+                errorText = "hash drain wait timed out after 10min (bounded-wait guard)";
+            }
+            if (debugEnabled) {
+                std::cerr << "[debug][server][sid=" << sessionId << "] hash_drain_timeout=1"
+                          << " pending_hash_jobs=" << sessionPendingHashJobs << std::endl;
+            }
+        }
     }
     if (failed.load()) {
         throw std::runtime_error("Server session failed: " + errorText);
@@ -1323,17 +1518,15 @@ void PrintClientCounters(size_t enumerated,
     lastFailed = failed;
     lastTransferred = transferred;
     lastDeleted = deleted;
-    std::cout << "\r"
-              << "Enumrated: " << enumerated
+    // CONSTRAINT-C1: each progress update occupies its own line (no '\r' overwrite),
+    // so output stays consistent across Windows/Linux/macOS terminals and log files.
+    std::cout << "Enumrated: " << enumerated
               << "  Compared: " << compared
               << "  Unchanged: " << unchanged
               << "  Failed: " << failed
               << "  Transfered: " << transferred
               << "  Deleted: " << deleted
-              << "      " << std::flush;
-    if (force) {
-        std::cout << std::endl;
-    }
+              << std::endl;
 }
 
 void TransferFileBatch(const SocketHandle& socket,
@@ -1477,6 +1670,8 @@ int RunServer(const CliOptions& options) {
 int RunClient(const CliOptions& options) {
     WsaContext wsa;
     const bool debugEnabled = IsDebugEnabled();
+    // --diag flag OR FASTCLONE_DIAG env var enables diagnostics (design §A.3).
+    const bool diagnostics = options.diagnostics || IsDiagEnabled();
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t streamLimit = tuned.streamLimit;
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
@@ -1546,6 +1741,9 @@ int RunClient(const CliOptions& options) {
     std::deque<CompareTask> compareTasks;
     std::mutex compareResultMu;
     std::deque<CompareResult> compareResults;
+    // Diagnostics-only: |local.mtimeNs - remote.mtimeNs| samples for size-equal files.
+    std::mutex mtimeDeltaMu;
+    std::vector<int64_t> mtimeDeltas;
     std::atomic<bool> compareStop = false;
     std::atomic<size_t> compareTasksIssued = 0;
     std::atomic<size_t> compareResultsHandled = 0;
@@ -1810,10 +2008,9 @@ int RunClient(const CliOptions& options) {
         if (ec) {
             return std::nullopt;
         }
-        entry.mtimeNs = ToUnixNs(fs::last_write_time(abs, ec));
-        if (ec) {
-            entry.mtimeNs = 0;
-        }
+        // Use the canonical reader so Windows compares manifest FILETIME ticks against
+        // local FILETIME ticks (same unit/epoch) instead of mismatched Unix ns.
+        entry.mtimeNs = ReadFileMtimeCanonical(abs);
         return entry;
     };
 
@@ -1823,24 +2020,33 @@ int RunClient(const CliOptions& options) {
     compareWorkers.reserve(compareWorkerCount);
     for (uint32_t i = 0; i < compareWorkerCount; ++i) {
         compareWorkers.emplace_back([&]() {
+            std::vector<int64_t> localMtimeDeltas;
             while (true) {
                 CompareTask task;
                 {
                     std::unique_lock<std::mutex> lock(compareTaskMu);
                     compareTaskCv.wait(lock, [&]() { return compareStop.load() || !compareTasks.empty(); });
                     if (compareStop.load() && compareTasks.empty()) {
-                        return;
+                        break;
                     }
                     task = std::move(compareTasks.front());
                     compareTasks.pop_front();
                 }
                 CompareResult result;
                 result.relPath = task.remote.relativePath;
-                result.action = DecideCompareAction(probeLocalFile(task.remote.relativePath), task.remote);
+                const std::optional<FileEntry> localProbe = probeLocalFile(task.remote.relativePath);
+                if (diagnostics && localProbe.has_value() && localProbe->fileSize == task.remote.fileSize) {
+                    localMtimeDeltas.push_back(std::llabs(static_cast<long long>(localProbe->mtimeNs - task.remote.mtimeNs)));
+                }
+                result.action = DecideCompareAction(localProbe, task.remote);
                 {
                     std::lock_guard<std::mutex> lock(compareResultMu);
                     compareResults.push_back(std::move(result));
                 }
+            }
+            if (diagnostics && !localMtimeDeltas.empty()) {
+                std::lock_guard<std::mutex> lock(mtimeDeltaMu);
+                mtimeDeltas.insert(mtimeDeltas.end(), localMtimeDeltas.begin(), localMtimeDeltas.end());
             }
         });
     }
@@ -2617,6 +2823,41 @@ int RunClient(const CliOptions& options) {
         }
     }
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
+
+    if (diagnostics) {
+        int64_t mtimeDeltaP50 = 0, mtimeDeltaP95 = 0, mtimeDeltaP99 = 0, mtimeDeltaMax = 0;
+        if (!mtimeDeltas.empty()) {
+            std::sort(mtimeDeltas.begin(), mtimeDeltas.end());
+            const size_t n = mtimeDeltas.size();
+            auto percentile = [&](double p) -> int64_t {
+                size_t idx = static_cast<size_t>(p * static_cast<double>(n - 1) + 0.5);
+                if (idx >= n) {
+                    idx = n - 1;
+                }
+                return mtimeDeltas[idx];
+            };
+            mtimeDeltaP50 = percentile(0.50);
+            mtimeDeltaP95 = percentile(0.95);
+            mtimeDeltaP99 = percentile(0.99);
+            mtimeDeltaMax = mtimeDeltas.back();
+        }
+        // AC-A3 requires these exact field names to be directly readable in the log.
+        // snake_case aliases are kept for backward compatibility with existing tooling.
+        std::cout << "[diag] fallbackCount=" << fallbackCount
+                  << " fallbackResolved=" << fallbackResolved
+                  << " hashRequestsSent=" << hashRequestsSent
+                  << " hashResponsesReceived=" << hashResponsesReceived
+                  << " mtime_delta_samples=" << mtimeDeltas.size()
+                  << " mtime_delta_p50=" << mtimeDeltaP50
+                  << " mtime_delta_p95=" << mtimeDeltaP95
+                  << " mtime_delta_p99=" << mtimeDeltaP99
+                  << " mtime_delta_max=" << mtimeDeltaMax
+                  << " fallback_count=" << fallbackCount
+                  << " fallback_resolved=" << fallbackResolved
+                  << " hash_req_sent=" << hashRequestsSent
+                  << " hash_resp_recv=" << hashResponsesReceived
+                  << std::endl;
+    }
 
     std::cout << "Deleting obsoleted files (sync with server)..." << std::endl;
     const RemoveLocalExtrasResult deleteResult = RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath);

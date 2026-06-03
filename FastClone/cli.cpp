@@ -44,7 +44,7 @@ void PrintUsage() {
     std::cerr
         << "Usage:\n"
         << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>\n"
-        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
+        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--diag]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
 }
 
@@ -177,6 +177,8 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.serverHashWorkers = static_cast<uint32_t>(workers);
         } else if (arg == "--enable-hash-memcache") {
             options.enableHashMemcache = true;
+        } else if (arg == "--diag") {
+            options.diagnostics = true;
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }

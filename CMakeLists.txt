@@ -54,13 +54,27 @@ enable_testing()
 
 add_executable(FastCloneTests
     FastClone/cli.cpp
+    FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
     tests/test_main.cpp
     tests/test_cli.cpp
+    tests/test_file_index.cpp
     tests/test_hash_memcache.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)
+
+# file_index.cpp pulls in xxhash; reuse the same resolution as the main target.
+if(XXHASH_FOUND)
+    target_include_directories(FastCloneTests PRIVATE ${XXHASH_INCLUDE_DIRS})
+    target_link_directories(FastCloneTests PRIVATE ${XXHASH_LIBRARY_DIRS})
+    target_link_libraries(FastCloneTests PRIVATE ${XXHASH_LIBRARIES})
+    target_compile_options(FastCloneTests PRIVATE ${XXHASH_CFLAGS_OTHER})
+else()
+    target_include_directories(FastCloneTests PRIVATE ${XXHASH_INCLUDE_DIR})
+    target_link_libraries(FastCloneTests PRIVATE ${XXHASH_LIBRARY})
+endif()
+
 if(WIN32)
     target_compile_definitions(FastCloneTests PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
