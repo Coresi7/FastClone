@@ -2040,6 +2040,32 @@ int RunClient(const CliOptions& options) {
 
     auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
         const fs::path abs = JoinRel(options.rootDir, relPath);
+#ifdef _WIN32
+        // Compare hot path: collapse the previous 4 std::filesystem metadata calls
+        // (exists/is_regular_file/file_size/last_write_time) into ONE syscall.
+        // On huge trees the per-file metadata cost dominates compare; a single
+        // GetFileAttributesExW avoids redundant path parsing and handle churn.
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (GetFileAttributesExW(abs.wstring().c_str(), GetFileExInfoStandard, &data) == 0) {
+            return std::nullopt;  // missing/inaccessible -> treat as new (TransferNow)
+        }
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            return std::nullopt;  // not a regular file
+        }
+        FileEntry entry;
+        entry.relativePath = relPath;
+        entry.isDirectory = false;
+        entry.fileSize = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
+                         static_cast<uint64_t>(data.nFileSizeLow);
+        // Raw FILETIME ticks (100ns since 1601), identical unit to the manifest
+        // writer (FileTimeToTicks). DecideCompareAction() normalizes both sides via
+        // TryNormalizeMtimeToUnixNs before tolerance, so correctness is preserved.
+        ULARGE_INTEGER mt{};
+        mt.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        mt.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
+        return entry;
+#else
         std::error_code ec;
         if (!fs::exists(abs, ec) || ec) {
             return std::nullopt;
@@ -2063,6 +2089,7 @@ int RunClient(const CliOptions& options) {
             return std::nullopt;
         }
         return entry;
+#endif
     };
 
     // Compare workers follow logical CPU concurrency (hardware_concurrency),
@@ -2374,6 +2401,32 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    // Batch hand-off buffer: compare tasks accumulated while processing one drained
+    // batch of manifest frames are flushed to the worker queue under a SINGLE lock +
+    // one notify_all, instead of one lock+notify per file. This removes the
+    // producer/consumer lock convoy on compareTaskMu that throttled enumeration
+    // throughput to a few tens of K/s while the CPU sat idle (all threads parked).
+    std::vector<CompareTask> compareDispatchBuffer;
+    auto enqueueCompareTask = [&](const FileEntry& e) {
+        compareDispatchBuffer.push_back(CompareTask{e});
+        // Count as issued immediately so in-flight gating stays accurate even before
+        // the buffer is flushed into compareTasks.
+        ++compareTasksIssued;
+    };
+    auto flushCompareDispatch = [&]() {
+        if (compareDispatchBuffer.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(compareTaskMu);
+            for (CompareTask& t : compareDispatchBuffer) {
+                compareTasks.push_back(std::move(t));
+            }
+        }
+        compareTaskCv.notify_all();
+        compareDispatchBuffer.clear();
+    };
+
     auto processIncomingFrame = [&](Frame& frame) {
         if (frame.type == MsgType::ManifestEntry) {
             FileEntry e = DecodeManifestEntry(frame.payload);
@@ -2391,14 +2444,10 @@ int RunClient(const CliOptions& options) {
             if ((compareTasksIssued.load() - compareResultsHandled.load()) >= maxInFlightCompareTasks) {
                 delayedCompareEntries.push_back(e);
             } else {
-                {
-                    std::lock_guard<std::mutex> lock(compareTaskMu);
-                    compareTasks.push_back(CompareTask{e});
-                }
-                ++compareTasksIssued;
-                compareTaskCv.notify_one();
+                enqueueCompareTask(e);
             }
-            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+            // NOTE: progress is printed once per drained batch in the main loop, not
+            // per entry, to keep the manifest hot path free of clock() calls.
         } else if (frame.type == MsgType::ManifestProgress) {
             size_t cursor = 0;
             const uint64_t serverEnumerated = ReadU64(frame.payload, cursor);
@@ -2723,13 +2772,9 @@ int RunClient(const CliOptions& options) {
                    (compareTasksIssued.load() - compareResultsHandled.load()) < maxInFlightCompareTasks) {
                 FileEntry e = std::move(delayedCompareEntries.front());
                 delayedCompareEntries.pop_front();
-                {
-                    std::lock_guard<std::mutex> lock(compareTaskMu);
-                    compareTasks.push_back(CompareTask{e});
-                }
-                ++compareTasksIssued;
-                compareTaskCv.notify_one();
+                enqueueCompareTask(e);
             }
+            flushCompareDispatch();
             dispatchHashRequests();
 
             if (debugEnabled) {
@@ -2857,8 +2902,15 @@ int RunClient(const CliOptions& options) {
             for (auto& frame : readyFrames) {
                 processIncomingFrame(frame);
             }
+            // Single lock + notify_all for the whole drained batch (see comment at
+            // compareDispatchBuffer): replaces the former per-entry lock/notify.
+            flushCompareDispatch();
             if (!readyFrames.empty()) {
                 loopHadForwardProgress = true;
+                // Manifest hot path no longer prints per entry; emit one throttled
+                // progress line per drained batch instead.
+                PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+                                    lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
             }
             updateStallWatchdog(loopHadForwardProgress);
         }
