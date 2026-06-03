@@ -1909,9 +1909,9 @@ int RunClient(const CliOptions& options) {
         }
     });
 
-    uint64_t smallFileBatchThreshold = 192 * 1024;
-    size_t smallBatchMaxFiles = 768;
-    size_t smallBatchMaxBytes = 32 * 1024 * 1024;
+    uint64_t smallFileBatchThreshold = 1920 * 1024;
+    size_t smallBatchMaxFiles = 7680;
+    size_t smallBatchMaxBytes = 320ULL * 1024ULL * 1024ULL;
     auto enqueueTransfer = [&](const std::string& rel, bool isRetry) {
         const auto it = remoteFiles.find(rel);
         const bool useBatch = (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold);
@@ -1966,34 +1966,34 @@ int RunClient(const CliOptions& options) {
         const size_t backlogBatch = pendingBatchTransfers.size() + pendingRetryBatchTransfers.size();
         const size_t backlogRegular = pendingTransfers.size() + pendingRetryTransfers.size();
         const size_t backlog = backlogBatch + backlogRegular;
-        uint64_t threshold = 192 * 1024;
-        size_t maxFiles = 768;
-        size_t maxBytes = 32 * 1024 * 1024;
+        uint64_t threshold = 1920 * 1024;
+        size_t maxFiles = 7680;
+        size_t maxBytes = 320ULL * 1024ULL * 1024ULL;
 
         if (backlog > 120000) {
-            threshold = 512 * 1024;
-            maxFiles = 2048;
-            maxBytes = 96 * 1024 * 1024;
+            threshold = 5120 * 1024;
+            maxFiles = 20480;
+            maxBytes = 960ULL * 1024ULL * 1024ULL;
         } else if (backlog > 60000) {
-            threshold = 384 * 1024;
-            maxFiles = 1536;
-            maxBytes = 64 * 1024 * 1024;
+            threshold = 3840 * 1024;
+            maxFiles = 15360;
+            maxBytes = 640ULL * 1024ULL * 1024ULL;
         } else if (backlog > 16000) {
-            threshold = 256 * 1024;
-            maxFiles = 1024;
-            maxBytes = 48 * 1024 * 1024;
+            threshold = 2560 * 1024;
+            maxFiles = 10240;
+            maxBytes = 480ULL * 1024ULL * 1024ULL;
         } else if (backlog < 1000) {
-            threshold = 128 * 1024;
-            maxFiles = 512;
-            maxBytes = 20 * 1024 * 1024;
+            threshold = 1280 * 1024;
+            maxFiles = 5120;
+            maxBytes = 200ULL * 1024ULL * 1024ULL;
         }
 
         // Low stream mode needs larger per-batch payload to amortize per-file
         // transaction overhead (open/end/mtime) without raising stream count.
         if (streamLimit <= 8) {
-            threshold = std::max<uint64_t>(threshold, 320 * 1024);
-            maxBytes = std::max<size_t>(maxBytes, 64 * 1024 * 1024);
-            maxFiles = std::max<size_t>(maxFiles, 1280);
+            threshold = std::max<uint64_t>(threshold, 3200 * 1024);
+            maxBytes = std::max<size_t>(maxBytes, 640ULL * 1024ULL * 1024ULL);
+            maxFiles = std::max<size_t>(maxFiles, 12800);
         }
 
         smallFileBatchThreshold = threshold;
@@ -2069,32 +2069,46 @@ int RunClient(const CliOptions& options) {
     // with a small safety floor for low-core machines.
     const uint32_t compareWorkerCount = std::max<uint32_t>(4, workerCount);
     const size_t maxInFlightCompareTasks = std::max<size_t>(1024, static_cast<size_t>(compareWorkerCount) * 64);
+    constexpr size_t kCompareBatchPop = 32;
     std::vector<std::thread> compareWorkers;
     compareWorkers.reserve(compareWorkerCount);
     for (uint32_t i = 0; i < compareWorkerCount; ++i) {
         compareWorkers.emplace_back([&]() {
             std::vector<int64_t> localMtimeDeltas;
+            std::vector<CompareTask> taskBatch;
+            taskBatch.reserve(kCompareBatchPop);
+            std::vector<CompareResult> resultBatch;
+            resultBatch.reserve(kCompareBatchPop);
             while (true) {
-                CompareTask task;
+                taskBatch.clear();
                 {
                     std::unique_lock<std::mutex> lock(compareTaskMu);
                     compareTaskCv.wait(lock, [&]() { return compareStop.load() || !compareTasks.empty(); });
                     if (compareStop.load() && compareTasks.empty()) {
                         break;
                     }
-                    task = std::move(compareTasks.front());
-                    compareTasks.pop_front();
+                    const size_t take = std::min<size_t>(kCompareBatchPop, compareTasks.size());
+                    for (size_t j = 0; j < take; ++j) {
+                        taskBatch.push_back(std::move(compareTasks.front()));
+                        compareTasks.pop_front();
+                    }
                 }
-                CompareResult result;
-                result.relPath = task.remote.relativePath;
-                const std::optional<FileEntry> localProbe = probeLocalFile(task.remote.relativePath);
-                if (diagnostics && localProbe.has_value() && localProbe->fileSize == task.remote.fileSize) {
-                    localMtimeDeltas.push_back(std::llabs(static_cast<long long>(localProbe->mtimeNs - task.remote.mtimeNs)));
+                resultBatch.clear();
+                for (const CompareTask& task : taskBatch) {
+                    CompareResult result;
+                    result.relPath = task.remote.relativePath;
+                    const std::optional<FileEntry> localProbe = probeLocalFile(task.remote.relativePath);
+                    if (diagnostics && localProbe.has_value() && localProbe->fileSize == task.remote.fileSize) {
+                        localMtimeDeltas.push_back(std::llabs(static_cast<long long>(localProbe->mtimeNs - task.remote.mtimeNs)));
+                    }
+                    result.action = DecideCompareAction(localProbe, task.remote);
+                    resultBatch.push_back(std::move(result));
                 }
-                result.action = DecideCompareAction(localProbe, task.remote);
-                {
+                if (!resultBatch.empty()) {
                     std::lock_guard<std::mutex> lock(compareResultMu);
-                    compareResults.push_back(std::move(result));
+                    for (CompareResult& result : resultBatch) {
+                        compareResults.push_back(std::move(result));
+                    }
                 }
             }
             if (diagnostics && !localMtimeDeltas.empty()) {
@@ -2148,6 +2162,9 @@ int RunClient(const CliOptions& options) {
         auto activeTransferSlots = [&]() -> size_t {
             return activeDownloads.size() + activeBatchDownloads.size();
         };
+        auto hasBatchBacklog = [&]() -> bool {
+            return !pendingBatchTransfers.empty() || !pendingRetryBatchTransfers.empty();
+        };
         while (activeTransferSlots() < streamLimit) {
             bool started = false;
             std::deque<std::string>* batchQueue = nullptr;
@@ -2186,6 +2203,13 @@ int RunClient(const CliOptions& options) {
                     started = true;
                 }
             } else if (regularQueue != nullptr) {
+                // Reserve one transfer slot for batch work whenever batch backlog exists.
+                // This prevents regular streams from starving batch streams under low stream limits.
+                const size_t reservedBatchSlots = (streamLimit > 1 && hasBatchBacklog()) ? 1 : 0;
+                const size_t regularLimit = static_cast<size_t>(streamLimit) - reservedBatchSlots;
+                if (activeDownloads.size() >= regularLimit) {
+                    break;
+                }
                 const std::string rel = regularQueue->front();
                 regularQueue->pop_front();
                 const fs::path abs = JoinRel(options.rootDir, rel);
