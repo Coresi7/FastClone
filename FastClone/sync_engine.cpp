@@ -1080,9 +1080,19 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             fs::is_regular_file(record.absPath, ec) && !ec) {
                             record.fileSize = static_cast<uint64_t>(fs::file_size(record.absPath, ec));
                             if (!ec) {
-                                // Same canonical mtime unit as the manifest path.
-                                record.mtimeNs = ReadFileMtimeCanonical(record.absPath);
-                                record.ok = true;
+                                // Validate the file can actually be OPENED for read here,
+                                // the same way the send loop will. A file that exists but
+                                // is exclusively locked by another process (e.g. Unity's
+                                // UnityLockfile) must be reported as not-ok now; otherwise
+                                // the send loop's open would fail mid-stream and used to
+                                // throw, killing the ENTIRE session (FR: a single
+                                // unreadable file must never abort the whole sync).
+                                std::ifstream probe(record.absPath, std::ios::binary);
+                                if (probe) {
+                                    // Same canonical mtime unit as the manifest path.
+                                    record.mtimeNs = ReadFileMtimeCanonical(record.absPath);
+                                    record.ok = true;
+                                }
                             }
                         }
                         batch.files.push_back(std::move(record));
@@ -1187,6 +1197,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
 
                     size_t burstBytes = 0;
+                    bool batchAborted = false;
                     while (burstBytes < perStreamBurstBytes) {
                         while (batch.index < batch.files.size() && !batch.files[batch.index].ok) {
                             ++batch.index;
@@ -1198,7 +1209,13 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         if (!batch.input.is_open()) {
                             batch.input.open(file.absPath, std::ios::binary);
                             if (!batch.input) {
-                                throw std::runtime_error("Cannot open batch file for read: " + file.relativePath);
+                                // Rare TOCTOU: the file was openable when the batch header
+                                // was built but is now unreadable. Abort only THIS batch
+                                // stream (the client fails its remaining entries) instead
+                                // of throwing and tearing down the whole session.
+                                sendFrames.push_back(Frame{MsgType::FileError, it->first, {}});
+                                batchAborted = true;
+                                break;
                             }
                             batch.remainingBytes = file.fileSize;
                             if (batch.remainingBytes == 0) {
@@ -1212,7 +1229,10 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         batch.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
                         const std::streamsize got = batch.input.gcount();
                         if (got <= 0) {
-                            throw std::runtime_error("Failed while reading batch file: " + file.relativePath);
+                            // I/O error mid-file: abort just this batch stream, not the session.
+                            sendFrames.push_back(Frame{MsgType::FileError, it->first, {}});
+                            batchAborted = true;
+                            break;
                         }
                         chunk.resize(static_cast<size_t>(got));
                         burstBytes += static_cast<size_t>(got);
@@ -1224,6 +1244,15 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             batch.input.close();
                             ++batch.index;
                         }
+                    }
+
+                    if (batchAborted) {
+                        if (batch.input.is_open()) {
+                            batch.input.close();
+                        }
+                        it = activeBatchStreams.erase(it);
+                        didWork = true;
+                        continue;
                     }
 
                     bool batchDone = true;
@@ -1749,6 +1778,19 @@ int RunClient(const CliOptions& options) {
     std::atomic<size_t> compareTasksIssued = 0;
     std::atomic<size_t> compareResultsHandled = 0;
 
+    // Directory creation is offloaded to a small worker pool. With deep trees the
+    // manifest can carry millions of directory entries; calling fs::create_directories
+    // for each one inline on the single main loop serialised millions of filesystem
+    // syscalls and was the dominant "wall" (the main thread could not drain manifest
+    // frames while blocked in create_directories). Workers create them in parallel and
+    // off the critical path; the main loop just records remoteDirs and hands off.
+    std::mutex dirTaskMu;
+    std::condition_variable dirTaskCv;
+    std::deque<std::string> dirTasks;
+    std::atomic<bool> dirStop = false;
+    std::atomic<size_t> dirTasksIssued = 0;
+    std::atomic<size_t> dirTasksDone = 0;
+
     std::mutex hashTaskMu;
     std::mutex hashResultMu;
     std::condition_variable hashTaskCv;
@@ -1830,27 +1872,39 @@ int RunClient(const CliOptions& options) {
     size_t lastProgressFallbackResolved = 0;
     size_t lastProgressHashResponses = 0;
     size_t lastProgressCompareHandled = 0;
+    size_t lastProgressDirsDone = 0;
 
     auto ensureEntryReserve = [&](size_t expectedEntries) {
-        const size_t target = expectedEntries + (expectedEntries / 2) + 1024;
-        if (target <= reservedEntryCapacity) {
+        const size_t need = expectedEntries + (expectedEntries / 2) + 1024;
+        if (need <= reservedEntryCapacity) {
             return;
         }
-        remoteFiles.reserve(target);
-        remoteHashes.reserve(target);
-        hashResolved.reserve(target);
-        hashRequested.reserve(target);
-        scheduledTransfers.reserve(target);
-        transferRetryCounts.reserve(target);
-        remoteDirs.reserve((target / 4) + 256);
+        // CRITICAL: grow capacity GEOMETRICALLY (doubling), not to the exact running
+        // count. ensureEntryReserve() is called every ~2048 entries; reserving to a
+        // target that creeps just past the current size made unordered_map::reserve()
+        // REHASH every container (millions of elements x ~9 maps) every 2048 inserts,
+        // i.e. O(N^2) overall -- this was the hard "wall" near 3M entries where
+        // enumeration collapsed to a few thousand/sec. Doubling caps total rehashes at
+        // O(log N) and makes amortised insertion O(1) again.
+        size_t newCapacity = (reservedEntryCapacity == 0) ? size_t{65536} : reservedEntryCapacity;
+        while (newCapacity < need) {
+            newCapacity *= 2;
+        }
+        remoteFiles.reserve(newCapacity);
+        remoteHashes.reserve(newCapacity);
+        hashResolved.reserve(newCapacity);
+        hashRequested.reserve(newCapacity);
+        scheduledTransfers.reserve(newCapacity);
+        transferRetryCounts.reserve(newCapacity);
+        remoteDirs.reserve((newCapacity / 4) + 256);
         {
             // localHashes/localHashFailed are also updated by hash worker threads,
             // so reserve must hold the same mutex to avoid concurrent rehash UB.
             std::lock_guard<std::mutex> lock(hashResultMu);
-            localHashes.reserve(target);
-            localHashFailed.reserve(target);
+            localHashes.reserve(newCapacity);
+            localHashFailed.reserve(newCapacity);
         }
-        reservedEntryCapacity = target;
+        reservedEntryCapacity = newCapacity;
     };
 
     std::mutex incomingMu;
@@ -2196,6 +2250,40 @@ int RunClient(const CliOptions& options) {
         });
     }
 
+    // Directory-creation worker pool (see dirTasks declaration). Each worker pops a
+    // batch and runs create_directories without holding any lock; concurrent creation
+    // of overlapping paths is safe (idempotent, errors swallowed via error_code).
+    const uint32_t dirWorkerCount = std::clamp<uint32_t>(workerCount, 2u, 8u);
+    constexpr size_t kDirBatchPop = 64;
+    std::vector<std::thread> dirWorkers;
+    dirWorkers.reserve(dirWorkerCount);
+    for (uint32_t i = 0; i < dirWorkerCount; ++i) {
+        dirWorkers.emplace_back([&]() {
+            std::vector<std::string> batch;
+            batch.reserve(kDirBatchPop);
+            while (true) {
+                batch.clear();
+                {
+                    std::unique_lock<std::mutex> lock(dirTaskMu);
+                    dirTaskCv.wait(lock, [&]() { return dirStop.load() || !dirTasks.empty(); });
+                    if (dirStop.load() && dirTasks.empty()) {
+                        return;
+                    }
+                    const size_t take = std::min<size_t>(kDirBatchPop, dirTasks.size());
+                    for (size_t j = 0; j < take; ++j) {
+                        batch.push_back(std::move(dirTasks.front()));
+                        dirTasks.pop_front();
+                    }
+                }
+                for (const std::string& rel : batch) {
+                    std::error_code mkec;
+                    fs::create_directories(JoinRel(options.rootDir, rel), mkec);
+                }
+                dirTasksDone.fetch_add(batch.size(), std::memory_order_relaxed);
+            }
+        });
+    }
+
     auto handleCompareResult = [&](const CompareResult& r) {
         const CompareAction action = r.action;
         if (action == CompareAction::TransferNow) {
@@ -2478,13 +2566,33 @@ int RunClient(const CliOptions& options) {
         compareDispatchBuffer.clear();
     };
 
+    // Same batched hand-off for directory creation (see dirTasks): accumulate paths
+    // and flush under one lock + one notify_all per drained manifest batch.
+    std::vector<std::string> dirDispatchBuffer;
+    auto flushDirDispatch = [&]() {
+        if (dirDispatchBuffer.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(dirTaskMu);
+            for (std::string& d : dirDispatchBuffer) {
+                dirTasks.push_back(std::move(d));
+            }
+        }
+        dirTaskCv.notify_all();
+        dirDispatchBuffer.clear();
+    };
+
     auto processIncomingFrame = [&](Frame& frame) {
         if (frame.type == MsgType::ManifestEntry) {
             FileEntry e = DecodeManifestEntry(frame.payload);
             if (e.isDirectory) {
                 remoteDirs.insert(e.relativePath);
-                std::error_code mkec;
-                fs::create_directories(JoinRel(options.rootDir, e.relativePath), mkec);
+                // Hand directory creation to the worker pool instead of running the
+                // (potentially millions of) create_directories syscalls inline on the
+                // single consumer thread.
+                dirDispatchBuffer.push_back(e.relativePath);
+                dirTasksIssued.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             remoteFiles[e.relativePath] = e;
@@ -2685,6 +2793,7 @@ int RunClient(const CliOptions& options) {
 
     auto updateStallWatchdog = [&](bool loopHadForwardProgress) {
         const size_t compareHandledNow = compareResultsHandled.load();
+        const size_t dirsDoneNow = dirTasksDone.load(std::memory_order_relaxed);
         const bool countersAdvanced = loopHadForwardProgress ||
                                       (enumerated != lastProgressEnumerated) ||
                                       (compared != lastProgressCompared) ||
@@ -2693,7 +2802,8 @@ int RunClient(const CliOptions& options) {
                                       (transferred != lastProgressTransferred) ||
                                       (fallbackResolved != lastProgressFallbackResolved) ||
                                       (hashResponsesReceived != lastProgressHashResponses) ||
-                                      (compareHandledNow != lastProgressCompareHandled);
+                                      (compareHandledNow != lastProgressCompareHandled) ||
+                                      (dirsDoneNow != lastProgressDirsDone);
         const auto now = steady_clock::now();
         if (countersAdvanced) {
             lastForwardProgressAt = now;
@@ -2705,6 +2815,7 @@ int RunClient(const CliOptions& options) {
             lastProgressFallbackResolved = fallbackResolved;
             lastProgressHashResponses = hashResponsesReceived;
             lastProgressCompareHandled = compareHandledNow;
+            lastProgressDirsDone = dirsDoneNow;
             lastStallWarnAt = steady_clock::time_point{};
             return;
         }
@@ -2804,6 +2915,10 @@ int RunClient(const CliOptions& options) {
     // to compare until the buffer drains below the low-water mark.
     const size_t kDelayedHighWater = 512 * 1024;
     const size_t kDelayedLowWater = 256 * 1024;
+    // Bound the offloaded directory-creation backlog too, so a tree with millions of
+    // directories cannot balloon dirTasks in RAM faster than the dir workers drain it.
+    const size_t kDirBacklogHighWater = 256 * 1024;
+    const size_t kDirBacklogLowWater = 64 * 1024;
     bool ingestPaused = false;
 
     try {
@@ -2883,6 +2998,9 @@ int RunClient(const CliOptions& options) {
                               << " queued_compare_tasks=" << queuedCompareTasks
                               << " ready_compare_results=" << readyCompareResults
                               << " delayed_compare_entries=" << delayedCompareEntries.size()
+                              << " dirs_created=" << dirTasksDone.load(std::memory_order_relaxed)
+                              << " dirs_queued=" << (dirTasksIssued.load(std::memory_order_relaxed) -
+                                                     dirTasksDone.load(std::memory_order_relaxed))
                               << " queued_incoming_frames=" << queuedIncomingFrames
                               << " queued_incoming_prio=" << queuedIncomingPriorityFrames
                               << " queued_incoming_manifest=" << queuedIncomingManifestFrames
@@ -2903,7 +3021,10 @@ int RunClient(const CliOptions& options) {
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
-            if (manifestDone && allCompareDone &&
+            const bool allDirsDone = dirDispatchBuffer.empty() &&
+                                     (dirTasksDone.load(std::memory_order_relaxed) ==
+                                      dirTasksIssued.load(std::memory_order_relaxed));
+            if (manifestDone && allCompareDone && allDirsDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone) {
@@ -2917,14 +3038,17 @@ int RunClient(const CliOptions& options) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            // Update the ingest pause state (hysteresis) from the current compare
-            // buffer depth before deciding how much manifest to pull this iteration.
+            // Update the ingest pause state (hysteresis) from the current compare and
+            // directory backlog depth before deciding how much manifest to pull this
+            // iteration. Either backlog growing too deep pauses manifest ingestion.
             const size_t delayedBacklog = delayedCompareEntries.size();
+            const size_t dirBacklog = dirTasksIssued.load(std::memory_order_relaxed) -
+                                      dirTasksDone.load(std::memory_order_relaxed);
             if (ingestPaused) {
-                if (delayedBacklog <= kDelayedLowWater) {
+                if (delayedBacklog <= kDelayedLowWater && dirBacklog <= kDirBacklogLowWater) {
                     ingestPaused = false;
                 }
-            } else if (delayedBacklog >= kDelayedHighWater) {
+            } else if (delayedBacklog >= kDelayedHighWater || dirBacklog >= kDirBacklogHighWater) {
                 ingestPaused = true;
             }
 
@@ -3011,6 +3135,7 @@ int RunClient(const CliOptions& options) {
             // Single lock + notify_all for the whole drained batch (see comment at
             // compareDispatchBuffer): replaces the former per-entry lock/notify.
             flushCompareDispatch();
+            flushDirDispatch();
             if (!readyFrames.empty()) {
                 loopHadForwardProgress = true;
                 // Manifest hot path no longer prints per entry; emit one throttled
@@ -3028,6 +3153,8 @@ int RunClient(const CliOptions& options) {
         compareTaskCv.notify_all();
         hashStop.store(true);
         hashTaskCv.notify_all();
+        dirStop.store(true);
+        dirTaskCv.notify_all();
         if (recvThread.joinable()) {
             recvThread.join();
         }
@@ -3041,6 +3168,11 @@ int RunClient(const CliOptions& options) {
                 w.join();
             }
         }
+        for (auto& w : dirWorkers) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
         throw;
     }
 
@@ -3048,12 +3180,22 @@ int RunClient(const CliOptions& options) {
     compareTaskCv.notify_all();
     hashStop.store(true);
     hashTaskCv.notify_all();
+    // dirTasks is fully drained before reaching here (the main-loop break condition
+    // requires dirTasksDone == dirTasksIssued), so signalling stop just lets the idle
+    // workers exit.
+    dirStop.store(true);
+    dirTaskCv.notify_all();
     for (auto& w : compareWorkers) {
         if (w.joinable()) {
             w.join();
         }
     }
     for (auto& w : hashWorkers) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    for (auto& w : dirWorkers) {
         if (w.joinable()) {
             w.join();
         }
@@ -3093,6 +3235,29 @@ int RunClient(const CliOptions& options) {
                   << " hash_req_sent=" << hashRequestsSent
                   << " hash_resp_recv=" << hashResponsesReceived
                   << std::endl;
+    }
+
+    // SAFETY: only delete local "extras" if the manifest was received in full. If the
+    // loop exited because the connection dropped (recvClosed/recvError) or ManifestEnd
+    // was never seen, remoteFiles/remoteDirs hold only a PARTIAL view of the server, and
+    // deleting against it would wipe out every local file the server hadn't sent yet.
+    // Abort instead of destroying data.
+    const bool manifestComplete = manifestDone && recvError.empty() && !recvClosed.load();
+    if (!manifestComplete) {
+        std::cerr << "[error][client] manifest incomplete (manifest_end="
+                  << (manifestDone ? 1 : 0) << " recv_closed=" << (recvClosed.load() ? 1 : 0)
+                  << " recv_error=\"" << recvError << "\" enumerated=" << enumerated
+                  << "); SKIPPING deletion to avoid destroying local files not yet received."
+                  << std::endl;
+        recvStop.store(true);
+        incomingDataCv.notify_all();
+        ShutdownBoth(socket);
+        if (recvThread.joinable()) {
+            recvThread.join();
+        }
+        std::cout << "Sync aborted (incomplete manifest). changed_files=" << transferred
+                  << " failed_files=" << failed << " enumerated=" << enumerated << std::endl;
+        return 3;
     }
 
     std::cout << "Deleting obsoleted files (sync with server)..." << std::endl;
