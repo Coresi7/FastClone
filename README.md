@@ -17,7 +17,7 @@ Supported platforms:
 
 ## Expected Performance
 
-- On i9-9900K + SATA SSD, syncing a ~3 million-file Library can finish in around 3 minutes when delta changes are limited (otherwise mainly bounded by network bandwidth).
+- On i9-9900K + SATA SSD, syncing a ~3 million-file Library can finish in around 20 seconds when delta changes are limited (otherwise mainly bounded by network bandwidth).
 
 ## Usage
 
