@@ -2566,33 +2566,18 @@ int RunClient(const CliOptions& options) {
         compareDispatchBuffer.clear();
     };
 
-    // Same batched hand-off for directory creation (see dirTasks): accumulate paths
-    // and flush under one lock + one notify_all per drained manifest batch.
-    std::vector<std::string> dirDispatchBuffer;
-    auto flushDirDispatch = [&]() {
-        if (dirDispatchBuffer.empty()) {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(dirTaskMu);
-            for (std::string& d : dirDispatchBuffer) {
-                dirTasks.push_back(std::move(d));
-            }
-        }
-        dirTaskCv.notify_all();
-        dirDispatchBuffer.clear();
-    };
-
     auto processIncomingFrame = [&](Frame& frame) {
         if (frame.type == MsgType::ManifestEntry) {
             FileEntry e = DecodeManifestEntry(frame.payload);
             if (e.isDirectory) {
+                // Only record the directory during streaming. Physical creation is
+                // deferred to the end and limited to file-less ("empty subtree")
+                // directories: any directory that contains files is either already
+                // present (unchanged files) or created by EnsureParentDir during
+                // transfer, so creating every manifest directory here is almost
+                // entirely wasted syscalls on a re-sync (and previously throttled
+                // enumeration via directory backpressure).
                 remoteDirs.insert(e.relativePath);
-                // Hand directory creation to the worker pool instead of running the
-                // (potentially millions of) create_directories syscalls inline on the
-                // single consumer thread.
-                dirDispatchBuffer.push_back(e.relativePath);
-                dirTasksIssued.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             remoteFiles[e.relativePath] = e;
@@ -2915,10 +2900,6 @@ int RunClient(const CliOptions& options) {
     // to compare until the buffer drains below the low-water mark.
     const size_t kDelayedHighWater = 512 * 1024;
     const size_t kDelayedLowWater = 256 * 1024;
-    // Bound the offloaded directory-creation backlog too, so a tree with millions of
-    // directories cannot balloon dirTasks in RAM faster than the dir workers drain it.
-    const size_t kDirBacklogHighWater = 256 * 1024;
-    const size_t kDirBacklogLowWater = 64 * 1024;
     bool ingestPaused = false;
 
     try {
@@ -3021,10 +3002,7 @@ int RunClient(const CliOptions& options) {
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
-            const bool allDirsDone = dirDispatchBuffer.empty() &&
-                                     (dirTasksDone.load(std::memory_order_relaxed) ==
-                                      dirTasksIssued.load(std::memory_order_relaxed));
-            if (manifestDone && allCompareDone && allDirsDone &&
+            if (manifestDone && allCompareDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone) {
@@ -3038,17 +3016,14 @@ int RunClient(const CliOptions& options) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            // Update the ingest pause state (hysteresis) from the current compare and
-            // directory backlog depth before deciding how much manifest to pull this
-            // iteration. Either backlog growing too deep pauses manifest ingestion.
+            // Update the ingest pause state (hysteresis) from the current compare
+            // buffer depth before deciding how much manifest to pull this iteration.
             const size_t delayedBacklog = delayedCompareEntries.size();
-            const size_t dirBacklog = dirTasksIssued.load(std::memory_order_relaxed) -
-                                      dirTasksDone.load(std::memory_order_relaxed);
             if (ingestPaused) {
-                if (delayedBacklog <= kDelayedLowWater && dirBacklog <= kDirBacklogLowWater) {
+                if (delayedBacklog <= kDelayedLowWater) {
                     ingestPaused = false;
                 }
-            } else if (delayedBacklog >= kDelayedHighWater || dirBacklog >= kDirBacklogHighWater) {
+            } else if (delayedBacklog >= kDelayedHighWater) {
                 ingestPaused = true;
             }
 
@@ -3135,7 +3110,6 @@ int RunClient(const CliOptions& options) {
             // Single lock + notify_all for the whole drained batch (see comment at
             // compareDispatchBuffer): replaces the former per-entry lock/notify.
             flushCompareDispatch();
-            flushDirDispatch();
             if (!readyFrames.empty()) {
                 loopHadForwardProgress = true;
                 // Manifest hot path no longer prints per entry; emit one throttled
@@ -3180,11 +3154,6 @@ int RunClient(const CliOptions& options) {
     compareTaskCv.notify_all();
     hashStop.store(true);
     hashTaskCv.notify_all();
-    // dirTasks is fully drained before reaching here (the main-loop break condition
-    // requires dirTasksDone == dirTasksIssued), so signalling stop just lets the idle
-    // workers exit.
-    dirStop.store(true);
-    dirTaskCv.notify_all();
     for (auto& w : compareWorkers) {
         if (w.joinable()) {
             w.join();
@@ -3195,6 +3164,58 @@ int RunClient(const CliOptions& options) {
             w.join();
         }
     }
+
+    // Manifest completeness gate (used both for the deferred directory creation below
+    // and the deletion guard further down). A partial manifest (dropped connection /
+    // no ManifestEnd) must neither create nor delete against an incomplete remote view.
+    const bool manifestComplete = manifestDone && recvError.empty() && !recvClosed.load();
+
+    if (manifestComplete) {
+        // Deferred directory creation (method 1): physically create ONLY the remote
+        // directories that contain no files anywhere beneath them ("empty subtree").
+        // Directories that hold files are already present (unchanged files) or created
+        // by EnsureParentDir during transfer, so creating every manifest directory is
+        // almost entirely redundant on a re-sync and previously throttled enumeration
+        // via directory backpressure.
+        std::unordered_set<std::string> dirsWithFiles;
+        dirsWithFiles.reserve(remoteDirs.size());
+        for (const auto& kv : remoteFiles) {
+            const std::string& filePath = kv.first;
+            size_t slash = filePath.rfind('/');
+            while (slash != std::string::npos) {
+                std::string dir = filePath.substr(0, slash);
+                if (dir.empty()) {
+                    break;
+                }
+                // Inserting walks up to the root the first time a directory is seen; if
+                // it is already marked then all of its ancestors are too, so stop early.
+                if (!dirsWithFiles.insert(std::move(dir)).second) {
+                    break;
+                }
+                slash = filePath.rfind('/', slash - 1);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(dirTaskMu);
+            for (const std::string& d : remoteDirs) {
+                if (!dirsWithFiles.contains(d)) {
+                    dirTasks.push_back(d);
+                    dirTasksIssued.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        const size_t emptyDirCount = dirTasksIssued.load(std::memory_order_relaxed);
+        dirTaskCv.notify_all();
+        if (emptyDirCount > 0) {
+            std::cout << "Creating " << emptyDirCount << " empty directories..." << std::endl;
+            while (dirTasksDone.load(std::memory_order_relaxed) < emptyDirCount) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+    }
+
+    dirStop.store(true);
+    dirTaskCv.notify_all();
     for (auto& w : dirWorkers) {
         if (w.joinable()) {
             w.join();
@@ -3237,12 +3258,11 @@ int RunClient(const CliOptions& options) {
                   << std::endl;
     }
 
-    // SAFETY: only delete local "extras" if the manifest was received in full. If the
-    // loop exited because the connection dropped (recvClosed/recvError) or ManifestEnd
-    // was never seen, remoteFiles/remoteDirs hold only a PARTIAL view of the server, and
-    // deleting against it would wipe out every local file the server hadn't sent yet.
-    // Abort instead of destroying data.
-    const bool manifestComplete = manifestDone && recvError.empty() && !recvClosed.load();
+    // SAFETY: only delete local "extras" if the manifest was received in full (see
+    // manifestComplete above). If the loop exited because the connection dropped
+    // (recvClosed/recvError) or ManifestEnd was never seen, remoteFiles/remoteDirs hold
+    // only a PARTIAL view of the server, and deleting against it would wipe out every
+    // local file the server hadn't sent yet. Abort instead of destroying data.
     if (!manifestComplete) {
         std::cerr << "[error][client] manifest incomplete (manifest_end="
                   << (manifestDone ? 1 : 0) << " recv_closed=" << (recvClosed.load() ? 1 : 0)
