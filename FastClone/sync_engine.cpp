@@ -34,6 +34,7 @@
 #include <optional>
 #include <queue>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +47,60 @@ namespace fc {
 namespace {
 
 constexpr const char* kProtocolVersion = "FC5";
+
+// Diagnostic wrapper around std::thread::join(). The exception
+// "resource deadlock would occur" is thrown by join() in exactly one case: a
+// thread tries to join ITSELF (t.get_id() == this_thread::get_id()), which on
+// MSVC surfaces as std::system_error{errc::resource_deadlock_would_occur}.
+// Behaviour:
+//   - Normal join: wrapped in try/catch so the throwing call SITE is logged.
+//   - Self-join: this signals corrupted thread ownership; we FAIL FAST (log the
+//     site + std::abort). We deliberately do NOT skip or detach -- neither is a
+//     safe recovery (see the detailed rationale at the self-join branch below),
+//     and hiding the error would carry the corruption into later, harder-to-debug
+//     failures. A run that hits the self-join branch is NOT a successful sync.
+inline void JoinDiag(std::thread& t, const char* site) {
+    if (!t.joinable()) {
+        return;
+    }
+    const std::thread::id self = std::this_thread::get_id();
+    const std::thread::id target = t.get_id();
+    if (target == self) {
+        // SELF-JOIN: a thread is trying to join itself -- the exact condition that
+        // raises errc::resource_deadlock_would_occur. With the current design this is
+        // UNREACHABLE: every join runs on a thread that does not own the target. If it
+        // ever fires, thread ownership has already been violated (e.g. memory
+        // corruption, or a captured std::thread reused across threads), so the process
+        // state is no longer trustworthy.
+        //
+        // We FAIL FAST rather than pretend to recover:
+        //   - join() is physically impossible here (would deadlock).
+        //   - detach() is NOT a safe recovery: it only releases the std::thread handle.
+        //     The thread body still references [&]-captured stack objects (mutex/cv/
+        //     queue/map/socket); once the owning scope unwinds they are destroyed,
+        //     producing use-after-free, silent corruption, false "success", or a hang
+        //     -- strictly worse than a loud, immediate abort.
+        // The site label pinpoints exactly which join detected the violation; any run
+        // that reaches here must NOT be treated as a successful sync.
+        std::cerr << "[deadlock-diag] FATAL SELF-JOIN at site=" << site
+                  << " thread_id=" << target
+                  << " -- thread ownership violated; aborting (state not trustworthy)"
+                  << std::endl;
+        std::cerr.flush();
+        std::abort();
+    }
+    try {
+        t.join();
+    } catch (const std::system_error& e) {
+        std::cerr << "[deadlock-diag] join FAILED at site=" << site
+                  << " code=" << e.code().value()
+                  << " msg=\"" << e.code().message() << "\""
+                  << " caller_thread=" << self
+                  << " target_thread=" << target
+                  << std::endl;
+        throw;
+    }
+}
 
 struct ServerStream {
     std::ifstream input;
@@ -528,7 +583,9 @@ public:
                         task = std::move(tasks_.front());
                         tasks_.pop_front();
                     }
+                    activeTasks_.fetch_add(1, std::memory_order_relaxed);
                     task();
+                    activeTasks_.fetch_sub(1, std::memory_order_relaxed);
                 }
             });
         }
@@ -550,6 +607,11 @@ public:
         return tasks_.size();
     }
 
+    // Tasks currently executing across all sessions (lock-free gauge).
+    size_t ActiveTasks() const {
+        return activeTasks_.load(std::memory_order_relaxed);
+    }
+
 private:
     void Stop() {
         {
@@ -558,9 +620,7 @@ private:
         }
         cv_.notify_all();
         for (auto& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
+            JoinDiag(worker, "server-hashpool-stop");
         }
         workers_.clear();
     }
@@ -571,6 +631,7 @@ private:
     std::vector<std::thread> workers_;
     uint32_t configuredWorkers_ = 0;
     bool stop_ = false;
+    std::atomic<size_t> activeTasks_{0};
 };
 
 ServerHashThreadPool& GetServerHashPool() {
@@ -643,6 +704,17 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     std::condition_variable sessionHashCv;
     size_t sessionPendingHashJobs = 0;
 
+    // Per-session hash-pipeline diagnostics (debug-only output). All relaxed atomics:
+    // written from the receiver thread and the global pool's worker threads, read by the
+    // main send loop's debug printer. Relaxed is sufficient because these are monotone
+    // counters used only for observability, not for synchronization.
+    std::atomic<uint64_t> hashRequestsReceived{0};   // HashRequest frames read from socket
+    std::atomic<uint64_t> hashCacheHits{0};          // served directly from memcache (no pool job)
+    std::atomic<uint64_t> hashJobsEnqueued{0};       // jobs handed to the global pool
+    std::atomic<uint64_t> hashJobsCompleted{0};      // pool jobs that finished
+    std::atomic<uint64_t> hashResponsesEnqueued{0};  // HashResponse frames pushed to outboundHigh
+    std::atomic<uint64_t> hashResponsesSent{0};      // HashResponse frames handed to the socket batch
+
     auto enqueueHigh = [&](Frame frame) {
         std::lock_guard<std::mutex> lock(mu);
         outboundHigh.push(std::move(frame));
@@ -679,6 +751,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         }
                     });
                 } else if (frame.type == MsgType::HashRequest) {
+                    hashRequestsReceived.fetch_add(1, std::memory_order_relaxed);
                     const std::string rel = DecodeHashRequest(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, rel);
                     HashFingerprint fingerprint;
@@ -687,6 +760,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         Hash256 cachedHash{};
                         if (GetServerHashMemCache().TryGet(rel, fingerprint, cachedHash)) {
                             enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(rel, cachedHash)});
+                            hashCacheHits.fetch_add(1, std::memory_order_relaxed);
+                            hashResponsesEnqueued.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -694,6 +769,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         std::lock_guard<std::mutex> lock(sessionHashMu);
                         ++sessionPendingHashJobs;
                     }
+                    hashJobsEnqueued.fetch_add(1, std::memory_order_relaxed);
                     try {
                         GetServerHashPool().Enqueue([&, rel, abs, fingerprint, fingerprintValid]() {
                             Hash256 hash{};
@@ -716,19 +792,26 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             if (!done.load()) {
                                 try {
                                     enqueueHigh(Frame{MsgType::HashResponse, 0, EncodeHashResponse(rel, hash)});
+                                    hashResponsesEnqueued.fetch_add(1, std::memory_order_relaxed);
                                 } catch (...) {
                                     failed.store(true);
                                     done.store(true);
                                     outboundCv.notify_all();
                                 }
                             }
+                            hashJobsCompleted.fetch_add(1, std::memory_order_relaxed);
                             {
                                 std::lock_guard<std::mutex> lock(sessionHashMu);
                                 if (sessionPendingHashJobs > 0) {
                                     --sessionPendingHashJobs;
                                 }
+                                // Notify WHILE holding sessionHashMu. This is the job's
+                                // last access to session-local state; if it ran after the
+                                // lock was released, the cleanup drain could observe
+                                // pending==0, return, and destroy sessionHashCv before this
+                                // notify executed (use-after-free under multi-client load).
+                                sessionHashCv.notify_all();
                             }
-                            sessionHashCv.notify_all();
                         });
                     } catch (...) {
                         {
@@ -736,8 +819,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             if (sessionPendingHashJobs > 0) {
                                 --sessionPendingHashJobs;
                             }
+                            sessionHashCv.notify_all();
                         }
-                        sessionHashCv.notify_all();
                         throw;
                     }
                 } else if (frame.type == MsgType::FileOpen) {
@@ -831,6 +914,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                                      : std::chrono::steady_clock::time_point{};
                 size_t highBudget = 256;
                 while (!outboundHigh.empty() && highBudget > 0) {
+                    if (outboundHigh.front().type == MsgType::HashResponse) {
+                        hashResponsesSent.fetch_add(1, std::memory_order_relaxed);
+                    }
                     sendFrames.push_back(std::move(outboundHigh.front()));
                     outboundHigh.pop();
                     didWork = true;
@@ -1008,9 +1094,16 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         pendingHashes = sessionPendingHashJobs;
                     }
                     const size_t globalPendingHashes = GetServerHashPool().PendingTasks();
+                    const size_t globalActiveHashes = GetServerHashPool().ActiveTasks();
                     const size_t hashMemcacheEntries = GetServerHashMemCache().EntryCount();
                     const uint64_t hashMemcacheHits = GetServerHashMemCache().HitCount();
                     const uint64_t hashMemcacheMisses = GetServerHashMemCache().MissCount();
+                    const uint64_t hashReqRecv = hashRequestsReceived.load(std::memory_order_relaxed);
+                    const uint64_t hashHits = hashCacheHits.load(std::memory_order_relaxed);
+                    const uint64_t hashJobsEnq = hashJobsEnqueued.load(std::memory_order_relaxed);
+                    const uint64_t hashJobsDone = hashJobsCompleted.load(std::memory_order_relaxed);
+                    const uint64_t hashRespEnq = hashResponsesEnqueued.load(std::memory_order_relaxed);
+                    const uint64_t hashRespSent = hashResponsesSent.load(std::memory_order_relaxed);
                     auto pct = [](std::vector<int64_t>& v, double p) -> int64_t {
                         if (v.empty()) {
                             return 0;
@@ -1032,7 +1125,16 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                               << " queued_manifest=" << manifestQueued
                               << " pending_adopt=" << pendingAdopt
                               << " pending_hash_jobs=" << pendingHashes
+                              << " hash_req_recv=" << hashReqRecv
+                              << " hash_cache_hits=" << hashHits
+                              << " hash_jobs_enq=" << hashJobsEnq
+                              << " hash_jobs_done=" << hashJobsDone
+                              << " hash_jobs_inflight=" << (hashJobsEnq - hashJobsDone)
+                              << " hash_resp_enq=" << hashRespEnq
+                              << " hash_resp_sent=" << hashRespSent
+                              << " hash_resp_backlog=" << (hashRespEnq - hashRespSent)
                               << " global_hash_queue=" << globalPendingHashes
+                              << " global_hash_active=" << globalActiveHashes
                               << " hash_memcache=" << (hashMemcacheEnabled ? 1 : 0)
                               << " hash_memcache_entries=" << hashMemcacheEntries
                               << " hash_memcache_hits=" << hashMemcacheHits
@@ -1082,6 +1184,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
             pendingHashes = sessionPendingHashJobs;
         }
         const size_t globalPendingHashes = GetServerHashPool().PendingTasks();
+        const size_t globalActiveHashes = GetServerHashPool().ActiveTasks();
         const size_t activeStreamCount = activeStreams.size();
         const size_t activeBatchCount = activeBatchStreams.size();
         // In-flight tasks: active transfer streams + batch streams + pending hash jobs.
@@ -1109,7 +1212,14 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                   << " queued_manifest=" << manifestQueued
                   << " pending_adopt=" << pendingAdopt
                   << " pending_hash_jobs=" << pendingHashes
+                  << " hash_req_recv=" << hashRequestsReceived.load(std::memory_order_relaxed)
+                  << " hash_cache_hits=" << hashCacheHits.load(std::memory_order_relaxed)
+                  << " hash_jobs_enq=" << hashJobsEnqueued.load(std::memory_order_relaxed)
+                  << " hash_jobs_done=" << hashJobsCompleted.load(std::memory_order_relaxed)
+                  << " hash_resp_enq=" << hashResponsesEnqueued.load(std::memory_order_relaxed)
+                  << " hash_resp_sent=" << hashResponsesSent.load(std::memory_order_relaxed)
                   << " global_hash_queue=" << globalPendingHashes
+                  << " global_hash_active=" << globalActiveHashes
                   << " active_streams=" << activeStreamCount
                   << " active_batches=" << activeBatchCount
                   << " in_flight=" << inFlight
@@ -1129,12 +1239,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     if (failed.load()) {
         ShutdownBoth(client);
     }
-    if (receiver.joinable()) {
-        receiver.join();
-    }
-    if (manifestThread.joinable()) {
-        manifestThread.join();
-    }
+    JoinDiag(receiver, "server-session-receiver");
+    JoinDiag(manifestThread, "server-session-manifest");
     {
         // Bounded wait so a leaked/stuck hash job can never produce an unbounded hang
         // (FR-05 / AC-B2). On timeout we converge as a controlled failure.
@@ -2885,28 +2991,18 @@ int RunClient(const CliOptions& options) {
         dirTaskCv.notify_all();
         ioStop.store(true);
         ioTaskCv.notify_all();
-        if (recvThread.joinable()) {
-            recvThread.join();
-        }
+        JoinDiag(recvThread, "client-catch-recv");
         for (auto& w : compareWorkers) {
-            if (w.joinable()) {
-                w.join();
-            }
+            JoinDiag(w, "client-catch-compare");
         }
         for (auto& w : hashWorkers) {
-            if (w.joinable()) {
-                w.join();
-            }
+            JoinDiag(w, "client-catch-hash");
         }
         for (auto& w : dirWorkers) {
-            if (w.joinable()) {
-                w.join();
-            }
+            JoinDiag(w, "client-catch-dir");
         }
         for (auto& w : ioWorkers) {
-            if (w.joinable()) {
-                w.join();
-            }
+            JoinDiag(w, "client-catch-io");
         }
         throw;
     }
@@ -2918,19 +3014,13 @@ int RunClient(const CliOptions& options) {
     ioStop.store(true);
     ioTaskCv.notify_all();
     for (auto& w : compareWorkers) {
-        if (w.joinable()) {
-            w.join();
-        }
+        JoinDiag(w, "client-compare");
     }
     for (auto& w : hashWorkers) {
-        if (w.joinable()) {
-            w.join();
-        }
+        JoinDiag(w, "client-hash");
     }
     for (auto& w : ioWorkers) {
-        if (w.joinable()) {
-            w.join();
-        }
+        JoinDiag(w, "client-io");
     }
 
     // Manifest completeness gate (used both for the deferred directory creation below
@@ -2985,9 +3075,7 @@ int RunClient(const CliOptions& options) {
     dirStop.store(true);
     dirTaskCv.notify_all();
     for (auto& w : dirWorkers) {
-        if (w.joinable()) {
-            w.join();
-        }
+        JoinDiag(w, "client-dir");
     }
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
 
@@ -3040,9 +3128,7 @@ int RunClient(const CliOptions& options) {
         recvStop.store(true);
         incomingDataCv.notify_all();
         ShutdownBoth(socket);
-        if (recvThread.joinable()) {
-            recvThread.join();
-        }
+        JoinDiag(recvThread, "client-recv-incomplete");
         std::cout << "Sync aborted (incomplete manifest). changed_files=" << transferred
                   << " failed_files=" << failed << " enumerated=" << enumerated << std::endl;
         return 3;
@@ -3060,9 +3146,7 @@ int RunClient(const CliOptions& options) {
     recvStop.store(true);
     incomingDataCv.notify_all();
     ShutdownBoth(socket);
-    if (recvThread.joinable()) {
-        recvThread.join();
-    }
+    JoinDiag(recvThread, "client-recv-final");
     const bool success = (failed == 0);
     std::cout << "Sync completed. changed_files=" << transferred
               << " failed_files=" << failed << std::endl;

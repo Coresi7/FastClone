@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -179,7 +181,28 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
         });
     }
     for (auto& worker : workers) {
-        worker.join();
+        if (!worker.joinable()) {
+            continue;
+        }
+        if (worker.get_id() == std::this_thread::get_id()) {
+            // SELF-JOIN: unreachable by design; if it fires, thread ownership is already
+            // corrupted. Fail fast -- detaching would not be safe recovery (the worker
+            // body still uses [&]-captured stack state). See JoinDiag in sync_engine.cpp.
+            std::cerr << "[deadlock-diag] FATAL SELF-JOIN at site=buildfileindex thread_id="
+                      << worker.get_id() << " -- aborting (state not trustworthy)" << std::endl;
+            std::cerr.flush();
+            std::abort();
+        }
+
+        try {
+            worker.join();
+        } catch (const std::system_error& e) {
+            std::cerr << "[deadlock-diag] join FAILED at site=buildfileindex code="
+                      << e.code().value() << " msg=\"" << e.code().message() << "\""
+                      << " caller_thread=" << std::this_thread::get_id()
+                      << " target_thread=" << worker.get_id() << std::endl;
+            throw;
+        }
     }
 
     std::sort(output.begin(), output.end(), [](const FileEntry& a, const FileEntry& b) {
