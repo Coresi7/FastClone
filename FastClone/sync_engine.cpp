@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -213,11 +214,181 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
     }
 }
 
+inline void AtomicMaxU64(std::atomic<uint64_t>& target, uint64_t value) {
+    uint64_t prev = target.load(std::memory_order_relaxed);
+    while (value > prev &&
+           !target.compare_exchange_weak(prev, value, std::memory_order_relaxed)) {
+        // prev was reloaded by compare_exchange_weak; loop until our value is no longer
+        // larger or the store succeeds.
+    }
+}
+
+// Diagnostics for the parallel enumeration. All cumulative; the debug printer derives
+// per-interval rates/averages by differencing snapshots. The point is to tell apart the
+// two things that can throttle enumeration on fast storage:
+//   - listing_us  : wall time spent INSIDE processDir (FindFirstFile/readdir) == disk
+//                   metadata I/O. If this is what climbs past the 3M mark, the wall is
+//                   the device, not our code.
+//   - flush_block_us : wall time a worker is blocked handing its frame chunk to the
+//                   outbound queue (backpressure + lock). If THIS dominates, the sender/
+//                   socket downstream is the cap, not the disk.
+// frames_per_flush confirms the batching is actually amortising the outbound lock.
+struct EnumStats {
+    std::atomic<uint64_t> dirsProcessed{0};
+    std::atomic<uint64_t> framesFlushed{0};
+    std::atomic<uint64_t> flushCount{0};
+    std::atomic<uint64_t> listingUsSum{0};
+    std::atomic<uint64_t> listingUsMax{0};
+    std::atomic<uint64_t> flushBlockUsSum{0};
+    std::atomic<uint64_t> flushBlockUsMax{0};
+};
+
+// Parallel directory traversal. A shared work queue of directories is serviced by a
+// pool of worker threads; each pops a directory, lists it (emitting entries through
+// processDir) and pushes any sub-directories back. The point is to keep MANY metadata
+// reads (FindFirstFile / opendir) in flight at once: on huge trees the per-directory
+// listing is dominated by random MFT / inode reads whose LATENCY a single thread cannot
+// hide (the disk sits half-idle at queue-depth 1). Fan-out raises the device queue
+// depth so those waits overlap, which is the actual lever past the metadata-cache wall.
+//
+// Termination is detected when the queue is empty AND no worker is mid-directory
+// (activeDirs == 0): activeDirs is incremented under the lock at pop time and only
+// decremented after the directory's children have been pushed, so it can never read
+// zero while work is still being produced.
+// Per-directory work is batched on BOTH shared queues so the hot path almost never
+// touches a lock per file:
+//   - kDirPopBatch directories are popped (and their children pushed back) per qmu
+//     acquisition, amortising the work-queue lock over many directories.
+//   - Each worker buffers emitted frames in a thread-local vector and hands them off via
+//     flushFrames() in chunks of kFrameFlushThreshold (and once more on exit). flushFrames
+//     is the ONLY place that touches the outbound queue lock, so a worker takes that lock
+//     ~1/kFrameFlushThreshold as often as a per-frame enqueue would. This is what keeps
+//     16 enumerators from serialising on the outbound mutex on fast (NVMe) storage.
+constexpr size_t kDirPopBatch = 8;
+constexpr size_t kFrameFlushThreshold = 1024;
+
+template <typename PendingDir, typename ProcessFn, typename FlushFn>
+static void ParallelDirWalk(PendingDir rootDir,
+                            unsigned numWorkers,
+                            const std::atomic<bool>& done,
+                            ProcessFn&& processDir,
+                            FlushFn&& flushFrames,
+                            EnumStats& stats) {
+    auto flushAndMeasure = [&](std::vector<Frame>& buf) {
+        const uint64_t frames = buf.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        flushFrames(buf);  // hands off and clears buf
+        const uint64_t us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        stats.framesFlushed.fetch_add(frames, std::memory_order_relaxed);
+        stats.flushCount.fetch_add(1, std::memory_order_relaxed);
+        stats.flushBlockUsSum.fetch_add(us, std::memory_order_relaxed);
+        AtomicMaxU64(stats.flushBlockUsMax, us);
+    };
+    std::mutex qmu;
+    std::condition_variable qcv;
+    std::deque<PendingDir> queue;
+    size_t activeDirs = 0;
+    queue.push_back(std::move(rootDir));
+
+    std::mutex errMu;
+    std::exception_ptr firstError;
+
+    auto worker = [&]() {
+        std::vector<PendingDir> batch;
+        std::vector<PendingDir> subdirs;
+        std::vector<Frame> frameBuf;
+        while (true) {
+            batch.clear();
+            {
+                std::unique_lock<std::mutex> lock(qmu);
+                qcv.wait(lock, [&]() {
+                    return done.load() || !queue.empty() || activeDirs == 0;
+                });
+                if (done.load()) {
+                    break;
+                }
+                if (queue.empty()) {
+                    // queue empty && activeDirs == 0 -> walk complete.
+                    qcv.notify_all();
+                    break;
+                }
+                const size_t take = std::min<size_t>(kDirPopBatch, queue.size());
+                for (size_t i = 0; i < take; ++i) {
+                    batch.push_back(std::move(queue.back()));
+                    queue.pop_back();
+                }
+                activeDirs += take;
+            }
+            subdirs.clear();
+            // A worker exception (e.g. bad_alloc, or a throwing encode) must neither call
+            // std::terminate NOR leak activeDirs: skipping the activeDirs decrement below
+            // would wedge the termination predicate and hang every other worker on join.
+            // So we capture the FIRST exception, always run the queue/activeDirs
+            // bookkeeping (just without pushing the failed batch's children), and rethrow
+            // once after all workers have joined. Siblings finish the rest of the tree
+            // normally, so no one is forced into a stop that would need an external wake.
+            bool threw = false;
+            try {
+                for (const PendingDir& d : batch) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    processDir(d, subdirs, frameBuf);
+                    const uint64_t us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0).count());
+                    stats.listingUsSum.fetch_add(us, std::memory_order_relaxed);
+                    AtomicMaxU64(stats.listingUsMax, us);
+                    stats.dirsProcessed.fetch_add(1, std::memory_order_relaxed);
+                    if (frameBuf.size() >= kFrameFlushThreshold) {
+                        flushAndMeasure(frameBuf);
+                    }
+                }
+            } catch (...) {
+                threw = true;
+                std::lock_guard<std::mutex> elock(errMu);
+                if (!firstError) {
+                    firstError = std::current_exception();
+                }
+            }
+            {
+                std::unique_lock<std::mutex> lock(qmu);
+                if (!threw) {
+                    for (PendingDir& d : subdirs) {
+                        queue.push_back(std::move(d));
+                    }
+                }
+                activeDirs -= batch.size();
+                if (!queue.empty() || activeDirs == 0) {
+                    qcv.notify_all();
+                }
+            }
+        }
+        // Hand off whatever this worker still holds before it exits (outside qmu).
+        if (!frameBuf.empty()) {
+            flushAndMeasure(frameBuf);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers);
+    for (unsigned i = 0; i < numWorkers; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (std::thread& t : workers) {
+        JoinDiag(t, "server-enum-walk");
+    }
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+}
+
 void EnumerateManifestEntriesFast(
     const fs::path& root,
     const std::optional<fs::path>& selfPath,
     const std::atomic<bool>& done,
-    const std::function<void(Frame&&)>& enqueueManifestFrame) {
+    const std::function<void(std::vector<Frame>&)>& flushManifestFrames,
+    EnumStats& stats) {
 #ifdef _WIN32
     auto FileTimeToTicks = [](FILETIME ft) -> int64_t {
         ULARGE_INTEGER v{};
@@ -234,17 +405,10 @@ void EnumerateManifestEntriesFast(
     const std::wstring rootW = root.wstring();
     const std::wstring selfW = selfPath.has_value() ? selfPath->wstring() : L"";
 
-    std::vector<PendingDir> stack;
-    stack.push_back(PendingDir{rootW, ""});
+    std::atomic<uint64_t> fileCount{0};
 
-    size_t fileCount = 0;
-    while (!stack.empty()) {
-        if (done.load()) {
-            return;
-        }
-        PendingDir current = std::move(stack.back());
-        stack.pop_back();
-
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+                          std::vector<Frame>& out) {
         std::wstring pattern = current.absDir;
         if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
             pattern.push_back(L'\\');
@@ -260,13 +424,12 @@ void EnumerateManifestEntriesFast(
             nullptr,
             FIND_FIRST_EX_LARGE_FETCH);
         if (hFind == INVALID_HANDLE_VALUE) {
-            continue;
+            return;
         }
 
         do {
             if (done.load()) {
-                FindClose(hFind);
-                return;
+                break;
             }
 
             const wchar_t* name = fd.cFileName;
@@ -294,97 +457,143 @@ void EnumerateManifestEntriesFast(
             entry.isDirectory = isDir;
             entry.fileSize = isDir ? 0 : (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
             entry.mtimeNs = FileTimeToTicks(fd.ftLastWriteTime);
-            enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
+            out.push_back(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
 
             if (isDir) {
-                stack.push_back(PendingDir{absPath, relPath});
+                subdirs.push_back(PendingDir{std::move(absPath), std::move(relPath)});
             } else {
-                ++fileCount;
-                if (fileCount % 2048 == 0) {
+                const uint64_t c = fileCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (c % 2048 == 0) {
                     std::vector<uint8_t> payload;
-                    AppendU64(payload, static_cast<uint64_t>(fileCount));
-                    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+                    AppendU64(payload, c);
+                    out.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
                 }
             }
         } while (FindNextFileW(hFind, &fd) != 0);
 
         FindClose(hFind);
-    }
+    };
 
+    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+    // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
+    // random metadata reads, and more threads only add lock churn on the work queue.
+    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+    ParallelDirWalk(PendingDir{rootW, std::string()}, numWorkers, done, processDir, flushManifestFrames, stats);
+
+    if (done.load()) {
+        return;
+    }
+    std::vector<Frame> tail;
     std::vector<uint8_t> payload;
-    AppendU64(payload, static_cast<uint64_t>(fileCount));
-    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
-    enqueueManifestFrame(Frame{MsgType::ManifestEnd, 0, {}});
+    AppendU64(payload, fileCount.load());
+    tail.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+    tail.push_back(Frame{MsgType::ManifestEnd, 0, {}});
+    flushManifestFrames(tail);
 #else
-    size_t fileCount = 0;
-    std::error_code ec;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
-         it != end;
-         it.increment(ec)) {
-        if (done.load()) {
+    struct PendingDir {
+        fs::path absDir;
+        std::string relDir;
+    };
+
+    std::atomic<uint64_t> fileCount{0};
+
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+                          std::vector<Frame>& out) {
+        std::error_code ec;
+        fs::directory_iterator it(current.absDir, fs::directory_options::skip_permission_denied, ec);
+        const fs::directory_iterator end;
+        if (ec) {
             return;
         }
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-
-        const fs::path absPath = it->path();
-        if (selfPath.has_value()) {
-            std::error_code eqec;
-            if (fs::equivalent(absPath, *selfPath, eqec) && !eqec) {
-                continue;
+        for (; it != end; it.increment(ec)) {
+            if (done.load()) {
+                return;
             }
-        }
-
-        const bool isDir = it->is_directory(ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        const bool isRegular = it->is_regular_file(ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        if (!isDir && !isRegular) {
-            continue;
-        }
-
-        FileEntry entry;
-        entry.relativePath = NormalizeRelativePath(fs::relative(absPath, root, ec));
-        if (ec || entry.relativePath.empty()) {
-            ec.clear();
-            continue;
-        }
-        entry.isDirectory = isDir;
-        if (isDir) {
-            entry.fileSize = 0;
-        } else {
-            entry.fileSize = static_cast<uint64_t>(fs::file_size(absPath, ec));
             if (ec) {
                 ec.clear();
                 continue;
             }
-            ++fileCount;
-            if (fileCount % 2048 == 0) {
-                std::vector<uint8_t> payload;
-                AppendU64(payload, static_cast<uint64_t>(fileCount));
-                enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+
+            const fs::path& absPath = it->path();
+            if (selfPath.has_value()) {
+                std::error_code eqec;
+                if (fs::equivalent(absPath, *selfPath, eqec) && !eqec) {
+                    continue;
+                }
+            }
+
+            const bool isDir = it->is_directory(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            const bool isRegular = it->is_regular_file(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            if (!isDir && !isRegular) {
+                continue;
+            }
+            // Match recursive_directory_iterator's default: do not descend into
+            // symlinked directories (avoids cycles), but still emit the entry.
+            const bool isSymlink = it->is_symlink(ec);
+            if (ec) {
+                ec.clear();
+            }
+
+            const std::string name = absPath.filename().string();
+            std::string relPath = current.relDir.empty() ? name : (current.relDir + "/" + name);
+            if (relPath.empty()) {
+                continue;
+            }
+
+            FileEntry entry;
+            entry.relativePath = relPath;
+            entry.isDirectory = isDir;
+            if (isDir) {
+                entry.fileSize = 0;
+            } else {
+                entry.fileSize = static_cast<uint64_t>(fs::file_size(absPath, ec));
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                const uint64_t c = fileCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (c % 2048 == 0) {
+                    std::vector<uint8_t> payload;
+                    AppendU64(payload, c);
+                    out.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+                }
+            }
+            entry.mtimeNs = ToUnixNs(fs::last_write_time(absPath, ec));
+            if (ec) {
+                entry.mtimeNs = 0;
+                ec.clear();
+            }
+            out.push_back(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
+
+            if (isDir && !isSymlink) {
+                subdirs.push_back(PendingDir{absPath, std::move(relPath)});
             }
         }
-        entry.mtimeNs = ToUnixNs(fs::last_write_time(absPath, ec));
-        if (ec) {
-            entry.mtimeNs = 0;
-            ec.clear();
-        }
-        enqueueManifestFrame(Frame{MsgType::ManifestEntry, 0, EncodeManifestEntry(entry)});
-    }
+    };
 
+    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+    // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
+    // random metadata reads, and more threads only add lock churn on the work queue.
+    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, done, processDir, flushManifestFrames, stats);
+
+    if (done.load()) {
+        return;
+    }
+    std::vector<Frame> tail;
     std::vector<uint8_t> payload;
-    AppendU64(payload, static_cast<uint64_t>(fileCount));
-    enqueueManifestFrame(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
-    enqueueManifestFrame(Frame{MsgType::ManifestEnd, 0, {}});
+    AppendU64(payload, fileCount.load());
+    tail.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
+    tail.push_back(Frame{MsgType::ManifestEnd, 0, {}});
+    flushManifestFrames(tail);
 #endif
 }
 
@@ -694,12 +903,16 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     // the main loop adopts them into its private containers, then does I/O lock-free.
     std::vector<std::pair<uint32_t, ServerStream>> pendingNewStreams;
     std::vector<std::pair<uint32_t, ServerBatchStream>> pendingNewBatchStreams;
-    const size_t maxQueuedManifestFrames = 512;
+    // Sized so all enumeration workers can each have a full flush chunk in flight without
+    // serialising on backpressure (workers * kFrameFlushThreshold, rounded up). RAM is
+    // cheap relative to the throughput win; the sender drains this continuously.
+    const size_t maxQueuedManifestFrames = 16384;
     std::atomic<bool> done = false;
     std::atomic<bool> failed = false;
     std::string errorText;
     std::thread manifestThread;
     std::atomic<bool> manifestStarted = false;
+    EnumStats enumStats;  // parallel-enumeration diagnostics (see EnumStats / debug printer)
     std::mutex sessionHashMu;  // lock order: acquire only when NOT holding mu (mu > sessionHashMu)
     std::condition_variable sessionHashCv;
     size_t sessionPendingHashJobs = 0;
@@ -720,15 +933,28 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         outboundHigh.push(std::move(frame));
         outboundCv.notify_one();
     };
-    auto enqueueManifest = [&](Frame frame) {
-        std::unique_lock<std::mutex> lock(mu);
-        outboundCv.wait(lock, [&]() {
-            return done.load() || outboundManifest.size() < maxQueuedManifestFrames;
-        });
-        if (done.load()) {
+    // Batched manifest hand-off: enumeration workers buffer frames locally and flush a
+    // chunk at a time, so the outbound queue lock is taken once per chunk instead of once
+    // per file. Backpressure is checked once for the whole chunk (a chunk may briefly
+    // push the queue past the soft limit, which is fine -- the limit only throttles how
+    // far producers run ahead of the sender). The vector is cleared on return so a
+    // cancelled flush cannot double-enqueue.
+    auto flushManifest = [&](std::vector<Frame>& frames) {
+        if (frames.empty()) {
             return;
         }
-        outboundManifest.push(std::move(frame));
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            outboundCv.wait(lock, [&]() {
+                return done.load() || outboundManifest.size() < maxQueuedManifestFrames;
+            });
+            if (!done.load()) {
+                for (Frame& frame : frames) {
+                    outboundManifest.push(std::move(frame));
+                }
+            }
+        }
+        frames.clear();
         outboundCv.notify_one();
     };
 
@@ -742,11 +968,15 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     manifestThread = std::thread([&]() {
                         try {
-                            EnumerateManifestEntriesFast(options.rootDir, selfPath, done, enqueueManifest);
+                            EnumerateManifestEntriesFast(options.rootDir, selfPath, done, flushManifest, enumStats);
                         } catch (const std::exception& ex) {
                             failed.store(true);
                             done.store(true);
                             sessionHashCv.notify_all();
+                            // Wake the sender (and any producer parked on manifest
+                            // backpressure) so it observes done and tears down promptly
+                            // instead of waiting out its poll timeout.
+                            outboundCv.notify_all();
                             errorText = ex.what();
                         }
                     });
@@ -897,6 +1127,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     std::vector<int64_t> muHoldUs;
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
+        // Snapshots for per-interval enumeration rates/averages (see EnumStats).
+        uint64_t lastEnumDirs = 0;
+        uint64_t lastEnumFrames = 0;
+        uint64_t lastEnumFlushes = 0;
+        uint64_t lastEnumListingUsSum = 0;
+        uint64_t lastEnumFlushBlockUsSum = 0;
         const size_t perStreamBurstBytes = (streamLimit <= 8)
                                                ? std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2)
                                                : static_cast<size_t>(effectiveChunkSize);
@@ -1121,6 +1357,24 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     const int64_t critHoldP50 = pct(muHoldUs, 0.50);
                     const int64_t critHoldP95 = pct(muHoldUs, 0.95);
                     const int64_t critHoldP99 = pct(muHoldUs, 0.99);
+                    const uint64_t enumDirs = enumStats.dirsProcessed.load(std::memory_order_relaxed);
+                    const uint64_t enumFrames = enumStats.framesFlushed.load(std::memory_order_relaxed);
+                    const uint64_t enumFlushes = enumStats.flushCount.load(std::memory_order_relaxed);
+                    const uint64_t enumListingUsSum = enumStats.listingUsSum.load(std::memory_order_relaxed);
+                    const uint64_t enumFlushBlockUsSum = enumStats.flushBlockUsSum.load(std::memory_order_relaxed);
+                    const uint64_t dDirs = enumDirs - lastEnumDirs;
+                    const uint64_t dFrames = enumFrames - lastEnumFrames;
+                    const uint64_t dFlushes = enumFlushes - lastEnumFlushes;
+                    const uint64_t dListingUs = enumListingUsSum - lastEnumListingUsSum;
+                    const uint64_t dFlushBlockUs = enumFlushBlockUsSum - lastEnumFlushBlockUsSum;
+                    const uint64_t enumFramesPerFlush = dFlushes ? (dFrames / dFlushes) : 0;
+                    const uint64_t enumListingUsAvg = dDirs ? (dListingUs / dDirs) : 0;
+                    const uint64_t enumFlushBlockUsAvg = dFlushes ? (dFlushBlockUs / dFlushes) : 0;
+                    lastEnumDirs = enumDirs;
+                    lastEnumFrames = enumFrames;
+                    lastEnumFlushes = enumFlushes;
+                    lastEnumListingUsSum = enumListingUsSum;
+                    lastEnumFlushBlockUsSum = enumFlushBlockUsSum;
                     std::cerr << "[debug][server][sid=" << sessionId << "] queued_high=" << highQueued
                               << " queued_manifest=" << manifestQueued
                               << " pending_adopt=" << pendingAdopt
@@ -1147,6 +1401,14 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                               << " crit_hold_us_p50=" << critHoldP50
                               << " crit_hold_us_p95=" << critHoldP95
                               << " crit_hold_us_p99=" << critHoldP99
+                              << " enum_dirs=" << enumDirs
+                              << " enum_frames=" << enumFrames
+                              << " enum_flushes=" << enumFlushes
+                              << " enum_frames_per_flush=" << enumFramesPerFlush
+                              << " enum_listing_us_avg=" << enumListingUsAvg
+                              << " enum_listing_us_max=" << enumStats.listingUsMax.load(std::memory_order_relaxed)
+                              << " enum_flush_block_us_avg=" << enumFlushBlockUsAvg
+                              << " enum_flush_block_us_max=" << enumStats.flushBlockUsMax.load(std::memory_order_relaxed)
                               << std::endl;
                     muWaitUs.clear();
                     muHoldUs.clear();
