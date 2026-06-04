@@ -13,7 +13,10 @@ add_executable(FastClone
     FastClone/hash_memcache.cpp
     FastClone/main.cpp
     FastClone/protocol.cpp
+    FastClone/protocol_codec.cpp
     FastClone/sync_engine.cpp
+    FastClone/sync_util.cpp
+    FastClone/transfer_tuning.cpp
     FastClone/win_socket.cpp
 )
 

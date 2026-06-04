@@ -148,7 +148,10 @@
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="protocol.h" />
+    <ClInclude Include="protocol_codec.h" />
     <ClInclude Include="sync_engine.h" />
+    <ClInclude Include="sync_util.h" />
+    <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
   </ItemGroup>
   <ItemGroup>
@@ -157,7 +160,10 @@
     <ClCompile Include="hash_memcache.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="protocol.cpp" />
+    <ClCompile Include="protocol_codec.cpp" />
     <ClCompile Include="sync_engine.cpp" />
+    <ClCompile Include="sync_util.cpp" />
+    <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

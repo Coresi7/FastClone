@@ -4,6 +4,9 @@
 #include "hash_memcache.h"
 #include "path_utils.h"
 #include "protocol.h"
+#include "protocol_codec.h"
+#include "sync_util.h"
+#include "transfer_tuning.h"
 #include "win_socket.h"
 
 #ifdef _WIN32
@@ -44,59 +47,9 @@ namespace {
 
 constexpr const char* kProtocolVersion = "FC5";
 
-std::optional<std::string> ReadEnvVar(const char* name) {
-#if defined(_WIN32) && defined(_MSC_VER)
-    char* raw = nullptr;
-    size_t len = 0;
-    const errno_t rc = _dupenv_s(&raw, &len, name);
-    if (rc != 0 || raw == nullptr) {
-        return std::nullopt;
-    }
-    std::string value(raw);
-    std::free(raw);
-    return value;
-#else
-    const char* env = std::getenv(name);
-    if (env == nullptr) {
-        return std::nullopt;
-    }
-    return std::string(env);
-#endif
-}
-
-bool ParseBoolEnv(const char* name) {
-    const std::optional<std::string> env = ReadEnvVar(name);
-    if (!env.has_value()) {
-        return false;
-    }
-    std::string v = *env;
-    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return v == "1" || v == "true" || v == "yes" || v == "on";
-}
-
-bool IsDebugEnabled() {
-    static const bool enabled = ParseBoolEnv("FASTCLONE_DEBUG");
-    return enabled;
-}
-
-// Design §A.3: --diag must also honour the FASTCLONE_DIAG environment variable,
-// reusing the same boolean parsing as FASTCLONE_DEBUG.
-bool IsDiagEnabled() {
-    static const bool enabled = ParseBoolEnv("FASTCLONE_DIAG");
-    return enabled;
-}
-
 struct ServerStream {
     std::ifstream input;
     std::string relativePath;
-};
-
-struct BatchFileRecord {
-    std::string relativePath;
-    uint64_t fileSize = 0;
-    int64_t mtimeNs = 0;
-    bool ok = false;
-    fs::path absPath;
 };
 
 struct ServerBatchStream {
@@ -122,71 +75,6 @@ enum class CompareAction {
     TransferNow,
     FallbackHash
 };
-
-struct TunedTransferOptions {
-    uint32_t streamLimit = 16;
-    uint32_t chunkSize = 256 * 1024;
-};
-
-TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
-    TunedTransferOptions tuned;
-    tuned.streamLimit = options.streamLimit;
-    tuned.chunkSize = options.chunkSize;
-
-    const uint32_t hw = std::max<uint32_t>(1, std::thread::hardware_concurrency());
-
-    if (options.streamAutoTune) {
-        // Keep default stream count conservative to reduce failure rate
-        // on weak SSD/controllers when user doesn't explicitly set --streams.
-        tuned.streamLimit = 4;
-    }
-
-    if (options.chunkAutoTune) {
-        if (tuned.streamLimit <= 8) {
-            tuned.chunkSize = 4 * 1024 * 1024;
-        } else if (tuned.streamLimit <= 16) {
-            tuned.chunkSize = 2 * 1024 * 1024;
-        } else if (tuned.streamLimit <= 32) {
-            tuned.chunkSize = 1024 * 1024;
-        } else if (tuned.streamLimit <= 64) {
-            tuned.chunkSize = 512 * 1024;
-        } else {
-            tuned.chunkSize = 256 * 1024;
-        }
-    }
-
-    tuned.streamLimit = std::clamp<uint32_t>(tuned.streamLimit, 1, 1024);
-    tuned.chunkSize = std::clamp<uint32_t>(tuned.chunkSize, 64 * 1024, 64 * 1024 * 1024);
-    return tuned;
-}
-
-uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
-size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
-
-bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs) {
-    // Heuristic shared with file_index.cpp compatibility logic:
-    // values above this threshold are very likely Unix nanoseconds.
-    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
-    // 1970-01-01 UTC offset in FILETIME 100ns ticks since 1601-01-01.
-    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
-
-    if (rawMtime > kLikelyUnixNsThreshold) {
-        outUnixNs = rawMtime;
-        return true;
-    }
-    // Treat lower values as FILETIME ticks. If conversion is not meaningful
-    // (e.g. unknown/legacy sentinel), caller can fall back to raw compare.
-    if (rawMtime < kWindowsEpochDiff100ns) {
-        return false;
-    }
-    const int64_t ticksSinceUnixEpoch = rawMtime - kWindowsEpochDiff100ns;
-    if (ticksSinceUnixEpoch > (std::numeric_limits<int64_t>::max)() / 100LL ||
-        ticksSinceUnixEpoch < (std::numeric_limits<int64_t>::min)() / 100LL) {
-        return false;
-    }
-    outUnixNs = ticksSinceUnixEpoch * 100LL;
-    return true;
-}
 
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
     constexpr int64_t kMtimeToleranceNs = 2LL * 1000LL * 1000LL;  // 2ms tolerance
@@ -216,45 +104,6 @@ CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, con
         }
     }
     return CompareAction::FallbackHash;
-}
-
-#ifdef _WIN32
-std::wstring Utf8ToWide(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
-    const int len = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
-    if (len <= 0) {
-        throw std::runtime_error("MultiByteToWideChar failed");
-    }
-    std::wstring output(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), output.data(), len);
-    return output;
-}
-
-std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) {
-        return {};
-    }
-    const int len = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (len <= 0) {
-        throw std::runtime_error("WideCharToMultiByte failed");
-    }
-    std::string output(static_cast<size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), output.data(), len, nullptr, nullptr);
-    return output;
-}
-#endif
-
-fs::path JoinRel(const fs::path& root, const std::string& relPath) {
-    if (relPath == "." || relPath.empty()) {
-        return root;
-    }
-#ifdef _WIN32
-    return root / fs::path(Utf8ToWide(relPath));
-#else
-    return root / fs::path(relPath);
-#endif
 }
 
 void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {}) {
@@ -308,8 +157,6 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
         throw std::runtime_error("Server authentication rejected");
     }
 }
-
-std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry);
 
 void EnumerateManifestEntriesFast(
     const fs::path& root,
@@ -486,125 +333,6 @@ void EnumerateManifestEntriesFast(
 #endif
 }
 
-std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
-    std::vector<uint8_t> payload;
-    payload.push_back(entry.isDirectory ? 1 : 0);
-    AppendString(payload, entry.relativePath);
-    AppendU64(payload, entry.fileSize);
-    AppendI64(payload, entry.mtimeNs);
-    return payload;
-}
-
-FileEntry DecodeManifestEntry(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    if (payload.empty()) {
-        throw std::runtime_error("Manifest payload too short");
-    }
-    FileEntry entry;
-    entry.isDirectory = payload[cursor++] != 0;
-    entry.relativePath = ReadString(payload, cursor);
-    entry.fileSize = ReadU64(payload, cursor);
-    entry.mtimeNs = ReadI64(payload, cursor);
-    return entry;
-}
-
-std::vector<uint8_t> EncodeHashRequest(const std::string& relPath) {
-    std::vector<uint8_t> payload;
-    AppendString(payload, relPath);
-    return payload;
-}
-
-std::string DecodeHashRequest(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    return ReadString(payload, cursor);
-}
-
-std::vector<uint8_t> EncodeHashResponse(const std::string& relPath, const Hash256& hash) {
-    std::vector<uint8_t> payload;
-    AppendString(payload, relPath);
-    payload.insert(payload.end(), hash.begin(), hash.end());
-    return payload;
-}
-
-std::pair<std::string, Hash256> DecodeHashResponse(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    std::pair<std::string, Hash256> value;
-    value.first = ReadString(payload, cursor);
-    if (cursor + value.second.size() > payload.size()) {
-        throw std::runtime_error("Hash response payload invalid");
-    }
-    std::copy(payload.begin() + static_cast<std::ptrdiff_t>(cursor), payload.begin() + static_cast<std::ptrdiff_t>(cursor + value.second.size()), value.second.begin());
-    return value;
-}
-
-std::vector<uint8_t> EncodeFileOpen(const std::string& relPath) {
-    std::vector<uint8_t> payload;
-    AppendString(payload, relPath);
-    return payload;
-}
-
-std::string DecodeFileOpen(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    return ReadString(payload, cursor);
-}
-
-std::vector<uint8_t> EncodeFileBatchRequest(const std::vector<std::string>& relPaths) {
-    if (relPaths.size() > UINT16_MAX) {
-        throw std::runtime_error("Batch request too large");
-    }
-    std::vector<uint8_t> payload;
-    AppendU16(payload, static_cast<uint16_t>(relPaths.size()));
-    for (const std::string& rel : relPaths) {
-        AppendString(payload, rel);
-    }
-    return payload;
-}
-
-std::vector<std::string> DecodeFileBatchRequest(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    const uint16_t count = ReadU16(payload, cursor);
-    std::vector<std::string> relPaths;
-    relPaths.reserve(count);
-    for (uint16_t i = 0; i < count; ++i) {
-        relPaths.push_back(ReadString(payload, cursor));
-    }
-    return relPaths;
-}
-
-std::vector<uint8_t> EncodeFileBatchOpenResponse(const std::vector<BatchFileRecord>& files) {
-    if (files.size() > UINT16_MAX) {
-        throw std::runtime_error("Batch response too large");
-    }
-    std::vector<uint8_t> payload;
-    AppendU16(payload, static_cast<uint16_t>(files.size()));
-    for (const auto& file : files) {
-        payload.push_back(file.ok ? 1 : 0);
-        AppendString(payload, file.relativePath);
-        AppendU64(payload, file.fileSize);
-        AppendI64(payload, file.mtimeNs);
-    }
-    return payload;
-}
-
-std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8_t>& payload) {
-    size_t cursor = 0;
-    const uint16_t count = ReadU16(payload, cursor);
-    std::vector<BatchFileRecord> files;
-    files.reserve(count);
-    for (uint16_t i = 0; i < count; ++i) {
-        if (cursor >= payload.size()) {
-            throw std::runtime_error("Batch open response invalid");
-        }
-        BatchFileRecord file;
-        file.ok = payload[cursor++] != 0;
-        file.relativePath = ReadString(payload, cursor);
-        file.fileSize = ReadU64(payload, cursor);
-        file.mtimeNs = ReadI64(payload, cursor);
-        files.push_back(std::move(file));
-    }
-    return files;
-}
-
 LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& exclude) {
     LocalState st;
 #ifdef _WIN32
@@ -714,14 +442,6 @@ LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& 
     return st;
 }
 
-void EnsureParentDir(const fs::path& filePath) {
-    const fs::path parent = filePath.parent_path();
-    if (!parent.empty()) {
-        std::error_code ec;
-        fs::create_directories(parent, ec);
-    }
-}
-
 struct RemoveLocalExtrasResult {
     size_t deletedFiles = 0;
     size_t failedOps = 0;
@@ -758,38 +478,6 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
         }
     }
     return result;
-}
-
-std::optional<fs::path> CurrentExePath() {
-#ifdef _WIN32
-    wchar_t pathBuf[MAX_PATH];
-    const DWORD len = GetModuleFileNameW(nullptr, pathBuf, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        return std::nullopt;
-    }
-    return fs::weakly_canonical(fs::path(pathBuf));
-#elif defined(__linux__)
-    std::vector<char> buf(4096);
-    const ssize_t len = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
-    if (len <= 0) {
-        return std::nullopt;
-    }
-    buf[static_cast<size_t>(len)] = '\0';
-    return fs::weakly_canonical(fs::path(buf.data()));
-#elif defined(__APPLE__)
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    if (size == 0) {
-        return std::nullopt;
-    }
-    std::vector<char> buf(size + 1, '\0');
-    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
-        return std::nullopt;
-    }
-    return fs::weakly_canonical(fs::path(buf.data()));
-#else
-    return std::nullopt;
-#endif
 }
 
 uint32_t ResolveServerHashWorkerCount(const CliOptions& options) {
@@ -1499,26 +1187,6 @@ struct BatchDownloadState {
     size_t currentIndex = 0;
 };
 
-uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit) {
-    if (streamLimit <= 16) {
-        return std::max<uint32_t>(configuredChunkSize, 1024 * 1024);
-    }
-    if (streamLimit <= 32) {
-        return std::max<uint32_t>(configuredChunkSize, 512 * 1024);
-    }
-    return configuredChunkSize;
-}
-
-size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize) {
-    if (streamLimit <= 16) {
-        return std::max<size_t>(4 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 4);
-    }
-    if (streamLimit <= 32) {
-        return std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2);
-    }
-    return std::max<size_t>(512 * 1024, static_cast<size_t>(effectiveChunkSize));
-}
-
 void PrintClientCounters(size_t enumerated,
                          size_t compared,
                          size_t unchanged,
@@ -1561,104 +1229,6 @@ void PrintClientCounters(size_t enumerated,
               << "  Transfered: " << transferred
               << "  Deleted: " << deleted
               << std::endl;
-}
-
-void TransferFileBatch(const SocketHandle& socket,
-                       const CliOptions& options,
-                       const fs::path& rootDir,
-                       const std::unordered_map<std::string, FileEntry>& remoteFiles,
-                       const std::vector<std::string>& filesToTransfer,
-                       size_t& transferredTotal) {
-    if (filesToTransfer.empty()) {
-        return;
-    }
-    std::unordered_map<uint32_t, DownloadState> activeDownloads;
-    std::unordered_map<uint32_t, std::string> streamToPath;
-    std::queue<std::pair<uint32_t, std::string>> pending;
-    uint32_t streamId = 1;
-    for (const std::string& rel : filesToTransfer) {
-        pending.push({streamId++, rel});
-    }
-
-    const TunedTransferOptions tuned = ResolveTransferOptions(options);
-    const uint32_t streamLimit = tuned.streamLimit;
-    const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
-    const size_t downloadFlushThreshold = DownloadFlushThresholdForStreams(streamLimit, effectiveChunkSize);
-
-    auto flushBufferedWrites = [&](DownloadState& d) {
-        if (d.writeBuffer.empty()) {
-            return;
-        }
-        d.output.write(reinterpret_cast<const char*>(d.writeBuffer.data()), static_cast<std::streamsize>(d.writeBuffer.size()));
-        d.writeBuffer.clear();
-    };
-
-    auto openPendingStream = [&](uint32_t sid, const std::string& rel) {
-        const fs::path abs = JoinRel(rootDir, rel);
-        EnsureParentDir(abs);
-        DownloadState d;
-        d.relPath = rel;
-        d.output.open(abs, std::ios::binary | std::ios::trunc);
-        if (!d.output) {
-            throw std::runtime_error("Cannot open local file for write: " + rel);
-        }
-        d.flushThreshold = downloadFlushThreshold;
-        d.writeBuffer.reserve(d.flushThreshold);
-        activeDownloads.emplace(sid, std::move(d));
-        streamToPath.emplace(sid, rel);
-        SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
-    };
-
-    while (!pending.empty() && activeDownloads.size() < streamLimit) {
-        auto [sid, rel] = pending.front();
-        pending.pop();
-        openPendingStream(sid, rel);
-    }
-
-    size_t completed = 0;
-    while (completed < filesToTransfer.size()) {
-        Frame frame = RecvFrame(socket);
-        if (frame.type == MsgType::FileChunk) {
-            auto it = activeDownloads.find(frame.streamId);
-            if (it == activeDownloads.end()) {
-                throw std::runtime_error("Received chunk for unknown stream");
-            }
-            DownloadState& d = it->second;
-            d.writeBuffer.insert(d.writeBuffer.end(), frame.payload.begin(), frame.payload.end());
-            if (d.writeBuffer.size() >= d.flushThreshold) {
-                flushBufferedWrites(d);
-            }
-        } else if (frame.type == MsgType::FileEnd) {
-            auto it = activeDownloads.find(frame.streamId);
-            if (it == activeDownloads.end()) {
-                throw std::runtime_error("Received end for unknown stream");
-            }
-            flushBufferedWrites(it->second);
-            it->second.output.flush();
-            it->second.output.close();
-            const std::string rel = it->second.relPath;
-            const FileEntry& meta = remoteFiles.at(rel);
-            SetFileModifyTime(JoinRel(rootDir, rel), meta.mtimeNs);
-            activeDownloads.erase(it);
-            streamToPath.erase(frame.streamId);
-            ++completed;
-            ++transferredTotal;
-            if (transferredTotal % 200 == 0) {
-                std::cout << "[progress] transfer total_completed=" << transferredTotal << std::endl;
-            }
-            if (!pending.empty()) {
-                auto [sid, nextRel] = pending.front();
-                pending.pop();
-                openPendingStream(sid, nextRel);
-            }
-        } else if (frame.type == MsgType::FileError) {
-            auto it = streamToPath.find(frame.streamId);
-            const std::string rel = it == streamToPath.end() ? "<unknown>" : it->second;
-            throw std::runtime_error("Server cannot open file: " + rel);
-        } else {
-            throw std::runtime_error("Unexpected frame during file transfer");
-        }
-    }
 }
 
 }  // namespace

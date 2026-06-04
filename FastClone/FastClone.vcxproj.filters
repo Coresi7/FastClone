@@ -27,7 +27,16 @@
     <ClInclude Include="protocol.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="protocol_codec.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="sync_engine.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="sync_util.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="transfer_tuning.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="win_socket.h">
@@ -50,7 +59,16 @@
     <ClCompile Include="protocol.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="protocol_codec.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="sync_engine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="sync_util.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="transfer_tuning.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="win_socket.cpp">
