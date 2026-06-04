@@ -1486,6 +1486,11 @@ struct BatchDownloadEntry {
     bool finalized = false;
     uint64_t received = 0;
     std::ofstream output;
+    // Received bytes are buffered here and handed to the async I/O worker pool once
+    // the whole file is in; the single main thread no longer writes file payloads to
+    // disk inline (which previously serialised all transfer I/O and starved manifest
+    // ingestion / compare).
+    std::vector<uint8_t> buffer;
 };
 
 struct BatchDownloadState {
@@ -1778,6 +1783,33 @@ int RunClient(const CliOptions& options) {
     std::atomic<size_t> compareTasksIssued = 0;
     std::atomic<size_t> compareResultsHandled = 0;
 
+    // Async file-write pool. Batch transfer payloads are buffered per file and handed
+    // off here; workers do EnsureParentDir + open/write/close + SetFileModifyTime in
+    // parallel and report success/failure back to the main thread (which owns all the
+    // counters / retry bookkeeping, so no atomics are needed for those). This removes
+    // the disk-I/O serialisation from the single main loop so it can keep draining the
+    // manifest backlog and feeding the compare workers.
+    struct IoWriteTask {
+        std::string relPath;
+        std::vector<uint8_t> data;
+        int64_t mtimeNs = 0;
+    };
+    struct IoWriteResult {
+        std::string relPath;
+        bool ok = false;
+    };
+    std::mutex ioTaskMu;
+    std::condition_variable ioTaskCv;
+    std::deque<IoWriteTask> ioTasks;
+    std::mutex ioResultMu;
+    std::deque<IoWriteResult> ioResults;
+    std::atomic<bool> ioStop = false;
+    std::atomic<uint64_t> ioInFlightBytes = 0;
+    // Main-thread only: number of files dispatched to the I/O pool whose result has not
+    // yet been handled. Used as a completion-gate term so the sync does not finish while
+    // writes are still pending.
+    size_t ioOutstanding = 0;
+
     // Directory creation is offloaded to a small worker pool. With deep trees the
     // manifest can carry millions of directory entries; calling fs::create_directories
     // for each one inline on the single main loop serialised millions of filesystem
@@ -1913,6 +1945,14 @@ int RunClient(const CliOptions& options) {
     std::deque<Frame> incomingManifestFrames;
     uint64_t incomingQueuedBytes = 0;
     const uint64_t incomingSoftLimitBytes = std::max<uint64_t>(256ULL * 1024ULL * 1024ULL, options.queuedFileSizeBytes);
+    // Upper bound on bytes buffered in flight by the async write pool (received but not
+    // yet written). This is a jitter-absorbing ceiling, NOT a steady-state working set:
+    // when the SSD keeps up, the workers drain faster than data arrives and this is never
+    // approached, so making it generous only helps ride out transient write stalls
+    // (AV scans, dir-create hiccups) without leaving the transfer pipeline idle. Tied to
+    // the incoming soft limit so a single knob scales both, with a 1 GiB floor.
+    const uint64_t ioInFlightLimitBytes =
+        std::max<uint64_t>(1024ULL * 1024ULL * 1024ULL, incomingSoftLimitBytes / 2);
     auto frameWireBytes = [](const Frame& f) -> uint64_t {
         return 9ULL + static_cast<uint64_t>(f.payload.size());
     };
@@ -2009,6 +2049,10 @@ int RunClient(const CliOptions& options) {
     uint64_t smallFileBatchThreshold = 1920 * 1024;
     size_t smallBatchMaxFiles = 7680;
     size_t smallBatchMaxBytes = 320ULL * 1024ULL * 1024ULL;
+    // Highest batch threshold for which the pending-regular queue has already been fully
+    // promoted to batch. rebalanceTransfersTowardBatch only does its O(N) queue rescan
+    // when the threshold has risen above this, instead of every single loop iteration.
+    uint64_t rebalanceDoneThreshold = smallFileBatchThreshold;
     auto enqueueTransfer = [&](const std::string& rel, bool isRetry) {
         const auto it = remoteFiles.find(rel);
         const bool useBatch = (it != remoteFiles.end() && it->second.fileSize <= smallFileBatchThreshold);
@@ -2127,12 +2171,28 @@ int RunClient(const CliOptions& options) {
             return moved;
         };
 
+        // Promotion (regular -> batch) is only needed after the threshold INCREASES:
+        // entries are classified with the current threshold at enqueue time, so a stable
+        // (or shrinking) threshold leaves nothing to move. Skipping the rescan otherwise
+        // avoids rebuilding the entire (here ~hundreds of thousands deep) pending queue on
+        // every loop iteration, which was burning the single main thread's time and
+        // starving manifest ingestion / compare.
+        if (smallFileBatchThreshold <= rebalanceDoneThreshold) {
+            return;
+        }
+
         // Keep per-loop reclassification bounded.
         const size_t moveBudget = std::max<size_t>(512, smallBatchMaxFiles);
         const size_t moved = moveEligible(pendingTransfers, pendingBatchTransfers, moveBudget);
         const size_t retryBudgetBase = std::max<size_t>(moveBudget / 2, size_t{256});
         const size_t retryBudget = (moved >= retryBudgetBase) ? size_t{0} : (retryBudgetBase - moved);
-        moveEligible(pendingRetryTransfers, pendingRetryBatchTransfers, retryBudget);
+        const size_t retryMoved = moveEligible(pendingRetryTransfers, pendingRetryBatchTransfers, retryBudget);
+        // A pass that promotes nothing means the queues hold no more entries eligible at
+        // the current threshold; mark this threshold done so we stop rescanning until it
+        // rises again.
+        if (moved == 0 && retryMoved == 0) {
+            rebalanceDoneThreshold = smallFileBatchThreshold;
+        }
     };
 
     auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
@@ -2284,6 +2344,69 @@ int RunClient(const CliOptions& options) {
         });
     }
 
+    // Async file-write worker pool (see IoWriteTask declaration). I/O-bound, so size it
+    // a bit above core count to keep the disk queue full of concurrent small-file
+    // create/write/close/set-mtime operations.
+    const uint32_t ioWorkerCount = std::clamp<uint32_t>(workerCount, 4u, 16u);
+    constexpr size_t kIoBatchPop = 16;
+    std::vector<std::thread> ioWorkers;
+    ioWorkers.reserve(ioWorkerCount);
+    for (uint32_t i = 0; i < ioWorkerCount; ++i) {
+        ioWorkers.emplace_back([&]() {
+            std::vector<IoWriteTask> batch;
+            batch.reserve(kIoBatchPop);
+            std::vector<IoWriteResult> results;
+            results.reserve(kIoBatchPop);
+            while (true) {
+                batch.clear();
+                {
+                    std::unique_lock<std::mutex> lock(ioTaskMu);
+                    ioTaskCv.wait(lock, [&]() { return ioStop.load() || !ioTasks.empty(); });
+                    if (ioStop.load() && ioTasks.empty()) {
+                        return;
+                    }
+                    const size_t take = std::min<size_t>(kIoBatchPop, ioTasks.size());
+                    for (size_t j = 0; j < take; ++j) {
+                        batch.push_back(std::move(ioTasks.front()));
+                        ioTasks.pop_front();
+                    }
+                }
+                results.clear();
+                for (IoWriteTask& t : batch) {
+                    bool ok = false;
+                    const fs::path abs = JoinRel(options.rootDir, t.relPath);
+                    EnsureParentDir(abs);
+                    {
+                        std::ofstream out(abs, std::ios::binary | std::ios::trunc);
+                        if (out) {
+                            if (!t.data.empty()) {
+                                out.write(reinterpret_cast<const char*>(t.data.data()),
+                                          static_cast<std::streamsize>(t.data.size()));
+                            }
+                            out.flush();
+                            ok = out.good();
+                            out.close();
+                            if (ok && !out.good()) {
+                                ok = false;
+                            }
+                        }
+                    }
+                    if (ok) {
+                        SetFileModifyTime(abs, t.mtimeNs);
+                    }
+                    ioInFlightBytes.fetch_sub(t.data.size(), std::memory_order_relaxed);
+                    results.push_back(IoWriteResult{std::move(t.relPath), ok});
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ioResultMu);
+                    for (IoWriteResult& r : results) {
+                        ioResults.push_back(std::move(r));
+                    }
+                }
+            }
+        });
+    }
+
     auto handleCompareResult = [&](const CompareResult& r) {
         const CompareAction action = r.action;
         if (action == CompareAction::TransferNow) {
@@ -2332,6 +2455,12 @@ int RunClient(const CliOptions& options) {
             return !pendingBatchTransfers.empty() || !pendingRetryBatchTransfers.empty();
         };
         while (activeTransferSlots() < streamLimit) {
+            // Backpressure: stop opening new transfers while the async write pool still
+            // has a large backlog of buffered (received-but-unwritten) bytes, so memory
+            // stays bounded. In-flight streams keep draining and the watermark recovers.
+            if (ioInFlightBytes.load(std::memory_order_relaxed) > ioInFlightLimitBytes) {
+                break;
+            }
             bool started = false;
             std::deque<std::string>* batchQueue = nullptr;
             std::deque<std::string>* regularQueue = nullptr;
@@ -2437,6 +2566,37 @@ int RunClient(const CliOptions& options) {
         }
         entry.finalized = true;
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+    };
+
+    // Hand a fully-received file off to the async I/O pool instead of writing it on the
+    // main thread. The counters are bumped later, on the main thread, when the worker's
+    // result is drained (see the ioResults handling in the main loop).
+    auto dispatchBatchWrite = [&](BatchDownloadEntry& entry) {
+        IoWriteTask task;
+        task.relPath = entry.relPath;
+        task.mtimeNs = entry.mtimeNs;
+        task.data = std::move(entry.buffer);
+        ioInFlightBytes.fetch_add(task.data.size(), std::memory_order_relaxed);
+        ++ioOutstanding;
+        {
+            std::lock_guard<std::mutex> lock(ioTaskMu);
+            ioTasks.push_back(std::move(task));
+        }
+        ioTaskCv.notify_one();
+        entry.finalized = true;
+    };
+
+    // Complete a batch entry: data-bearing successful writes go to the async pool; empty
+    // files and failures keep the original synchronous finalize path (cheap, no bulk I/O).
+    auto completeBatchEntry = [&](BatchDownloadEntry& entry) {
+        if (entry.finalized) {
+            return;
+        }
+        if (entry.shouldWrite && entry.fileSize > 0) {
+            dispatchBatchWrite(entry);
+        } else {
+            finalizeBatchEntry(entry);
+        }
     };
 
     auto resolveFallbackIfReady = [&]() {
@@ -2662,7 +2822,7 @@ int RunClient(const CliOptions& options) {
                     if (batch.currentIndex < batch.entries.size() &&
                         !batch.entries[batch.currentIndex].finalized &&
                         batch.entries[batch.currentIndex].received >= batch.entries[batch.currentIndex].fileSize) {
-                        finalizeBatchEntry(batch.entries[batch.currentIndex]);
+                        completeBatchEntry(batch.entries[batch.currentIndex]);
                     }
                     ++batch.currentIndex;
                 }
@@ -2673,23 +2833,20 @@ int RunClient(const CliOptions& options) {
                 const uint64_t remainingForEntry = entry.fileSize - entry.received;
                 const size_t available = frame.payload.size() - offset;
                 const size_t take = static_cast<size_t>(std::min<uint64_t>(remainingForEntry, static_cast<uint64_t>(available)));
+                // Buffer the bytes in memory; the actual disk write happens off-thread in
+                // the I/O pool once the file is complete (see dispatchBatchWrite).
                 if (entry.shouldWrite) {
-                    if (!entry.output.is_open()) {
-                        const fs::path abs = JoinRel(options.rootDir, entry.relPath);
-                        EnsureParentDir(abs);
-                        entry.output.open(abs, std::ios::binary | std::ios::trunc);
-                        if (!entry.output.good()) {
-                            entry.shouldWrite = false;
-                        }
+                    if (entry.buffer.capacity() == 0 && entry.fileSize > 0) {
+                        entry.buffer.reserve(static_cast<size_t>(entry.fileSize));
                     }
-                    if (entry.shouldWrite) {
-                        entry.output.write(reinterpret_cast<const char*>(frame.payload.data() + offset), static_cast<std::streamsize>(take));
-                    }
+                    entry.buffer.insert(entry.buffer.end(),
+                                        frame.payload.data() + offset,
+                                        frame.payload.data() + offset + take);
                 }
                 entry.received += take;
                 offset += take;
                 if (entry.received >= entry.fileSize) {
-                    finalizeBatchEntry(entry);
+                    completeBatchEntry(entry);
                     ++batch.currentIndex;
                 }
             }
@@ -2704,7 +2861,9 @@ int RunClient(const CliOptions& options) {
                     if (entry.received < entry.fileSize) {
                         entry.shouldWrite = false;
                     }
-                    finalizeBatchEntry(entry);
+                    // completeBatchEntry routes complete writes through the async pool and
+                    // incomplete/failed ones through the synchronous fail path.
+                    completeBatchEntry(entry);
                 }
             }
             activeBatchDownloads.erase(itBatch);
@@ -2925,6 +3084,30 @@ int RunClient(const CliOptions& options) {
                     loopHadForwardProgress = true;
                 }
             }
+            {
+                // Drain results from the async file-write pool. Counters and retry
+                // bookkeeping stay on the main thread, so no atomics are needed for them.
+                std::deque<IoWriteResult> ioDone;
+                {
+                    std::lock_guard<std::mutex> lock(ioResultMu);
+                    ioDone.swap(ioResults);
+                }
+                for (auto& r : ioDone) {
+                    --ioOutstanding;
+                    if (r.ok) {
+                        ++compared;
+                        ++transferred;
+                        transferRetryCounts.erase(r.relPath);
+                    } else {
+                        retryOrFail(r.relPath);
+                    }
+                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+                                        lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+                }
+                if (!ioDone.empty()) {
+                    loopHadForwardProgress = true;
+                }
+            }
             while (!delayedCompareEntries.empty() &&
                    (compareTasksIssued.load() - compareResultsHandled.load()) < maxInFlightCompareTasks) {
                 FileEntry e = std::move(delayedCompareEntries.front());
@@ -3005,7 +3188,8 @@ int RunClient(const CliOptions& options) {
             if (manifestDone && allCompareDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
-                activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone) {
+                activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone &&
+                ioOutstanding == 0) {
                 break;
             }
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
@@ -3129,6 +3313,8 @@ int RunClient(const CliOptions& options) {
         hashTaskCv.notify_all();
         dirStop.store(true);
         dirTaskCv.notify_all();
+        ioStop.store(true);
+        ioTaskCv.notify_all();
         if (recvThread.joinable()) {
             recvThread.join();
         }
@@ -3147,6 +3333,11 @@ int RunClient(const CliOptions& options) {
                 w.join();
             }
         }
+        for (auto& w : ioWorkers) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
         throw;
     }
 
@@ -3154,12 +3345,19 @@ int RunClient(const CliOptions& options) {
     compareTaskCv.notify_all();
     hashStop.store(true);
     hashTaskCv.notify_all();
+    ioStop.store(true);
+    ioTaskCv.notify_all();
     for (auto& w : compareWorkers) {
         if (w.joinable()) {
             w.join();
         }
     }
     for (auto& w : hashWorkers) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    for (auto& w : ioWorkers) {
         if (w.joinable()) {
             w.join();
         }
