@@ -220,6 +220,34 @@ inline void AtomicMaxU64(std::atomic<uint64_t>& target, uint64_t value) {
     }
 }
 
+// Worker count for the parallel directory walks (enumeration + deletion). These are
+// latency-bound metadata reads, so oversubscribe the cores to keep the device queue
+// deep, but cap the fan-out: past ~16 concurrent listings the queue is saturated and more
+// threads only add work-queue lock churn.
+inline unsigned ResolveDirWalkWorkerCount() {
+    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+    return std::min<unsigned>(hw * 2, 16u);
+}
+
+// rel = relDir + "/" + name (or just name at the root). Single definition for every walk.
+inline std::string BuildRelPath(const std::string& relDir, const std::string& name) {
+    return relDir.empty() ? name : (relDir + "/" + name);
+}
+
+#ifdef _WIN32
+// Open a FindFirstFileExW enumeration handle for a directory's children. Centralises the
+// "append \\*" pattern build and the (basic-info + large-fetch) flags both walks use.
+inline HANDLE OpenDirFind(const std::wstring& absDir, WIN32_FIND_DATAW& fd) {
+    std::wstring pattern = absDir;
+    if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
+        pattern.push_back(L'\\');
+    }
+    pattern.append(L"*");
+    return FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+                            FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+}
+#endif
+
 // Diagnostics for the parallel enumeration. All cumulative; the debug printer derives
 // per-interval rates/averages by differencing snapshots. The point is to tell apart the
 // two things that can throttle enumeration on fast storage:
@@ -400,6 +428,7 @@ void EnumerateManifestEntriesFast(
             flushAndMeasure(out);
         }
     };
+    std::atomic<uint64_t> fileCount{0};
 #ifdef _WIN32
     auto FileTimeToTicks = [](FILETIME ft) -> int64_t {
         ULARGE_INTEGER v{};
@@ -419,24 +448,10 @@ void EnumerateManifestEntriesFast(
     const std::wstring rootW = ToExtendedLengthPath(root);
     const std::wstring selfW = selfPath.has_value() ? ToExtendedLengthPath(*selfPath) : L"";
 
-    std::atomic<uint64_t> fileCount{0};
-
     auto listOneDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
-        std::wstring pattern = current.absDir;
-        if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
-            pattern.push_back(L'\\');
-        }
-        pattern.append(L"*");
-
         WIN32_FIND_DATAW fd{};
-        HANDLE hFind = FindFirstFileExW(
-            pattern.c_str(),
-            FindExInfoBasic,
-            &fd,
-            FindExSearchNameMatch,
-            nullptr,
-            FIND_FIRST_EX_LARGE_FETCH);
+        HANDLE hFind = OpenDirFind(current.absDir, fd);
         if (hFind == INVALID_HANDLE_VALUE) {
             return;
         }
@@ -464,7 +479,7 @@ void EnumerateManifestEntriesFast(
             }
 
             const std::string nameUtf8 = WideToUtf8(name);
-            std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
+            std::string relPath = BuildRelPath(current.relDir, nameUtf8);
 
             FileEntry entry;
             entry.relativePath = relPath;
@@ -492,29 +507,14 @@ void EnumerateManifestEntriesFast(
         runListing(listOneDir, current, subdirs, out);
     };
 
-    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
-    // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
-    // random metadata reads, and more threads only add lock churn on the work queue.
-    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+    const unsigned numWorkers = ResolveDirWalkWorkerCount();
     ParallelDirWalk(PendingDir{rootW, std::string()}, numWorkers, kDirPopBatch, done,
                     "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
-
-    if (done.load()) {
-        return;
-    }
-    std::vector<Frame> tail;
-    std::vector<uint8_t> payload;
-    AppendU64(payload, fileCount.load());
-    tail.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
-    tail.push_back(Frame{MsgType::ManifestEnd, 0, {}});
-    flushManifestFrames(tail);
 #else
     struct PendingDir {
         fs::path absDir;
         std::string relDir;
     };
-
-    std::atomic<uint64_t> fileCount{0};
 
     auto listOneDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
@@ -562,7 +562,7 @@ void EnumerateManifestEntriesFast(
             }
 
             const std::string name = absPath.filename().string();
-            std::string relPath = current.relDir.empty() ? name : (current.relDir + "/" + name);
+            std::string relPath = BuildRelPath(current.relDir, name);
             if (relPath.empty()) {
                 continue;
             }
@@ -602,13 +602,13 @@ void EnumerateManifestEntriesFast(
         runListing(listOneDir, current, subdirs, out);
     };
 
-    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
-    // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
-    // random metadata reads, and more threads only add lock churn on the work queue.
-    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+    const unsigned numWorkers = ResolveDirWalkWorkerCount();
     ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, kDirPopBatch, done,
                     "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
+#endif
 
+    // Common tail (both platforms): flush the final progress + ManifestEnd, unless the
+    // walk was cancelled.
     if (done.load()) {
         return;
     }
@@ -618,7 +618,6 @@ void EnumerateManifestEntriesFast(
     tail.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
     tail.push_back(Frame{MsgType::ManifestEnd, 0, {}});
     flushManifestFrames(tail);
-#endif
 }
 
 struct RemoveLocalExtrasResult {
@@ -666,8 +665,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
         ctx.localDirs.clear();
     };
 
-    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
-    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+    const unsigned numWorkers = ResolveDirWalkWorkerCount();
 
 #ifdef _WIN32
     struct PendingDir {
@@ -676,14 +674,8 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
     };
     const std::wstring excludeW = exclude.has_value() ? ToExtendedLengthPath(*exclude) : L"";
     auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, DelCtx& ctx) {
-        std::wstring pattern = current.absDir;
-        if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
-            pattern.push_back(L'\\');
-        }
-        pattern.append(L"*");
         WIN32_FIND_DATAW fd{};
-        HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
-                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        HANDLE hFind = OpenDirFind(current.absDir, fd);
         if (hFind == INVALID_HANDLE_VALUE) {
             return;
         }
@@ -705,7 +697,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
             }
             const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             const std::string nameUtf8 = WideToUtf8(name);
-            std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
+            std::string relPath = BuildRelPath(current.relDir, nameUtf8);
             if (isDir) {
                 if (!remoteDirs.contains(relPath)) {
                     ctx.extraDirs.push_back(relPath);
@@ -772,7 +764,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                 ec.clear();
             }
             const std::string name = absPath.filename().string();
-            std::string relPath = current.relDir.empty() ? name : (current.relDir + "/" + name);
+            std::string relPath = BuildRelPath(current.relDir, name);
             if (relPath.empty()) {
                 continue;
             }
