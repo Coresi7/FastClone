@@ -42,7 +42,7 @@ namespace fc {
 
 namespace {
 
-constexpr const char* kProtocolVersion = "FC4";
+constexpr const char* kProtocolVersion = "FC5";
 
 std::optional<std::string> ReadEnvVar(const char* name) {
 #if defined(_WIN32) && defined(_MSC_VER)
