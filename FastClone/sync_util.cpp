@@ -115,23 +115,133 @@ std::string WideToUtf8(const std::wstring& value) {
 }
 #endif
 
+#ifdef _WIN32
+namespace {
+bool LooksAbsoluteWindows(const std::wstring& w) {
+    // Drive-absolute "X:\" / "X:/" or UNC "\\".
+    if (w.size() >= 3 && w[1] == L':' && (w[2] == L'\\' || w[2] == L'/')) {
+        return true;
+    }
+    if (w.size() >= 2 && w[0] == L'\\' && w[1] == L'\\') {
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::wstring ToExtendedLengthPath(const fs::path& path) {
+    std::wstring w = path.wstring();
+    // Already an extended ("\\?\") or device ("\\.\") path -> leave untouched.
+    if (w.size() >= 4 && w[0] == L'\\' && w[1] == L'\\' &&
+        (w[2] == L'?' || w[2] == L'.') && w[3] == L'\\') {
+        return w;
+    }
+    // The \\?\ prefix requires a fully-qualified path; leave relative paths alone so a
+    // relative root never gets corrupted (it simply keeps the legacy MAX_PATH limit).
+    if (!LooksAbsoluteWindows(w)) {
+        return w;
+    }
+    for (wchar_t& c : w) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    if (w.size() >= 2 && w[0] == L'\\' && w[1] == L'\\') {
+        return L"\\\\?\\UNC\\" + w.substr(2);  // \\server\share -> \\?\UNC\server\share
+    }
+    return L"\\\\?\\" + w;
+}
+#endif
+
 fs::path JoinRel(const fs::path& root, const std::string& relPath) {
+#ifdef _WIN32
+    std::wstring full = root.wstring();
+    for (wchar_t& c : full) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    if (!(relPath == "." || relPath.empty())) {
+        if (!full.empty() && full.back() != L'\\') {
+            full.push_back(L'\\');
+        }
+        std::wstring relW = Utf8ToWide(relPath);
+        for (wchar_t& c : relW) {
+            if (c == L'/') {
+                c = L'\\';
+            }
+        }
+        full += relW;
+    }
+    return fs::path(ToExtendedLengthPath(fs::path(full)));
+#else
     if (relPath == "." || relPath.empty()) {
         return root;
     }
-#ifdef _WIN32
-    return root / fs::path(Utf8ToWide(relPath));
-#else
     return root / fs::path(relPath);
 #endif
 }
 
+void CreateDirectoriesLong(const fs::path& dir) {
+#ifdef _WIN32
+    std::wstring w = dir.wstring();
+    while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) {
+        w.pop_back();
+    }
+    if (w.empty()) {
+        return;
+    }
+    // Find the index just past the volume root so we never try to "create" the root
+    // itself (\\?\C:\, C:\, \\?\UNC\server\share\, \\server\share\).
+    size_t start = 0;
+    auto afterShare = [&](size_t from) -> size_t {
+        const size_t server = w.find(L'\\', from);
+        if (server == std::wstring::npos) {
+            return w.size();
+        }
+        const size_t share = w.find(L'\\', server + 1);
+        return (share == std::wstring::npos) ? w.size() : share + 1;
+    };
+    if (w.compare(0, 8, L"\\\\?\\UNC\\") == 0) {
+        start = afterShare(8);
+    } else if (w.compare(0, 4, L"\\\\?\\") == 0) {
+        start = (w.size() >= 7) ? 7 : w.size();  // extended drive root, e.g. \\?\C:
+    } else if (w.size() >= 3 && w[1] == L':') {
+        start = 3;  // drive root, e.g. C:
+    } else if (w.size() >= 2 && w[0] == L'\\' && w[1] == L'\\') {
+        start = afterShare(2);  // UNC share root
+    }
+    // Create each ancestor in order (shallow -> deep), then the directory itself.
+    for (size_t i = start; i < w.size(); ++i) {
+        if (w[i] == L'\\') {
+            CreateDirectoryW(w.substr(0, i).c_str(), nullptr);  // ignore "exists"/root errors
+        }
+    }
+    CreateDirectoryW(w.c_str(), nullptr);
+#else
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+#endif
+}
+
 void EnsureParentDir(const fs::path& filePath) {
+#ifdef _WIN32
+    std::wstring full = filePath.wstring();
+    while (!full.empty() && (full.back() == L'\\' || full.back() == L'/')) {
+        full.pop_back();
+    }
+    const size_t sep = full.find_last_of(L"\\/");
+    if (sep == std::wstring::npos || sep == 0) {
+        return;
+    }
+    CreateDirectoriesLong(fs::path(full.substr(0, sep)));
+#else
     const fs::path parent = filePath.parent_path();
     if (!parent.empty()) {
         std::error_code ec;
         fs::create_directories(parent, ec);
     }
+#endif
 }
 
 std::optional<fs::path> CurrentExePath() {

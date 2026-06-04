@@ -29,11 +29,13 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -114,11 +116,6 @@ struct ServerBatchStream {
     bool headerSent = false;
     std::ifstream input;
     uint64_t remainingBytes = 0;
-};
-
-struct LocalState {
-    std::unordered_map<std::string, FileEntry> files;
-    std::unordered_set<std::string> directories;
 };
 
 struct ClientHashTask {
@@ -255,37 +252,28 @@ struct EnumStats {
 // (activeDirs == 0): activeDirs is incremented under the lock at pop time and only
 // decremented after the directory's children have been pushed, so it can never read
 // zero while work is still being produced.
-// Per-directory work is batched on BOTH shared queues so the hot path almost never
-// touches a lock per file:
-//   - kDirPopBatch directories are popped (and their children pushed back) per qmu
-//     acquisition, amortising the work-queue lock over many directories.
-//   - Each worker buffers emitted frames in a thread-local vector and hands them off via
-//     flushFrames() in chunks of kFrameFlushThreshold (and once more on exit). flushFrames
-//     is the ONLY place that touches the outbound queue lock, so a worker takes that lock
-//     ~1/kFrameFlushThreshold as often as a per-frame enqueue would. This is what keeps
-//     16 enumerators from serialising on the outbound mutex on fast (NVMe) storage.
-constexpr size_t kDirPopBatch = 8;
+// Per-directory work is batched so the hot path almost never touches the shared queue
+// lock: dirPopBatch directories are popped (and their children pushed back) per qmu
+// acquisition, amortising the work-queue lock over many directories. Anything the caller
+// does per file (emit frames, delete extras) is done lock-free against its own per-worker
+// WorkerCtx; the caller decides when/how to hand that off (see processDir / finishWorker).
+//
+// Each worker keeps a default-constructed WorkerCtx for the whole walk and threads it
+// through processDir; finishWorker runs once when the worker drains, to flush/merge that
+// context. Use it to batch any cross-thread hand-off out of the per-file path.
+constexpr size_t kDirPopBatch = 8;          // manifest enumeration
+constexpr size_t kDeleteDirPopBatch = 64;   // deletion walk: bigger, pure metadata reads
 constexpr size_t kFrameFlushThreshold = 1024;
 
-template <typename PendingDir, typename ProcessFn, typename FlushFn>
+template <typename PendingDir, typename WorkerCtx, typename ProcessFn, typename FinishFn>
 static void ParallelDirWalk(PendingDir rootDir,
                             unsigned numWorkers,
+                            size_t dirPopBatch,
                             const std::atomic<bool>& done,
+                            const char* joinSite,
+                            WorkerCtx ctxPrototype,
                             ProcessFn&& processDir,
-                            FlushFn&& flushFrames,
-                            EnumStats& stats) {
-    auto flushAndMeasure = [&](std::vector<Frame>& buf) {
-        const uint64_t frames = buf.size();
-        const auto t0 = std::chrono::steady_clock::now();
-        flushFrames(buf);  // hands off and clears buf
-        const uint64_t us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count());
-        stats.framesFlushed.fetch_add(frames, std::memory_order_relaxed);
-        stats.flushCount.fetch_add(1, std::memory_order_relaxed);
-        stats.flushBlockUsSum.fetch_add(us, std::memory_order_relaxed);
-        AtomicMaxU64(stats.flushBlockUsMax, us);
-    };
+                            FinishFn&& finishWorker) {
     std::mutex qmu;
     std::condition_variable qcv;
     std::deque<PendingDir> queue;
@@ -296,9 +284,9 @@ static void ParallelDirWalk(PendingDir rootDir,
     std::exception_ptr firstError;
 
     auto worker = [&]() {
+        WorkerCtx ctx = ctxPrototype;
         std::vector<PendingDir> batch;
         std::vector<PendingDir> subdirs;
-        std::vector<Frame> frameBuf;
         while (true) {
             batch.clear();
             {
@@ -314,7 +302,7 @@ static void ParallelDirWalk(PendingDir rootDir,
                     qcv.notify_all();
                     break;
                 }
-                const size_t take = std::min<size_t>(kDirPopBatch, queue.size());
+                const size_t take = std::min<size_t>(dirPopBatch, queue.size());
                 for (size_t i = 0; i < take; ++i) {
                     batch.push_back(std::move(queue.back()));
                     queue.pop_back();
@@ -322,27 +310,16 @@ static void ParallelDirWalk(PendingDir rootDir,
                 activeDirs += take;
             }
             subdirs.clear();
-            // A worker exception (e.g. bad_alloc, or a throwing encode) must neither call
-            // std::terminate NOR leak activeDirs: skipping the activeDirs decrement below
-            // would wedge the termination predicate and hang every other worker on join.
-            // So we capture the FIRST exception, always run the queue/activeDirs
-            // bookkeeping (just without pushing the failed batch's children), and rethrow
-            // once after all workers have joined. Siblings finish the rest of the tree
-            // normally, so no one is forced into a stop that would need an external wake.
+            // A worker exception (e.g. bad_alloc) must neither call std::terminate NOR leak
+            // activeDirs: skipping the decrement below would wedge the termination predicate
+            // and hang every other worker on join. So we capture the FIRST exception, always
+            // run the queue/activeDirs bookkeeping (just without pushing the failed batch's
+            // children), and rethrow once after all workers have joined. Siblings finish the
+            // rest of the tree normally, so no one is forced into a stop needing a wake.
             bool threw = false;
             try {
                 for (const PendingDir& d : batch) {
-                    const auto t0 = std::chrono::steady_clock::now();
-                    processDir(d, subdirs, frameBuf);
-                    const uint64_t us = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - t0).count());
-                    stats.listingUsSum.fetch_add(us, std::memory_order_relaxed);
-                    AtomicMaxU64(stats.listingUsMax, us);
-                    stats.dirsProcessed.fetch_add(1, std::memory_order_relaxed);
-                    if (frameBuf.size() >= kFrameFlushThreshold) {
-                        flushAndMeasure(frameBuf);
-                    }
+                    processDir(d, subdirs, ctx);
                 }
             } catch (...) {
                 threw = true;
@@ -364,10 +341,8 @@ static void ParallelDirWalk(PendingDir rootDir,
                 }
             }
         }
-        // Hand off whatever this worker still holds before it exits (outside qmu).
-        if (!frameBuf.empty()) {
-            flushAndMeasure(frameBuf);
-        }
+        // Flush/merge whatever this worker still holds before it exits (outside qmu).
+        finishWorker(ctx);
     };
 
     std::vector<std::thread> workers;
@@ -376,7 +351,7 @@ static void ParallelDirWalk(PendingDir rootDir,
         workers.emplace_back(worker);
     }
     for (std::thread& t : workers) {
-        JoinDiag(t, "server-enum-walk");
+        JoinDiag(t, joinSite);
     }
     if (firstError) {
         std::rethrow_exception(firstError);
@@ -389,6 +364,42 @@ void EnumerateManifestEntriesFast(
     const std::atomic<bool>& done,
     const std::function<void(std::vector<Frame>&)>& flushManifestFrames,
     EnumStats& stats) {
+    // Hand a worker's buffered frames to the outbound queue (one lock per chunk) and
+    // record the hand-off latency. Used both at the per-chunk threshold and on drain.
+    auto flushAndMeasure = [&](std::vector<Frame>& buf) {
+        const uint64_t frames = buf.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        flushManifestFrames(buf);  // hands off and clears buf
+        const uint64_t us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        stats.framesFlushed.fetch_add(frames, std::memory_order_relaxed);
+        stats.flushCount.fetch_add(1, std::memory_order_relaxed);
+        stats.flushBlockUsSum.fetch_add(us, std::memory_order_relaxed);
+        AtomicMaxU64(stats.flushBlockUsMax, us);
+    };
+    auto finishWorker = [&](std::vector<Frame>& buf) {
+        if (!buf.empty()) {
+            flushAndMeasure(buf);
+        }
+    };
+    // Time the pure listing of one directory and, after it, flush the worker buffer if it
+    // crossed the chunk threshold. Wrapped around the platform listing so the timing
+    // excludes the (separately measured) hand-off.
+    auto runListing = [&](auto&& listOneDir, const auto& current, auto& subdirsRef,
+                          std::vector<Frame>& out) {
+        const auto t0 = std::chrono::steady_clock::now();
+        listOneDir(current, subdirsRef, out);
+        const uint64_t us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        stats.listingUsSum.fetch_add(us, std::memory_order_relaxed);
+        AtomicMaxU64(stats.listingUsMax, us);
+        stats.dirsProcessed.fetch_add(1, std::memory_order_relaxed);
+        if (out.size() >= kFrameFlushThreshold) {
+            flushAndMeasure(out);
+        }
+    };
 #ifdef _WIN32
     auto FileTimeToTicks = [](FILETIME ft) -> int64_t {
         ULARGE_INTEGER v{};
@@ -402,12 +413,15 @@ void EnumerateManifestEntriesFast(
         std::string relDir;
     };
 
-    const std::wstring rootW = root.wstring();
-    const std::wstring selfW = selfPath.has_value() ? selfPath->wstring() : L"";
+    // Extended-length ("\\?\") root so deep source trees (root + relpath > 260) enumerate
+    // instead of FindFirstFile silently failing and dropping whole subtrees from the
+    // manifest. selfW is prefixed too so the self-exclude comparison stays consistent.
+    const std::wstring rootW = ToExtendedLengthPath(root);
+    const std::wstring selfW = selfPath.has_value() ? ToExtendedLengthPath(*selfPath) : L"";
 
     std::atomic<uint64_t> fileCount{0};
 
-    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+    auto listOneDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
         std::wstring pattern = current.absDir;
         if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
@@ -473,12 +487,17 @@ void EnumerateManifestEntriesFast(
 
         FindClose(hFind);
     };
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+                          std::vector<Frame>& out) {
+        runListing(listOneDir, current, subdirs, out);
+    };
 
     const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
     // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
     // random metadata reads, and more threads only add lock churn on the work queue.
     const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
-    ParallelDirWalk(PendingDir{rootW, std::string()}, numWorkers, done, processDir, flushManifestFrames, stats);
+    ParallelDirWalk(PendingDir{rootW, std::string()}, numWorkers, kDirPopBatch, done,
+                    "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
 
     if (done.load()) {
         return;
@@ -497,7 +516,7 @@ void EnumerateManifestEntriesFast(
 
     std::atomic<uint64_t> fileCount{0};
 
-    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+    auto listOneDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
         std::error_code ec;
         fs::directory_iterator it(current.absDir, fs::directory_options::skip_permission_denied, ec);
@@ -578,12 +597,17 @@ void EnumerateManifestEntriesFast(
             }
         }
     };
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
+                          std::vector<Frame>& out) {
+        runListing(listOneDir, current, subdirs, out);
+    };
 
     const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
     // Cap fan-out: past ~16 concurrent listings the device queue is already saturated on
     // random metadata reads, and more threads only add lock churn on the work queue.
     const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
-    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, done, processDir, flushManifestFrames, stats);
+    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, kDirPopBatch, done,
+                    "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
 
     if (done.load()) {
         return;
@@ -597,48 +621,80 @@ void EnumerateManifestEntriesFast(
 #endif
 }
 
-LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& exclude) {
-    LocalState st;
+struct RemoveLocalExtrasResult {
+    size_t deletedFiles = 0;
+    size_t failedOps = 0;
+};
+
+// Parallel reconciliation + delete. The local tree is walked by the same worker-pool
+// engine as enumeration (deletion is pure metadata I/O -- listing dirs + unlinking --
+// so it hits the exact MFT-latency wall single-threaded; fan-out raises queue depth).
+// Per directory, a worker FIRST enumerates fully, THEN deletes the files that are absent
+// from the remote manifest: never delete while the directory handle is open (modifying a
+// directory mid-enumeration is undefined on both NTFS and POSIX). remoteFiles/remoteDirs
+// are immutable here (post-ManifestEnd), so the membership lookups are lock-free
+// concurrent reads. Extra directories are collected per worker and removed deepest-first
+// at the very end (serial: directory count is tiny next to files, and deepest-first has
+// an inherent ordering dependency).
+RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
+                                          const std::unordered_set<std::string>& remoteDirs,
+                                          const std::unordered_map<std::string, FileEntry>& remoteFiles,
+                                          const std::optional<fs::path>& exclude,
+                                          std::unordered_set<std::string>& existingLocalDirs) {
+    RemoveLocalExtrasResult result;
+    std::atomic<uint64_t> deletedFiles{0};
+    std::atomic<uint64_t> failedOps{0};
+    std::mutex extraDirsMu;
+    std::vector<std::string> extraDirs;        // local dirs absent from remoteDirs
+    const std::atomic<bool> noCancel{false};   // deletion walk is not cancellable
+
+    struct DelCtx {
+        std::vector<std::string> extraDirs;    // per-worker, merged on finish
+        std::vector<std::string> localDirs;    // every existing local dir this worker saw
+    };
+    auto mergeCtx = [&](DelCtx& ctx) {
+        std::lock_guard<std::mutex> lock(extraDirsMu);
+        extraDirs.insert(extraDirs.end(),
+                         std::make_move_iterator(ctx.extraDirs.begin()),
+                         std::make_move_iterator(ctx.extraDirs.end()));
+        ctx.extraDirs.clear();
+        // Hand back the set of directories that already exist locally so the caller can
+        // skip create_directories() for them (on a re-sync that is all of them, and those
+        // calls are pure wasted, filter-driver-intercepted metadata I/O).
+        existingLocalDirs.insert(std::make_move_iterator(ctx.localDirs.begin()),
+                                 std::make_move_iterator(ctx.localDirs.end()));
+        ctx.localDirs.clear();
+    };
+
+    const unsigned hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+    const unsigned numWorkers = std::min<unsigned>(hw * 2, 16u);
+
 #ifdef _WIN32
     struct PendingDir {
         std::wstring absDir;
         std::string relDir;
     };
-
-    const std::wstring rootW = root.wstring();
-    const std::wstring excludeW = exclude.has_value() ? exclude->wstring() : L"";
-    std::vector<PendingDir> stack;
-    stack.push_back(PendingDir{rootW, ""});
-
-    while (!stack.empty()) {
-        PendingDir current = std::move(stack.back());
-        stack.pop_back();
-
+    const std::wstring excludeW = exclude.has_value() ? ToExtendedLengthPath(*exclude) : L"";
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, DelCtx& ctx) {
         std::wstring pattern = current.absDir;
         if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
             pattern.push_back(L'\\');
         }
         pattern.append(L"*");
-
         WIN32_FIND_DATAW fd{};
-        HANDLE hFind = FindFirstFileExW(
-            pattern.c_str(),
-            FindExInfoBasic,
-            &fd,
-            FindExSearchNameMatch,
-            nullptr,
-            FIND_FIRST_EX_LARGE_FETCH);
+        HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (hFind == INVALID_HANDLE_VALUE) {
-            continue;
+            return;
         }
-
+        // Phase 1: enumerate fully; collect deletions but do NOT touch the directory yet.
+        std::vector<std::wstring> filesToDelete;
         do {
             const wchar_t* name = fd.cFileName;
             if ((name[0] == L'.' && name[1] == L'\0') ||
                 (name[0] == L'.' && name[1] == L'.' && name[2] == L'\0')) {
                 continue;
             }
-
             std::wstring absPath = current.absDir;
             if (!absPath.empty() && absPath.back() != L'\\' && absPath.back() != L'/') {
                 absPath.push_back(L'\\');
@@ -647,100 +703,116 @@ LocalState BuildLocalState(const fs::path& root, const std::optional<fs::path>& 
             if (!excludeW.empty() && _wcsicmp(absPath.c_str(), excludeW.c_str()) == 0) {
                 continue;
             }
-
             const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             const std::string nameUtf8 = WideToUtf8(name);
-            const std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
+            std::string relPath = current.relDir.empty() ? nameUtf8 : (current.relDir + "/" + nameUtf8);
             if (isDir) {
-                st.directories.insert(relPath);
-                stack.push_back(PendingDir{absPath, relPath});
-            } else {
-                st.files.emplace(relPath, FileEntry{relPath, false, 0, 0});
+                if (!remoteDirs.contains(relPath)) {
+                    ctx.extraDirs.push_back(relPath);
+                }
+                ctx.localDirs.push_back(relPath);
+                subdirs.push_back(PendingDir{std::move(absPath), std::move(relPath)});
+            } else if (!remoteFiles.contains(relPath)) {
+                filesToDelete.push_back(std::move(absPath));
             }
         } while (FindNextFileW(hFind, &fd) != 0);
-
         FindClose(hFind);
-    }
-#else
-    std::error_code ec;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
-         it != end;
-         it.increment(ec)) {
-        if (ec) {
-            ec.clear();
-            continue;
+        // Phase 2: delete now that the find handle is closed.
+        for (const std::wstring& abs : filesToDelete) {
+            std::error_code ec;
+            if (fs::remove(fs::path(abs), ec)) {
+                deletedFiles.fetch_add(1, std::memory_order_relaxed);
+            } else if (ec) {
+                failedOps.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        const fs::path absPath = it->path();
-        if (exclude.has_value()) {
-            std::error_code eqec;
-            if (fs::equivalent(absPath, *exclude, eqec) && !eqec) {
+    };
+    ParallelDirWalk(PendingDir{ToExtendedLengthPath(root), std::string()}, numWorkers, kDeleteDirPopBatch,
+                    noCancel, "client-delete-walk", DelCtx{}, processDir, mergeCtx);
+#else
+    struct PendingDir {
+        fs::path absDir;
+        std::string relDir;
+    };
+    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, DelCtx& ctx) {
+        std::error_code ec;
+        fs::directory_iterator it(current.absDir, fs::directory_options::skip_permission_denied, ec);
+        const fs::directory_iterator end;
+        if (ec) {
+            return;
+        }
+        std::vector<fs::path> filesToDelete;
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
                 continue;
             }
-        }
-
-        const bool isDir = it->is_directory(ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        const bool isRegular = it->is_regular_file(ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        if (!isDir && !isRegular) {
-            continue;
-        }
-        const std::string relPath = NormalizeRelativePath(fs::relative(absPath, root, ec));
-        if (ec || relPath.empty()) {
-            ec.clear();
-            continue;
-        }
-        if (isDir) {
-            st.directories.insert(relPath);
-        } else {
-            st.files.emplace(relPath, FileEntry{relPath, false, 0, 0});
-        }
-    }
-#endif
-    return st;
-}
-
-struct RemoveLocalExtrasResult {
-    size_t deletedFiles = 0;
-    size_t failedOps = 0;
-};
-
-RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
-                                          const std::unordered_set<std::string>& remoteDirs,
-                                          const std::unordered_map<std::string, FileEntry>& remoteFiles,
-                                          const std::optional<fs::path>& exclude) {
-    RemoveLocalExtrasResult result;
-    LocalState local = BuildLocalState(root, exclude);
-    for (const auto& kv : local.files) {
-        if (!remoteFiles.contains(kv.first)) {
-            std::error_code ec;
-            const bool removed = fs::remove(JoinRel(root, kv.first), ec);
-            if (removed) {
-                ++result.deletedFiles;
-            } else if (ec) {
-                ++result.failedOps;
+            const fs::path& absPath = it->path();
+            if (exclude.has_value()) {
+                std::error_code eqec;
+                if (fs::equivalent(absPath, *exclude, eqec) && !eqec) {
+                    continue;
+                }
+            }
+            const bool isDir = it->is_directory(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            const bool isRegular = it->is_regular_file(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            if (!isDir && !isRegular) {
+                continue;
+            }
+            const bool isSymlink = it->is_symlink(ec);
+            if (ec) {
+                ec.clear();
+            }
+            const std::string name = absPath.filename().string();
+            std::string relPath = current.relDir.empty() ? name : (current.relDir + "/" + name);
+            if (relPath.empty()) {
+                continue;
+            }
+            if (isDir) {
+                if (!remoteDirs.contains(relPath)) {
+                    ctx.extraDirs.push_back(relPath);
+                }
+                ctx.localDirs.push_back(relPath);
+                if (!isSymlink) {
+                    subdirs.push_back(PendingDir{absPath, std::move(relPath)});
+                }
+            } else if (!remoteFiles.contains(relPath)) {
+                filesToDelete.push_back(absPath);
             }
         }
-    }
-    std::vector<std::string> dirs(local.directories.begin(), local.directories.end());
-    std::sort(dirs.begin(), dirs.end(), [](const std::string& a, const std::string& b) {
+        for (const fs::path& abs : filesToDelete) {
+            std::error_code rec;
+            if (fs::remove(abs, rec)) {
+                deletedFiles.fetch_add(1, std::memory_order_relaxed);
+            } else if (rec) {
+                failedOps.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, kDeleteDirPopBatch,
+                    noCancel, "client-delete-walk", DelCtx{}, processDir, mergeCtx);
+#endif
+
+    std::sort(extraDirs.begin(), extraDirs.end(), [](const std::string& a, const std::string& b) {
         return a.size() > b.size();
     });
-    for (const std::string& dir : dirs) {
-        if (!remoteDirs.contains(dir)) {
-            std::error_code ec;
-            fs::remove(JoinRel(root, dir), ec);
-            if (ec) {
-                ++result.failedOps;
-            }
+    for (const std::string& dir : extraDirs) {
+        std::error_code ec;
+        fs::remove(JoinRel(root, dir), ec);
+        if (ec) {
+            failedOps.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    result.deletedFiles = static_cast<size_t>(deletedFiles.load());
+    result.failedOps = static_cast<size_t>(failedOps.load());
     return result;
 }
 
@@ -1640,6 +1712,23 @@ int RunServer(const CliOptions& options) {
 }
 
 int RunClient(const CliOptions& options) {
+    const auto syncStartTime = std::chrono::steady_clock::now();
+    auto formatElapsed = [&]() -> std::string {
+        const auto elapsed = std::chrono::steady_clock::now() - syncStartTime;
+        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        const long long h = ms / 3600000; ms %= 3600000;
+        const long long m = ms / 60000; ms %= 60000;
+        const double s = static_cast<double>(ms) / 1000.0;
+        std::ostringstream os;
+        if (h > 0) {
+            os << h << "h ";
+        }
+        if (h > 0 || m > 0) {
+            os << m << "m ";
+        }
+        os << std::fixed << std::setprecision(1) << s << "s";
+        return os.str();
+    };
     WsaContext wsa;
     const bool debugEnabled = IsDebugEnabled();
     // --diag flag OR FASTCLONE_DIAG env var enables diagnostics (design §A.3).
@@ -2251,7 +2340,12 @@ int RunClient(const CliOptions& options) {
     // Directory-creation worker pool (see dirTasks declaration). Each worker pops a
     // batch and runs create_directories without holding any lock; concurrent creation
     // of overlapping paths is safe (idempotent, errors swallowed via error_code).
-    const uint32_t dirWorkerCount = std::clamp<uint32_t>(workerCount, 2u, 8u);
+    // create_directories() is latency-bound metadata I/O (often further serialised by an
+    // AV/filter driver intercepting each CreateDirectory), so the CPU/disk sit nearly
+    // idle while threads block in the kernel. Like the enumeration walk, the lever is
+    // CONCURRENCY, not batch size: oversubscribe past the core count to keep many
+    // metadata ops in flight at once.
+    const uint32_t dirWorkerCount = std::clamp<uint32_t>(workerCount * 2, 4u, 32u);
     constexpr size_t kDirBatchPop = 64;
     std::vector<std::thread> dirWorkers;
     dirWorkers.reserve(dirWorkerCount);
@@ -2274,8 +2368,7 @@ int RunClient(const CliOptions& options) {
                     }
                 }
                 for (const std::string& rel : batch) {
-                    std::error_code mkec;
-                    fs::create_directories(JoinRel(options.rootDir, rel), mkec);
+                    CreateDirectoriesLong(JoinRel(options.rootDir, rel));
                 }
                 dirTasksDone.fetch_add(batch.size(), std::memory_order_relaxed);
             }
@@ -3290,57 +3383,6 @@ int RunClient(const CliOptions& options) {
     // no ManifestEnd) must neither create nor delete against an incomplete remote view.
     const bool manifestComplete = manifestDone && recvError.empty() && !recvClosed.load();
 
-    if (manifestComplete) {
-        // Deferred directory creation (method 1): physically create ONLY the remote
-        // directories that contain no files anywhere beneath them ("empty subtree").
-        // Directories that hold files are already present (unchanged files) or created
-        // by EnsureParentDir during transfer, so creating every manifest directory is
-        // almost entirely redundant on a re-sync and previously throttled enumeration
-        // via directory backpressure.
-        std::unordered_set<std::string> dirsWithFiles;
-        dirsWithFiles.reserve(remoteDirs.size());
-        for (const auto& kv : remoteFiles) {
-            const std::string& filePath = kv.first;
-            size_t slash = filePath.rfind('/');
-            while (slash != std::string::npos) {
-                std::string dir = filePath.substr(0, slash);
-                if (dir.empty()) {
-                    break;
-                }
-                // Inserting walks up to the root the first time a directory is seen; if
-                // it is already marked then all of its ancestors are too, so stop early.
-                if (!dirsWithFiles.insert(std::move(dir)).second) {
-                    break;
-                }
-                slash = filePath.rfind('/', slash - 1);
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lock(dirTaskMu);
-            for (const std::string& d : remoteDirs) {
-                if (!dirsWithFiles.contains(d)) {
-                    dirTasks.push_back(d);
-                    dirTasksIssued.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
-        const size_t emptyDirCount = dirTasksIssued.load(std::memory_order_relaxed);
-        dirTaskCv.notify_all();
-        if (emptyDirCount > 0) {
-            std::cout << "Creating " << emptyDirCount << " empty directories..." << std::endl;
-            while (dirTasksDone.load(std::memory_order_relaxed) < emptyDirCount) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            }
-        }
-    }
-
-    dirStop.store(true);
-    dirTaskCv.notify_all();
-    for (auto& w : dirWorkers) {
-        JoinDiag(w, "client-dir");
-    }
-    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
-
     if (diagnostics) {
         int64_t mtimeDeltaP50 = 0, mtimeDeltaP95 = 0, mtimeDeltaP99 = 0, mtimeDeltaMax = 0;
         if (!mtimeDeltas.empty()) {
@@ -3387,22 +3429,94 @@ int RunClient(const CliOptions& options) {
                   << " recv_error=\"" << recvError << "\" enumerated=" << enumerated
                   << "); SKIPPING deletion to avoid destroying local files not yet received."
                   << std::endl;
+        dirStop.store(true);
+        dirTaskCv.notify_all();
+        for (auto& w : dirWorkers) {
+            JoinDiag(w, "client-dir-abort");
+        }
         recvStop.store(true);
         incomingDataCv.notify_all();
         ShutdownBoth(socket);
         JoinDiag(recvThread, "client-recv-incomplete");
         std::cout << "Sync aborted (incomplete manifest). changed_files=" << transferred
-                  << " failed_files=" << failed << " enumerated=" << enumerated << std::endl;
+                  << " failed_files=" << failed << " enumerated=" << enumerated
+                  << " elapsed=" << formatElapsed() << std::endl;
         return 3;
     }
 
+    // Delete obsolete files first; the walk also hands back the set of directories that
+    // already exist locally, which lets the empty-directory creation below skip the (on a
+    // re-sync, ALL) directories that are already present instead of issuing a useless,
+    // filter-driver-throttled create_directories() per directory.
+    std::unordered_set<std::string> existingLocalDirs;
     std::cout << "Deleting obsoleted files (sync with server)..." << std::endl;
-    const RemoveLocalExtrasResult deleteResult = RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath);
+    const RemoveLocalExtrasResult deleteResult =
+        RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath, existingLocalDirs);
     deleted = deleteResult.deletedFiles;
     failed += deleteResult.failedOps;
     compared += deleteResult.failedOps;
     compared += deleted;
     std::cout << "Delete done, " << deleted << " files" << std::endl;
+
+    // Create ONLY the empty-subtree remote directories that are actually MISSING locally.
+    // (Directories that hold files already exist or are made by EnsureParentDir during
+    // transfer; directories that already exist locally are skipped via existingLocalDirs.)
+    {
+        std::unordered_set<std::string> dirsWithFiles;
+        dirsWithFiles.reserve(remoteDirs.size());
+        for (const auto& kv : remoteFiles) {
+            const std::string& filePath = kv.first;
+            size_t slash = filePath.rfind('/');
+            while (slash != std::string::npos) {
+                std::string dir = filePath.substr(0, slash);
+                if (dir.empty()) {
+                    break;
+                }
+                if (!dirsWithFiles.insert(std::move(dir)).second) {
+                    break;
+                }
+                slash = filePath.rfind('/', slash - 1);
+            }
+        }
+        std::vector<std::string> emptyDirs;
+        for (const std::string& d : remoteDirs) {
+            if (!dirsWithFiles.contains(d) && !existingLocalDirs.contains(d)) {
+                emptyDirs.push_back(d);
+            }
+        }
+        // create_directories() builds ancestors implicitly, so issue only the deepest of
+        // any nested chain: after a lexicographic sort, a dir that is a path-prefix of the
+        // next entry is its ancestor and can be skipped.
+        std::sort(emptyDirs.begin(), emptyDirs.end());
+        {
+            std::lock_guard<std::mutex> lock(dirTaskMu);
+            for (size_t i = 0; i < emptyDirs.size(); ++i) {
+                const std::string& d = emptyDirs[i];
+                if (i + 1 < emptyDirs.size()) {
+                    const std::string& next = emptyDirs[i + 1];
+                    if (next.size() > d.size() && next.compare(0, d.size(), d) == 0 &&
+                        next[d.size()] == '/') {
+                        continue;
+                    }
+                }
+                dirTasks.push_back(d);
+                dirTasksIssued.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        const size_t emptyDirCount = dirTasksIssued.load(std::memory_order_relaxed);
+        dirTaskCv.notify_all();
+        if (emptyDirCount > 0) {
+            std::cout << "Creating " << emptyDirCount << " empty directories..." << std::endl;
+            while (dirTasksDone.load(std::memory_order_relaxed) < emptyDirCount) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+    }
+    dirStop.store(true);
+    dirTaskCv.notify_all();
+    for (auto& w : dirWorkers) {
+        JoinDiag(w, "client-dir");
+    }
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
     SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
     recvStop.store(true);
@@ -3411,7 +3525,8 @@ int RunClient(const CliOptions& options) {
     JoinDiag(recvThread, "client-recv-final");
     const bool success = (failed == 0);
     std::cout << "Sync completed. changed_files=" << transferred
-              << " failed_files=" << failed << std::endl;
+              << " failed_files=" << failed
+              << " elapsed=" << formatElapsed() << std::endl;
     return success ? 0 : 2;
 }
 
