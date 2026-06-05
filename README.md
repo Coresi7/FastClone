@@ -1,6 +1,6 @@
 # FastClone
 
-`FastClone` is a high-throughput directory sync tool optimized for massive small-file workloads (for example, Unity/Unreal project folders).
+`FastClone` is a high-throughput directory sync tool built for extreme-scale trees: it rapidly syncs **tens of millions of files** and **TB-scale data**, handling a mix of huge files and enormous numbers of tiny files in a single pass (e.g. Unity/Unreal project folders, game build outputs, and large asset/dataset repositories).
 
 Supported platforms:
 - Windows: WinAPI fast path (highest performance)
@@ -12,7 +12,7 @@ Supported platforms:
 - Multi-stream transfer over a single TCP connection
 - Mirror sync: files/directories deleted on server are also deleted on client
 - Fallback verification: uses `XXH3_128` when `size + mtime` do not match
-- Handles very large trees and supports small-file batch transfer
+- Scales to tens-of-millions-file, TB-scale trees: tiny files are batched together while large files are split across multiple chunked streams
 - Strict protocol version check (version mismatch is rejected immediately)
 
 ## Expected Performance
