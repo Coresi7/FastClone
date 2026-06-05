@@ -857,7 +857,14 @@ public:
                         tasks_.pop_front();
                     }
                     activeTasks_.fetch_add(1, std::memory_order_relaxed);
-                    task();
+                    // Backstop: a job MUST NOT escape an exception here. This worker loop has
+                    // no caller to catch it, so an escaping exception would std::terminate the
+                    // whole server. Individual jobs are expected to handle their own cleanup;
+                    // this only guarantees one bad task cannot take down the entire pool.
+                    try {
+                        task();
+                    } catch (...) {
+                    }
                     activeTasks_.fetch_sub(1, std::memory_order_relaxed);
                 }
             });
@@ -1075,12 +1082,24 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                 hash.fill(0xFF);
                             }
                             if (hashMemcacheEnabled && hashOk) {
-                                HashFingerprint afterFingerprint;
-                                if (TryReadHashFingerprint(abs, afterFingerprint) &&
-                                    (!fingerprintValid ||
-                                     (afterFingerprint.fileSize == fingerprint.fileSize &&
-                                      afterFingerprint.mtimeNs == fingerprint.mtimeNs))) {
-                                    GetServerHashMemCache().Upsert(rel, afterFingerprint, hash);
+                                // The memcache write is a best-effort optimisation. It MUST
+                                // never be fatal: Upsert does cache_[rel]=... on an unbounded
+                                // map, whose rehash can throw std::bad_alloc. This lambda runs
+                                // on a global-pool worker that calls task() with no try/catch,
+                                // so an escaping exception would std::terminate the whole
+                                // server AND skip the sessionPendingHashJobs decrement below
+                                // (wedging the 10-min teardown drain). Swallow any failure.
+                                try {
+                                    HashFingerprint afterFingerprint;
+                                    if (TryReadHashFingerprint(abs, afterFingerprint) &&
+                                        (!fingerprintValid ||
+                                         (afterFingerprint.fileSize == fingerprint.fileSize &&
+                                          afterFingerprint.mtimeNs == fingerprint.mtimeNs))) {
+                                        GetServerHashMemCache().Upsert(rel, afterFingerprint, hash);
+                                    }
+                                } catch (...) {
+                                    // Cache write failed (e.g. OOM); the hash response is still
+                                    // sent below, so correctness is unaffected -- just no cache.
                                 }
                             }
                             if (!done.load()) {
@@ -1172,7 +1191,13 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     sessionHashCv.notify_all();
                     outboundCv.notify_all();
                 } else {
-                    throw std::runtime_error("Unknown message in server session");
+                    std::ostringstream os;
+                    os << "Unknown message in server session: type="
+                       << static_cast<int>(static_cast<uint8_t>(frame.type)) << " ("
+                       << MsgTypeName(static_cast<uint8_t>(frame.type)) << ") streamId="
+                       << frame.streamId << " payloadLen=" << frame.payload.size() << " "
+                       << DescribeRecentFrames();
+                    throw std::runtime_error(os.str());
                 }
             }
         } catch (const std::exception& ex) {
@@ -2032,6 +2057,35 @@ int RunClient(const CliOptions& options) {
 
             while (!recvStop.load()) {
                 Frame f = RecvFrame(socket);
+                // Direction guard (desync diagnostics): the server must only ever send the
+                // response/stream frame types below. Receiving anything else (e.g. a
+                // client->server request type, a handshake type, or Error) means the byte
+                // stream is misaligned or the peer is misbehaving. Detect it HERE, in wire
+                // order, with the per-thread recent-frame history -- this is strictly more
+                // informative than the later main-thread "unexpected frame" throw, because
+                // the priority/manifest split reorders frames before the main loop sees them.
+                switch (f.type) {
+                    case MsgType::ManifestEntry:
+                    case MsgType::ManifestProgress:
+                    case MsgType::ManifestEnd:
+                    case MsgType::HashResponse:
+                    case MsgType::FileChunk:
+                    case MsgType::FileEnd:
+                    case MsgType::FileError:
+                    case MsgType::FileBatchOpen:
+                    case MsgType::FileBatchChunk:
+                    case MsgType::FileBatchEnd:
+                        break;  // legitimately server -> client
+                    default: {
+                        std::ostringstream os;
+                        os << "client received wrong-direction/unknown frame: type="
+                           << static_cast<int>(static_cast<uint8_t>(f.type)) << " ("
+                           << MsgTypeName(static_cast<uint8_t>(f.type)) << ") streamId="
+                           << f.streamId << " payloadLen=" << f.payload.size() << " "
+                           << DescribeRecentFrames();
+                        throw std::runtime_error(os.str());
+                    }
+                }
                 if (isManifestFrame(f.type)) {
                     const bool forceFlush = (f.type == MsgType::ManifestEnd);
                     manifestBatchBytes += frameWireBytes(f);
@@ -2954,7 +3008,14 @@ int RunClient(const CliOptions& options) {
             }
             PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else {
-            throw std::runtime_error("Unexpected frame in client stream loop");
+            {
+                std::ostringstream os;
+                os << "Unexpected frame in client stream loop: type="
+                   << static_cast<int>(static_cast<uint8_t>(frame.type)) << " ("
+                   << MsgTypeName(static_cast<uint8_t>(frame.type)) << ") streamId="
+                   << frame.streamId << " payloadLen=" << frame.payload.size();
+                throw std::runtime_error(os.str());
+            }
         }
     };
 
@@ -3294,20 +3355,35 @@ int RunClient(const CliOptions& options) {
                 const bool compareWorkPending =
                     (compareTasksIssued.load() != compareResultsHandled.load()) || !delayedCompareEntries.empty();
                 if (ingestPaused || compareWorkPending) {
-                    std::unique_lock<std::mutex> lock(compareResultMu);
-                    compareResultCv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-                        return !compareResults.empty();
-                    });
+                    {
+                        std::unique_lock<std::mutex> lock(compareResultMu);
+                        compareResultCv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+                            return !compareResults.empty();
+                        });
+                    }
+                    // updateStallWatchdog() takes its own locks (incomingMu/compareTaskMu/
+                    // hashTaskMu) on the warn path, so it MUST run with no loop mutex held.
                     updateStallWatchdog(loopHadForwardProgress);
                     continue;
                 }
-                std::unique_lock<std::mutex> lock(incomingMu);
-                incomingDataCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
-                    return recvClosed.load() || !incomingPriorityFrames.empty() || !incomingManifestFrames.empty();
-                });
-                if (recvClosed.load() && incomingPriorityFrames.empty() && incomingManifestFrames.empty()) {
+                bool recvDrainedAndClosed = false;
+                {
+                    std::unique_lock<std::mutex> lock(incomingMu);
+                    incomingDataCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+                        return recvClosed.load() || !incomingPriorityFrames.empty() || !incomingManifestFrames.empty();
+                    });
+                    recvDrainedAndClosed = recvClosed.load() && incomingPriorityFrames.empty() &&
+                                           incomingManifestFrames.empty();
+                }
+                if (recvDrainedAndClosed) {
                     break;
                 }
+                // MUST be outside the incomingMu scope above: updateStallWatchdog()'s warn
+                // path re-acquires incomingMu, and re-locking a std::mutex already held by
+                // this thread throws std::system_error{resource_deadlock_would_occur} on
+                // MSVC (errc 36). That was the "resource deadlock would occur" crash hit
+                // after ~1 min of a network stall, the only window where this branch runs
+                // every iteration and the watchdog finally crosses its warn threshold.
                 updateStallWatchdog(loopHadForwardProgress);
                 continue;
             }

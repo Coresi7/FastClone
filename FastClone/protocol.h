@@ -41,6 +41,17 @@ void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames
 void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame);
 Frame RecvFrame(const SocketHandle& socket);
 
+// Diagnostics for framing desync investigation.
+// Human-readable name for a wire type byte (or "?(<n>)" for out-of-enum values).
+const char* MsgTypeName(uint8_t typeByte);
+// True only for byte values that map to a defined MsgType.
+bool IsKnownMsgType(uint8_t typeByte);
+// Formats the last few frames RECEIVED on the CALLING thread (wire order), i.e. the
+// per-thread history maintained by RecvFrame. Used to dump context when a desync or
+// wrong-direction frame is detected. Returns "<none>" if the calling thread has not
+// received any frames.
+std::string DescribeRecentFrames();
+
 void AppendU16(std::vector<uint8_t>& out, uint16_t value);
 void AppendU32(std::vector<uint8_t>& out, uint32_t value);
 void AppendU64(std::vector<uint8_t>& out, uint64_t value);
