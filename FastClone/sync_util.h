@@ -12,6 +12,14 @@ bool ParseBoolEnv(const char* name);
 bool IsDebugEnabled();
 bool IsDiagEnabled();
 
+// True for permanent auth/protocol/desync errors that must not consume reconnect budget.
+// Includes: protocol version mismatch, authentication failures, "Server error: ..." frames,
+// RecvFrame desync, wrong-direction frames. Transient network errors return false.
+//
+// NOTE: classification is string-based today. Throw sites are listed in sync_util.cpp.
+// A future DisconnectReason enum at each throw site would remove this coupling.
+bool IsFatalClientDisconnectReason(const std::string& reason);
+
 #ifdef _WIN32
 std::wstring Utf8ToWide(const std::string& value);
 std::string WideToUtf8(const std::wstring& value);

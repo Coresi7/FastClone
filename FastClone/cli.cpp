@@ -44,7 +44,7 @@ void PrintUsage() {
     std::cerr
         << "Usage:\n"
         << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>\n"
-        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--diag]\n"
+        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
 }
 
@@ -82,6 +82,36 @@ uint64_t ParseSizeBytesStrict(const std::string& value, const char* name) {
         multiplier = 1024ULL * 1024ULL * 1024ULL;
     } else {
         throw std::runtime_error(std::string("Invalid ") + name + ", expected suffix [K|M|G]");
+    }
+
+    const unsigned long long maxValue = (std::numeric_limits<uint64_t>::max)() / multiplier;
+    if (base > maxValue) {
+        throw std::runtime_error(std::string(name) + " is too large");
+    }
+    return static_cast<uint64_t>(base * multiplier);
+}
+
+uint64_t ParseDurationMsStrict(const std::string& value, const char* name) {
+    if (value.empty()) {
+        throw std::runtime_error(std::string(name) + " is empty");
+    }
+    size_t idx = 0;
+    const unsigned long long base = std::stoull(value, &idx, 10);
+    std::string suffix = value.substr(idx);
+    for (char& c : suffix) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    uint64_t multiplier = 1;
+    // Bare number (no suffix) is treated as seconds, same as an explicit "s" suffix.
+    if (suffix.empty() || suffix == "s" || suffix == "sec") {
+        multiplier = 1000ULL;
+    } else if (suffix == "m" || suffix == "min") {
+        multiplier = 60ULL * 1000ULL;
+    } else if (suffix == "h" || suffix == "hr") {
+        multiplier = 60ULL * 60ULL * 1000ULL;
+    } else {
+        throw std::runtime_error(std::string("Invalid ") + name + ", expected suffix [s|m|h]");
     }
 
     const unsigned long long maxValue = (std::numeric_limits<uint64_t>::max)() / multiplier;
@@ -179,6 +209,17 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.enableHashMemcache = true;
         } else if (arg == "--diag") {
             options.diagnostics = true;
+        } else if (arg == "--reconnect-retries") {
+            const long retries = ParseLongStrict(ArgAt(args, ++i), "--reconnect-retries");
+            if (retries < 0 || retries > 1000000) {
+                throw std::runtime_error("Invalid --reconnect-retries");
+            }
+            options.reconnectRetries = static_cast<uint32_t>(retries);
+        } else if (arg == "--reconnect-window") {
+            options.reconnectWindowMs = ParseDurationMsStrict(ArgAt(args, ++i), "--reconnect-window");
+            if (options.reconnectWindowMs == 0) {
+                throw std::runtime_error("Invalid --reconnect-window (must be > 0)");
+            }
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }

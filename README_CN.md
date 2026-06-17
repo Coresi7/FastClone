@@ -35,7 +35,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]
+FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）
@@ -44,6 +44,8 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `--streams`：并发 stream 数；不传走 auto-tune（默认按 `4`，显式设置大于 `8` 会打印失败率风险警告）
 - `--chunk-kb`：块大小（KB）；不传走 auto-tune，范围 `1..65536`
 - `--queued-file-size`：接收队列内存软目标（用于自适应限速）；默认 `5G`，范围 `256M..64G`，支持 `K/M/G` 后缀
+- `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
+- `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
 
 ## 进度输出
 
@@ -56,17 +58,37 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `Transfered`：已传输完成数
 - `Deleted`：镜像删除数（删除阶段结束后更新）
 
+## 网络闪断与自动重连
+
+客户端在连接中断（manifest 未完整接收）时会自动重连并继续同步，无需手动重跑整条命令：
+
+- 默认最多 **10** 次会话重连，总窗口 **30 分钟**，指数退避（1s → 2s → 4s … 上限 30s）
+- 重连等待期间若服务端尚未就绪（`connect failed` 等），同样计入重连预算并退避重试，不会立即退出
+- `--reconnect-retries 0` 可禁用自动重连（行为与旧版一致：中断后退出码 `3`）
+- 已落盘且 `size+mtime` 一致的文件在重连后自动跳过，无需二次传输
+- **非块级断点续传**：大文件若传输中断，重连后从文件头重传（协议无 offset 字段）
+- **协议版本不变**：重连是会客户端会话策略，仍使用 FC5 线协议（无新 MsgType/字段）
+- 协议/鉴权错误、帧 desync 等不可恢复错误立即退出（退出码 `1`），不消耗重连预算
+- 已知不可恢复错误包括：密码不匹配、协议版本不匹配（FC5）、服务端 Error 帧、帧 desync
+
+新增 CLI 参数：
+
+- `--reconnect-retries <n>`：最大会话重连次数；默认 `10`，`0` = 禁用
+- `--reconnect-window <duration>`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+
 ## 注意事项
 
 - 当前为明文 TCP + 口令，建议只在可信网络使用
 - 镜像模式会删除客户端多余文件/目录
-- 不支持断点续传，中断后需重跑（但重跑可自动对比，相同文件无需二次传输）
+- 不支持单文件块级断点续传；中断后依赖自动重连或重跑（重跑/重连均可自动对比，相同文件无需二次传输）
 
 ## 退出码
 
 - `0`：同步成功（无失败文件）
 - `1`：参数错误或运行时异常
 - `2`：同步完成但存在失败文件（可结合 `--streams` 降低并发后重试）
+- `3`：同步未完成且自动重连已禁用（`--reconnect-retries 0`），或连接中断后未启用重连
+- `4`：自动重连预算耗尽，同步仍未完成
 
 ## 跨平台构建（Linux/macOS）
 

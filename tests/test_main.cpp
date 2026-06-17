@@ -4,10 +4,12 @@
 void RunCliTests();
 void RunHashMemCacheTests();
 void RunFileIndexTests();
+void RunReconnectClassifierTests();
 
 int main() {
     try {
         RunCliTests();
+        RunReconnectClassifierTests();
         RunHashMemCacheTests();
         RunFileIndexTests();
         std::cout << "All FastClone tests passed." << std::endl;

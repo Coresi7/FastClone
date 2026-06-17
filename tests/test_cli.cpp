@@ -60,4 +60,38 @@ void RunCliTests() {
                         "--enable-hash-memcache",
                     },
                     "server-only");
+
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone",
+            "client",
+            "--server",
+            "127.0.0.1:27842",
+            "--target",
+            ".",
+            "--password",
+            "pw",
+            "--reconnect-retries",
+            "0",
+            "--reconnect-window",
+            "5m",
+        });
+        Require(opt.mode == fc::Mode::Client, "Expected client mode");
+        Require(opt.reconnectRetries == 0, "Expected reconnect retries 0");
+        Require(opt.reconnectWindowMs == 5ULL * 60ULL * 1000ULL, "Expected reconnect window 5m");
+    }
+
+    ExpectThrowWith({
+                        "FastClone",
+                        "client",
+                        "--server",
+                        "127.0.0.1:27842",
+                        "--target",
+                        ".",
+                        "--password",
+                        "pw",
+                        "--reconnect-window",
+                        "bad",
+                    },
+                    "reconnect-window");
 }

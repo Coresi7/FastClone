@@ -59,10 +59,12 @@ add_executable(FastCloneTests
     FastClone/cli.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
+    FastClone/sync_util.cpp
     tests/test_main.cpp
     tests/test_cli.cpp
     tests/test_file_index.cpp
     tests/test_hash_memcache.cpp
+    tests/test_reconnect.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)

@@ -25,6 +25,8 @@ struct CliOptions {
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
     bool diagnostics = false;
+    uint32_t reconnectRetries = 10;
+    uint64_t reconnectWindowMs = 30ULL * 60ULL * 1000ULL;
 };
 
 #if defined(_WIN32) && defined(_MSC_VER)

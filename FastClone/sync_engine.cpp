@@ -51,6 +51,40 @@ namespace {
 
 constexpr const char* kProtocolVersion = "FC5";
 
+// Schedule the next reconnect attempt after a transient failure (session drop or
+// server-not-ready connect/handshake). Returns the process exit code when the
+// caller must terminate; std::nullopt means backoff completed and the outer session
+// loop should continue (retry ConnectTo).
+std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
+                                                  uint32_t reconnectRetries,
+                                                  uint64_t reconnectWindowMs,
+                                                  uint32_t& reconnectAttemptsUsed,
+                                                  const std::chrono::steady_clock::time_point& reconnectWindowStart,
+                                                  int exitWhenDisabled) {
+    if (IsFatalClientDisconnectReason(reason)) {
+        std::cerr << "[reconnect] fatal error, not retrying: \"" << reason << "\"" << std::endl;
+        return 1;
+    }
+    if (reconnectRetries == 0) {
+        return exitWhenDisabled;
+    }
+    const auto reconnectNow = std::chrono::steady_clock::now();
+    const auto reconnectWindowLimit = std::chrono::milliseconds(reconnectWindowMs);
+    if (reconnectAttemptsUsed >= reconnectRetries ||
+        (reconnectNow - reconnectWindowStart) > reconnectWindowLimit) {
+        std::cerr << "[reconnect] budget exhausted attempts=" << reconnectAttemptsUsed
+                  << "/" << reconnectRetries << " reason=\"" << reason << "\"" << std::endl;
+        return 4;
+    }
+    ++reconnectAttemptsUsed;
+    const uint32_t backoffShift = std::min<uint32_t>(reconnectAttemptsUsed - 1, 5u);
+    const uint32_t backoffSec = std::min<uint32_t>(30u, 1u << backoffShift);
+    std::cerr << "[reconnect] attempt=" << reconnectAttemptsUsed << " reason=\"" << reason
+              << "\" backoff_s=" << backoffSec << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(backoffSec));
+    return std::nullopt;
+}
+
 // Diagnostic wrapper around std::thread::join(). The exception
 // "resource deadlock would occur" is thrown by join() in exactly one case: a
 // thread tries to join ITSELF (t.get_id() == this_thread::get_id()), which on
@@ -195,7 +229,8 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
     SendSimple(socket, MsgType::Hello, kProtocolVersion);
     Frame helloBack = RecvFrame(socket);
     if (helloBack.type == MsgType::Error) {
-        throw std::runtime_error(std::string(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size()));
+        const std::string payload(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size());
+        throw std::runtime_error("Server error: " + payload);
     }
     if (helloBack.type != MsgType::Hello) {
         throw std::runtime_error("Server HELLO missing");
@@ -1773,8 +1808,42 @@ int RunClient(const CliOptions& options) {
         }
     }
 
-    SocketHandle socket = ConnectTo(options.host, options.port);
-    EnsureHandshakeAsClient(socket, options.password);
+    // --- Session reconnect loop: cross-session vs per-session state ---
+    // PERSIST across reconnect attempts (declared outside while):
+    //   reconnectAttemptsUsed, reconnectWindowStart/Limit -- reconnect budget
+    //   syncStartTime/formatElapsed -- total wall time for the CLI run
+    //   tuned/streamLimit/effectiveChunkSize -- CLI transfer tuning (fixed at start)
+    //   selfPath, options, diagnostics/debug flags -- run configuration
+    //   WsaContext -- process-wide socket init
+    // DO NOT add per-session maps/queues/counters here without resetting them inside while.
+    // RESET every session (declared inside while, after ConnectTo succeeds):
+    //   socket, remoteFiles/remoteDirs, all transfer/hash/compare queues & maps,
+    //   activeDownloads/BatchDownloads, worker threads, recv thread, progress counters,
+    //   manifestDone, recvError/recvClosed -- each session is a fresh FC5 handshake +
+    //   ManifestRequest. Already-synced local files persist on DISK only; the next session
+    //   re-enumerates and skips them via size+mtime compare (no in-memory carry-over).
+    uint32_t reconnectAttemptsUsed = 0;
+    const auto reconnectWindowStart = std::chrono::steady_clock::now();
+
+    // ConnectTo + handshake failures (server not ready) reuse the same reconnect budget
+    // as mid-session drops; see ScheduleClientReconnectOrExit().
+    while (true) {
+    SocketHandle socket;
+    try {
+        socket = ConnectTo(options.host, options.port);
+        EnsureHandshakeAsClient(socket, options.password);
+    } catch (const std::exception& ex) {
+        const std::string connectReason = ex.what();
+        if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
+                connectReason, options.reconnectRetries, options.reconnectWindowMs,
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/1)) {
+            if (*exitCode == 1) {
+                std::cerr << "FastClone error: " << connectReason << std::endl;
+            }
+            return *exitCode;
+        }
+        continue;
+    }
     if (options.streamAutoTune || options.chunkAutoTune) {
         std::cout << "[auto-tune] streams=" << streamLimit
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
@@ -3509,7 +3578,15 @@ int RunClient(const CliOptions& options) {
         std::cout << "Sync aborted (incomplete manifest). changed_files=" << transferred
                   << " failed_files=" << failed << " enumerated=" << enumerated
                   << " elapsed=" << formatElapsed() << std::endl;
-        return 3;
+
+        const std::string disconnectReason =
+            recvError.empty() ? "connection_closed" : recvError;
+        if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
+                disconnectReason, options.reconnectRetries, options.reconnectWindowMs,
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/3)) {
+            return *exitCode;
+        }
+        continue;
     }
 
     // Delete obsolete files first; the walk also hands back the set of directories that
@@ -3596,6 +3673,7 @@ int RunClient(const CliOptions& options) {
               << " failed_files=" << failed
               << " elapsed=" << formatElapsed() << std::endl;
     return success ? 0 : 2;
+    }  // while (reconnect session)
 }
 
 }  // namespace fc

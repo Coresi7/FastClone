@@ -62,6 +62,43 @@ bool IsDiagEnabled() {
     return enabled;
 }
 
+bool IsFatalClientDisconnectReason(const std::string& reason) {
+    if (reason.empty()) {
+        return false;
+    }
+    // Maintenance contract (string-matched throw sites — keep in sync when editing):
+    //   EnsureHandshakeAsClient: "Server error: ...", "Server HELLO missing",
+    //     "Protocol version mismatch: ...", "Server authentication rejected"
+    //   EnsureHandshakeAsServer: "Authentication failed", "Protocol version mismatch: ..."
+    //   recv thread (sync_engine.cpp): "client received wrong-direction/unknown frame: ..."
+    //   RecvFrame (protocol.cpp): "RecvFrame desync: ..."
+    // Future: replace with DisconnectReason enum at throw sites (see sync_util.h).
+    // Handshake / configuration errors — retrying cannot succeed.
+    if (reason.find("Protocol version mismatch") != std::string::npos) {
+        return true;
+    }
+    if (reason.find("Server authentication rejected") != std::string::npos) {
+        return true;
+    }
+    if (reason.find("Authentication failed") != std::string::npos) {
+        return true;
+    }
+    if (reason.find("Server HELLO missing") != std::string::npos) {
+        return true;
+    }
+    if (reason.find("Server error: ") == 0) {
+        return true;
+    }
+    // Wire desync / wrong-direction frames — reconnecting will not realign the stream.
+    if (reason.find("client received wrong-direction/unknown frame") != std::string::npos) {
+        return true;
+    }
+    if (reason.find("RecvFrame desync:") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
 bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs) {
     // Heuristic shared with file_index.cpp compatibility logic:
     // values above this threshold are very likely Unix nanoseconds.
