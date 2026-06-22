@@ -1,7 +1,9 @@
 #include <exception>
 #include <iostream>
 
+#if defined(FASTCLONE_ENABLE_CLI_TESTS)
 void RunCliTests();
+#endif
 void RunHashMemCacheTests();
 void RunFileIndexTests();
 void RunReconnectClassifierTests();
@@ -9,7 +11,9 @@ void RunRouteSelectionTests();
 
 int main() {
     try {
+#if defined(FASTCLONE_ENABLE_CLI_TESTS)
         RunCliTests();
+#endif
         RunReconnectClassifierTests();
         RunHashMemCacheTests();
         RunFileIndexTests();

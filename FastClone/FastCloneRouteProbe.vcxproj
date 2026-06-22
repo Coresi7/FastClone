@@ -22,8 +22,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{6d4e0a99-a0c7-46f5-b71f-1e5d9bb1a13b}</ProjectGuid>
-    <RootNamespace>FastClone</RootNamespace>
+    <ProjectGuid>{B7E3F2A1-9C4D-4E6B-A8F0-2D5C7A9E1B3C}</ProjectGuid>
+    <RootNamespace>FastCloneRouteProbe</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -74,17 +74,24 @@
 
   <PropertyGroup Label="UserMacros" />
 
+  <!-- Dedicated intermediate dir so the shared .cpp objs never collide with FastClone's
+       IntDir (design §6); OutDir stays at the default so the exe lands in $(Platform)\$(Configuration). -->
+  <PropertyGroup>
+    <IntDir>$(Platform)\$(Configuration)\FastCloneRouteProbe\</IntDir>
+  </PropertyGroup>
+
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;iphlpapi.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -96,13 +103,14 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;iphlpapi.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -112,13 +120,14 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;iphlpapi.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -130,13 +139,14 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;iphlpapi.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -144,30 +154,19 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClInclude Include="cli.h" />
     <ClInclude Include="client_handshake.h" />
     <ClInclude Include="file_index.h" />
-    <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
-    <ClInclude Include="sync_engine.h" />
-    <ClInclude Include="sync_util.h" />
-    <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="cli.cpp" />
     <ClCompile Include="client_handshake.cpp" />
-    <ClCompile Include="file_index.cpp" />
-    <ClCompile Include="hash_memcache.cpp" />
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="net_topology.cpp" />
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="protocol_codec.cpp" />
-    <ClCompile Include="sync_engine.cpp" />
-    <ClCompile Include="sync_util.cpp" />
-    <ClCompile Include="transfer_tuning.cpp" />
+    <ClCompile Include="route_probe_main.cpp" />
     <ClCompile Include="win_socket.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

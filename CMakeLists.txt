@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(FastClone
     FastClone/cli.cpp
+    FastClone/client_handshake.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
     FastClone/main.cpp
@@ -74,6 +75,9 @@ add_executable(FastCloneTests
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)
+# CMake build includes test_cli.cpp (RunCliTests is defined); enable its call in test_main.cpp.
+# The VS FastCloneTests.vcxproj excludes test_cli.cpp and leaves this macro undefined.
+target_compile_definitions(FastCloneTests PRIVATE FASTCLONE_ENABLE_CLI_TESTS)
 
 # file_index.cpp pulls in xxhash; reuse the same resolution as the main target.
 if(XXHASH_FOUND)
@@ -97,3 +101,24 @@ add_test(NAME FastCloneTests COMMAND FastCloneTests)
 install(TARGETS FastClone
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+# --- Diagnostics-only multipath route probe (additive; does not touch FastClone/Tests) ---
+# The tool reuses the shared client handshake primitives (client_handshake.cpp) and links
+# only the self-contained .cpp it needs. It deliberately does NOT link sync_engine.cpp /
+# file_index.cpp / xxhash (no transfer engine, no hashing).
+add_executable(FastCloneRouteProbe
+    FastClone/route_probe_main.cpp
+    FastClone/client_handshake.cpp
+    FastClone/net_topology.cpp
+    FastClone/protocol.cpp
+    FastClone/protocol_codec.cpp
+    FastClone/win_socket.cpp
+)
+target_include_directories(FastCloneRouteProbe PRIVATE FastClone)
+target_link_libraries(FastCloneRouteProbe PRIVATE Threads::Threads)
+
+if(WIN32)
+    target_compile_definitions(FastCloneRouteProbe PRIVATE
+        _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(FastCloneRouteProbe PRIVATE ws2_32 iphlpapi bcrypt)
+endif()

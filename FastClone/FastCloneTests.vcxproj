@@ -22,8 +22,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{6d4e0a99-a0c7-46f5-b71f-1e5d9bb1a13b}</ProjectGuid>
-    <RootNamespace>FastClone</RootNamespace>
+    <ProjectGuid>{F5A2C7D4-1B3E-4A8C-9D6F-0E2B4C6A8D10}</ProjectGuid>
+    <RootNamespace>FastCloneTests</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -74,11 +74,18 @@
 
   <PropertyGroup Label="UserMacros" />
 
+  <!-- Dedicated intermediate dir so the shared .cpp objs never collide with FastClone's
+       or FastCloneRouteProbe's IntDir (design §3.6 / R-05). -->
+  <PropertyGroup>
+    <IntDir>$(Platform)\$(Configuration)\FastCloneTests\</IntDir>
+  </PropertyGroup>
+
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
@@ -96,7 +103,8 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
@@ -112,7 +120,8 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
@@ -130,7 +139,8 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
@@ -145,30 +155,33 @@
 
   <ItemGroup>
     <ClInclude Include="cli.h" />
-    <ClInclude Include="client_handshake.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
-    <ClInclude Include="sync_engine.h" />
     <ClInclude Include="sync_util.h" />
-    <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Production sources under test (mirrors CMake FastCloneTests; no sync_engine.cpp /
+         main.cpp / transfer_tuning.cpp / route_probe_main.cpp / client_handshake.cpp). -->
     <ClCompile Include="cli.cpp" />
-    <ClCompile Include="client_handshake.cpp" />
     <ClCompile Include="file_index.cpp" />
     <ClCompile Include="hash_memcache.cpp" />
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="net_topology.cpp" />
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="protocol_codec.cpp" />
-    <ClCompile Include="sync_engine.cpp" />
     <ClCompile Include="sync_util.cpp" />
-    <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
+    <!-- Test sources. test_cli.cpp is deliberately excluded (MSVC ParseCli(int, wchar_t**)
+         vs the test's char** call -> C2664); test_main.cpp guards RunCliTests() with
+         FASTCLONE_ENABLE_CLI_TESTS, which this project does NOT define (design §3.7 D-02 A). -->
+    <ClCompile Include="..\tests\test_main.cpp" />
+    <ClCompile Include="..\tests\test_file_index.cpp" />
+    <ClCompile Include="..\tests\test_hash_memcache.cpp" />
+    <ClCompile Include="..\tests\test_reconnect.cpp" />
+    <ClCompile Include="..\tests\test_route_selection.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

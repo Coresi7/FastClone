@@ -859,4 +859,47 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     return plans;
 }
 
+std::pair<std::string, uint16_t> SplitServerKey(const std::string& key, uint16_t defaultPort) {
+    // Bracketed IPv6 literal, optionally followed by ":port".
+    if (!key.empty() && key.front() == '[') {
+        const size_t close = key.find(']');
+        if (close != std::string::npos) {
+            const std::string host = key.substr(1, close - 1);
+            // Bare "[ipv6]" with no trailing port.
+            if (close + 1 >= key.size()) {
+                return {host, defaultPort};
+            }
+            if (key[close + 1] == ':') {
+                const std::string portStr = key.substr(close + 2);
+                try {
+                    const int port = std::stoi(portStr);
+                    if (port > 0 && port <= 65535) {
+                        return {host, static_cast<uint16_t>(port)};
+                    }
+                } catch (...) {
+                }
+            }
+            // Malformed trailing data: fall back to the bracketed host on the default port.
+            return {host, defaultPort};
+        }
+    }
+    const size_t colon = key.rfind(':');
+    if (colon == std::string::npos) {
+        return {key, defaultPort};
+    }
+    const std::string portStr = key.substr(colon + 1);
+    // A bare IPv6 literal (multiple ':') without an explicit port should not be split.
+    if (key.find(':') != colon) {
+        return {key, defaultPort};
+    }
+    try {
+        const int port = std::stoi(portStr);
+        if (port > 0 && port <= 65535) {
+            return {key.substr(0, colon), static_cast<uint16_t>(port)};
+        }
+    } catch (...) {
+    }
+    return {key, defaultPort};
+}
+
 }  // namespace fc

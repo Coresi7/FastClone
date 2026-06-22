@@ -45,6 +45,9 @@
     <ClInclude Include="win_socket.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="client_handshake.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="cli.cpp">
@@ -78,6 +81,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="win_socket.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="client_handshake.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

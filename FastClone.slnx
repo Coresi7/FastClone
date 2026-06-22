@@ -4,4 +4,10 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="FastClone/FastClone.vcxproj" Id="6d4e0a99-a0c7-46f5-b71f-1e5d9bb1a13b" />
+  <Project Path="FastClone/FastCloneRouteProbe.vcxproj" Id="B7E3F2A1-9C4D-4E6B-A8F0-2D5C7A9E1B3C">
+    <Build Project="false" />
+  </Project>
+  <Project Path="FastClone/FastCloneTests.vcxproj" Id="F5A2C7D4-1B3E-4A8C-9D6F-0E2B4C6A8D10">
+    <Build Project="false" />
+  </Project>
 </Solution>

@@ -19,4 +19,10 @@ docs/
 .cursor/
 HARNESS_VERSION
 build/
+build_tests/
+Release/
+Win32/
+*.iobj
+*.ipdb
+*.exe
 

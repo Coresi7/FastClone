@@ -9,10 +9,10 @@ Supported platforms:
 ## Core Features
 
 - Single executable: same binary can run as `server` or `client`
-- Multi-stream transfer over a single TCP connection
+- Multi-connection parallel transfer (multipath / FC6): aggregate bandwidth across multiple NICs; also works fine with a single NIC / connection
 - Mirror sync: files/directories deleted on server are also deleted on client
 - Fallback verification: uses `XXH3_128` when `size + mtime` do not match
-- Scales to tens-of-millions-file, TB-scale trees: tiny files are batched together while large files are split across multiple chunked streams
+- Scales to tens-of-millions-file, TB-scale trees: tiny files are batched together while many files run concurrently across multiple streams / links (a single file itself is never split across streams)
 - Strict protocol version check (version mismatch is rejected immediately)
 
 ## Expected Performance
@@ -36,15 +36,19 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### Client
 
 ```bash
-FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
-- `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted)
+- `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted); accepts a comma-separated list and/or may be repeated to supply multiple multipath endpoints
 - `--target`: local target directory
 - `--password`: password (must match server)
 - `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`, and explicit values above `8` print a reliability warning)
 - `--chunk-kb`: chunk size in KB; auto-tuned when omitted, valid range `1..65536`
 - `--queued-file-size`: soft receive-queue memory target for adaptive throttling (default: `5G`, range: `256M..64G`, supports suffixes `K/M/G`)
+- `--large-file-threshold`: pins files `>=` this size to the primary link; default `1G`, range `1M..1T`, suffixes `K/M/G` (independent of the small-file batch threshold and the receive-queue target)
+- `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
+- `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
+- `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
 
 ## Progress Counters
 
@@ -55,19 +59,47 @@ The client prints and updates these counters in one line:
 - `Unchanged`: files that do not need transfer
 - `Failed`: files still failed after retries (up to 3 attempts)
 - `Transfered`: files transferred successfully
-- `Deleted`: files removed during mirror-delete phase
+- `Connections`: number of currently established connections (links)
+
+Mirror-delete runs after all transfers and is not part of the live counters above; the delete phase prints `Delete done, <n> files` when it finishes.
+
+## Multi-NIC Parallel Transfer (Multipath, FC6)
+
+When the server and client each have multiple NICs, FastClone can use **several physical links at once** in a single sync to aggregate bandwidth:
+
+- A session is a **connection pool**: the primary link is established first (the first `--server` endpoint / the first `--link`), then auxiliary links are added best-effort.
+- **Automatic selection**: the client enumerates local NICs, probes reachability to the server-advertised endpoints, and pairs them by "address family (IPv4 first) > same-subnet > RTT", keeping **at most one connection per physical NIC on each side** (a dual-stack NIC's v4/v6 are not treated as two links).
+- **Explicit pinning**: `--link <localIP|iface>=<serverIP[:port]>` bypasses automatic selection; the first `--link` is the primary link.
+- **Large files stay on the primary link**: a single file cannot be split across links, so files `>= --large-file-threshold` (default `1G`) are pinned to the primary link (assumed best); other files / small-file batches are spread across links adaptively by measured throughput.
+- With a single NIC / endpoint it degrades to a single connection, identical to prior behavior.
+
+Diagnostics: the solution ships an **optionally-built** `FastCloneRouteProbe` project that probes a given server and prints the reachability matrix and the final link selection, to help diagnose link assignment in the field.
+
+## Reconnect on Transient Network Failures
+
+If the connection drops before the manifest is fully received, the client automatically reconnects and resumes without rerunning the whole command:
+
+- Up to **10** session reconnects within a **30-minute** window by default, with exponential backoff (1s → 2s → 4s … capped at 30s)
+- Connect failures while the server is not yet ready also consume the reconnect budget and back off instead of exiting immediately
+- `--reconnect-retries 0` disables auto-reconnect (legacy behavior: exit code `3` on interruption)
+- Files already on disk with matching `size+mtime` are skipped after reconnect
+- **No block-level resume**: an interrupted large file is re-sent from the start (the protocol has no offset field)
+- The current wire protocol is **FC6** (multipath session: adds `SessionJoin`, and `AuthOk` carries the session id and the server endpoint list); with multiple connections, a single dropped link migrates its in-flight files to healthy links, and only a fully-down pool triggers a session-level reconnect
+- Unrecoverable errors (auth/protocol mismatch, frame desync, server Error frame) exit immediately (code `1`) and do not consume the reconnect budget
 
 ## Notes
 
 - Current transport is plain TCP + password; use only in trusted networks
 - Mirror mode removes extra files/directories on the client
-- No resume support; rerun after interruption (unchanged files are still skipped by comparison)
+- No block-level resume; rely on auto-reconnect or rerun after interruption (unchanged files are still skipped by comparison)
 
 ## Exit Codes
 
 - `0`: sync succeeded (no failed files)
 - `1`: argument error or runtime exception
 - `2`: sync completed with failed files (try lowering concurrency, e.g. `--streams`)
+- `3`: sync incomplete and auto-reconnect disabled (`--reconnect-retries 0`), or connection dropped without reconnect enabled
+- `4`: auto-reconnect budget exhausted with the sync still incomplete
 
 ## Cross-Platform Build (Linux/macOS)
 

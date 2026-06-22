@@ -1,6 +1,6 @@
 # FastClone
 
-`FastClone` 是一个单文件、单连接的高吞吐目录同步工具，面向超大规模目录树：可**迅速同步千万量级文件、传输 TB 级数据**，并在一次同步中同时高效处理海量碎文件与超大文件（例如 Unity/Unreal 工程目录、游戏构建产物、大型素材/数据集仓库）。
+`FastClone` 是一个单文件、多连接（多路径）的高吞吐目录同步工具，面向超大规模目录树：可**迅速同步千万量级文件、传输 TB 级数据**，并在一次同步中同时高效处理海量碎文件与超大文件（例如 Unity/Unreal 工程目录、游戏构建产物、大型素材/数据集仓库）。
 
 现在支持：
 - Windows：使用 WinAPI 快路径（更高性能）
@@ -9,10 +9,10 @@
 ## 核心特性
 
 - 单 EXE：同一个程序可作为 `server` 或 `client` 运行
-- 单 TCP 连接多路并发传输
+- 多连接并行传输（多路径 / FC6）：可跨多块网卡叠加带宽；单网卡 / 单连接同样适用
 - 镜像同步：服务端删除 -> 客户端也删除
 - 回退比对：`size + mtime` 不一致时使用 `XXH3_128`
-- 面向千万量级文件、TB 级数据的超大目录树：碎文件批量打包，大文件多流分块并发
+- 面向千万量级文件、TB 级数据的超大目录树：碎文件批量打包传输，多个文件在多条流 / 多条链路上并发（单个文件本身不跨流拆分）
 - 协议版本强校验（版本不匹配直接拒绝）
 
 ## 预期性能
@@ -35,15 +35,17 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
-- `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）
+- `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
 - `--target`：本地目标目录
 - `--password`：口令（与服务端一致）
 - `--streams`：并发 stream 数；不传走 auto-tune（默认按 `4`，显式设置大于 `8` 会打印失败率风险警告）
 - `--chunk-kb`：块大小（KB）；不传走 auto-tune，范围 `1..65536`
 - `--queued-file-size`：接收队列内存软目标（用于自适应限速）；默认 `5G`，范围 `256M..64G`，支持 `K/M/G` 后缀
+- `--large-file-threshold`：将 `>=` 该大小的文件固定走首要链路；默认 `1G`，范围 `1M..1T`，支持 `K/M/G` 后缀（与碎文件批处理阈值、接收队列阈值相互独立）
+- `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
 - `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
 
@@ -56,7 +58,9 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `Unchanged`：无需传输数
 - `Failed`：传输失败且重试（最多 3 次）后仍失败的文件数
 - `Transfered`：已传输完成数
-- `Deleted`：镜像删除数（删除阶段结束后更新）
+- `Connections`：当前已建立的连接（链路）数
+
+镜像删除在所有传输完成后进行，不计入上面的实时计数；删除阶段结束时单独打印 `Delete done, <n> files`。
 
 ## 网络闪断与自动重连
 
@@ -67,14 +71,26 @@ FastClone client --server <host[:port]> --target <path> --password <pwd> [--stre
 - `--reconnect-retries 0` 可禁用自动重连（行为与旧版一致：中断后退出码 `3`）
 - 已落盘且 `size+mtime` 一致的文件在重连后自动跳过，无需二次传输
 - **非块级断点续传**：大文件若传输中断，重连后从文件头重传（协议无 offset 字段）
-- **协议版本不变**：重连是会客户端会话策略，仍使用 FC5 线协议（无新 MsgType/字段）
+- **当前线协议为 FC6**（多路径会话：新增 `SessionJoin`，`AuthOk` 携带会话标识与服务端端点列表）；多连接下单条链路断开会把其在途文件迁移到健康链路重传，仅当所有链路都断开才触发会话级重连
 - 协议/鉴权错误、帧 desync 等不可恢复错误立即退出（退出码 `1`），不消耗重连预算
-- 已知不可恢复错误包括：密码不匹配、协议版本不匹配（FC5）、服务端 Error 帧、帧 desync
+- 已知不可恢复错误包括：密码不匹配、协议版本不匹配（FC6）、服务端 Error 帧、帧 desync
 
 新增 CLI 参数：
 
 - `--reconnect-retries <n>`：最大会话重连次数；默认 `10`，`0` = 禁用
 - `--reconnect-window <duration>`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+
+## 多网卡并行传输（多路径，FC6）
+
+当服务端与客户端各自拥有多块网卡时，FastClone 可在一次同步中**同时使用多条物理链路**以叠加带宽：
+
+- 一个会话由一个**连接池**组成：先建立首要链路（`--server` 的第一个端点 / `--link` 的第一条），再尽力建立辅助链路。
+- **自动选路**：客户端枚举本机网卡、对服务端下发的端点做可达性探测，按"地址族（IPv4 优先）> 同子网 > RTT"择优配对，并保证**每块物理网卡（客户端与服务端两侧）至多一条连接**（双栈网卡的 v4/v6 不会被当成两条链路）。
+- **显式指定**：用 `--link <本地IP|网卡名>=<服务端IP[:端口]>` 可绕过自动选路，列表第一条为首要链路。
+- **大文件固定走首要链路**：单个文件无法跨链路拆分，因此大小 `>= --large-file-threshold`（默认 `1G`）的文件固定走首要链路（假定其为最佳链路）；其余文件 / 碎文件批按实测吞吐自适应分摊到各链路。
+- 单网卡 / 单端点时自动退化为单连接，行为与此前一致。
+
+诊断工具：解决方案中附带一个**可选编译**的 `FastCloneRouteProbe` 工程，可对指定服务端做真实可达性探测并打印可达性矩阵与最终选路结果，便于现场排查链路分配。
 
 ## 注意事项
 

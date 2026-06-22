@@ -1,5 +1,6 @@
 #include "sync_engine.h"
 
+#include "client_handshake.h"
 #include "file_index.h"
 #include "hash_memcache.h"
 #include "net_topology.h"
@@ -51,8 +52,6 @@ namespace fs = std::filesystem;
 namespace fc {
 
 namespace {
-
-constexpr const char* kProtocolVersion = "FC6";
 
 // Schedule the next reconnect attempt after a transient failure (session drop or
 // server-not-ready connect/handshake). Returns the process exit code when the
@@ -196,30 +195,9 @@ CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, con
     return CompareAction::FallbackHash;
 }
 
-void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {}) {
-    Frame frame;
-    frame.type = type;
-    frame.streamId = 0;
-    frame.payload.assign(text.begin(), text.end());
-    SendFrame(socket, frame);
-}
-
-// --- FC6 handshake: version negotiation is shared; session claim differs (design §3, §5) ---
-
-// Server side: exchange Hello and validate the protocol version (FR-018 / AC-013). On
-// mismatch sends Error and throws so the version-reject path is identical to FC5.
-void NegotiateHelloAsServer(const SocketHandle& socket) {
-    const Frame hello = RecvFrame(socket);
-    if (hello.type != MsgType::Hello) {
-        throw std::runtime_error("Expected HELLO");
-    }
-    const std::string clientVersion(reinterpret_cast<const char*>(hello.payload.data()), hello.payload.size());
-    if (clientVersion != kProtocolVersion) {
-        SendSimple(socket, MsgType::Error, "Protocol version mismatch: server=" + std::string(kProtocolVersion) + " client=" + clientVersion);
-        throw std::runtime_error("Protocol version mismatch: server=" + std::string(kProtocolVersion) + " client=" + clientVersion);
-    }
-    SendSimple(socket, MsgType::Hello, kProtocolVersion);
-}
+// --- FC6 handshake: version negotiation + the client/server primitives live in
+// client_handshake.h/.cpp (fc namespace). HandshakeAndResolveSession below stays here
+// because it is coupled to the server-side session registry state. ---
 
 // Server-side logical session shared by all connections that carry the same sessionId
 // (FR-003/004). Per D-02 it only carries merge identity + lifecycle, not transfer state.
@@ -355,80 +333,6 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         return session;
     }
     throw std::runtime_error("Expected AUTH or SessionJoin");
-}
-
-// Client side: Hello negotiation (FR-018 / AC-013). Throws on mismatch / server error.
-void NegotiateHelloAsClient(const SocketHandle& socket) {
-    SendSimple(socket, MsgType::Hello, kProtocolVersion);
-    Frame helloBack = RecvFrame(socket);
-    if (helloBack.type == MsgType::Error) {
-        const std::string payload(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size());
-        throw std::runtime_error("Server error: " + payload);
-    }
-    if (helloBack.type != MsgType::Hello) {
-        throw std::runtime_error("Server HELLO missing");
-    }
-    const std::string serverVersion(reinterpret_cast<const char*>(helloBack.payload.data()), helloBack.payload.size());
-    if (serverVersion != kProtocolVersion) {
-        throw std::runtime_error("Protocol version mismatch: client=" + std::string(kProtocolVersion) + " server=" + serverVersion);
-    }
-}
-
-// Client first connection: Hello -> Auth -> AuthOk(NewSession). Returns the session
-// identity + server-advertised endpoint list (design §3.2 / FR-003/005/017).
-AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password) {
-    NegotiateHelloAsClient(socket);
-    SendSimple(socket, MsgType::Auth, password);
-    Frame authResult = RecvFrame(socket);
-    if (authResult.type != MsgType::AuthOk) {
-        const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
-        throw std::runtime_error("Server authentication rejected: " + payload);
-    }
-    AuthOkInfo info = DecodeAuthOk(authResult.payload);
-    // The first connection must receive a NewSession AuthOk carrying a session id; any
-    // other role (or an empty id) is a non-retryable protocol violation (review B-04).
-    if (info.role != AuthOkRole::NewSession) {
-        throw std::runtime_error(
-            "Protocol error: expected AuthOk role NewSession on first connection, got JoinAck");
-    }
-    if (info.sessionId.empty()) {
-        throw std::runtime_error("Protocol error: AuthOk(NewSession) carried an empty sessionId");
-    }
-    return info;
-}
-
-// Client follow-up connection: Hello -> SessionJoin(sessionId,pwd) -> AuthOk(JoinAck).
-void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
-                         const std::string& sessionId) {
-    NegotiateHelloAsClient(socket);
-    SessionJoinInfo join;
-    join.sessionId = sessionId;
-    join.password = password;
-    SendFrame(socket, Frame{MsgType::SessionJoin, 0, EncodeSessionJoin(join)});
-    Frame authResult = RecvFrame(socket);
-    if (authResult.type != MsgType::AuthOk) {
-        const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
-        throw std::runtime_error("Server rejected session join: " + payload);
-    }
-    // A follow-up connection must be acknowledged with role JoinAck; receiving NewSession
-    // here means the server treated us as a brand-new session and the lane cannot be joined
-    // to the pool. Non-retryable protocol violation (review B-04).
-    const AuthOkInfo info = DecodeAuthOk(authResult.payload);
-    if (info.role != AuthOkRole::JoinAck) {
-        throw std::runtime_error(
-            "Protocol error: expected AuthOk role JoinAck on session join, got NewSession");
-    }
-    // The JoinAck must echo back the session id we asked to join. An empty id, or one that
-    // does not match our request, means the lane is not bound to the intended session pool
-    // (a misrouted/buggy server reply). Non-retryable protocol violation (review B-04 / B4-R1).
-    if (info.sessionId.empty()) {
-        throw std::runtime_error("Protocol error: AuthOk(JoinAck) carried an empty sessionId");
-    }
-    if (info.sessionId != sessionId) {
-        throw std::runtime_error(
-            "Protocol error: AuthOk(JoinAck) sessionId mismatch, requested=" + sessionId +
-            " got=" + info.sessionId);
-    }
 }
 
 inline void AtomicMaxU64(std::atomic<uint64_t>& target, uint64_t value) {
@@ -1877,57 +1781,6 @@ ConnectBinding BindingFromLocal(const std::string& local) {
         binding.ifaceName = local;
     }
     return binding;
-}
-
-// Parse "host:port" into host + port. Supported forms (review D-01):
-//   - "ipv4:port" / "host:port"      -> split on the single ':'
-//   - "ipv4" / "host"                -> defaultPort
-//   - "[ipv6]:port"                  -> host = bare ipv6 literal (brackets stripped)
-//   - "[ipv6]"                       -> bare ipv6 literal, defaultPort
-//   - "ipv6" (bare literal, '::1')   -> kept whole, defaultPort (no split)
-// The returned host is always the bare literal/name (no brackets) so it can be fed
-// directly to getaddrinfo.
-std::pair<std::string, uint16_t> SplitServerKey(const std::string& key, uint16_t defaultPort) {
-    // Bracketed IPv6 literal, optionally followed by ":port".
-    if (!key.empty() && key.front() == '[') {
-        const size_t close = key.find(']');
-        if (close != std::string::npos) {
-            const std::string host = key.substr(1, close - 1);
-            // Bare "[ipv6]" with no trailing port.
-            if (close + 1 >= key.size()) {
-                return {host, defaultPort};
-            }
-            if (key[close + 1] == ':') {
-                const std::string portStr = key.substr(close + 2);
-                try {
-                    const int port = std::stoi(portStr);
-                    if (port > 0 && port <= 65535) {
-                        return {host, static_cast<uint16_t>(port)};
-                    }
-                } catch (...) {
-                }
-            }
-            // Malformed trailing data: fall back to the bracketed host on the default port.
-            return {host, defaultPort};
-        }
-    }
-    const size_t colon = key.rfind(':');
-    if (colon == std::string::npos) {
-        return {key, defaultPort};
-    }
-    const std::string portStr = key.substr(colon + 1);
-    // A bare IPv6 literal (multiple ':') without an explicit port should not be split.
-    if (key.find(':') != colon) {
-        return {key, defaultPort};
-    }
-    try {
-        const int port = std::stoi(portStr);
-        if (port > 0 && port <= 65535) {
-            return {key.substr(0, colon), static_cast<uint16_t>(port)};
-        }
-    } catch (...) {
-    }
-    return {key, defaultPort};
 }
 
 // Establish the auxiliary (non-primary) connections of the pool and JOIN them to the
