@@ -67,9 +67,12 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
         return false;
     }
     // Maintenance contract (string-matched throw sites — keep in sync when editing):
-    //   EnsureHandshakeAsClient: "Server error: ...", "Server HELLO missing",
-    //     "Protocol version mismatch: ...", "Server authentication rejected"
-    //   EnsureHandshakeAsServer: "Authentication failed", "Protocol version mismatch: ..."
+    //   NegotiateHelloAsClient / HandshakeClientNew (FC6): "Server error: ...",
+    //     "Server HELLO missing", "Protocol version mismatch: ...",
+    //     "Server authentication rejected"
+    //   HandshakeClientNew / HandshakeClientJoin (FC6 AuthOk role check): "Protocol error: ..."
+    //   HandshakeAndResolveSession (FC6 server): "Authentication failed",
+    //     "Protocol version mismatch: ..."
     //   recv thread (sync_engine.cpp): "client received wrong-direction/unknown frame: ..."
     //   RecvFrame (protocol.cpp): "RecvFrame desync: ..."
     // Future: replace with DisconnectReason enum at throw sites (see sync_util.h).
@@ -84,6 +87,11 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
         return true;
     }
     if (reason.find("Server HELLO missing") != std::string::npos) {
+        return true;
+    }
+    // AuthOk role/sessionId violations (review B-04 / B4-R1: JoinAck sessionId echo check)
+    // — a malformed handshake reply cannot be fixed by retrying the same server.
+    if (reason.find("Protocol error: ") == 0) {
         return true;
     }
     if (reason.find("Server error: ") == 0) {

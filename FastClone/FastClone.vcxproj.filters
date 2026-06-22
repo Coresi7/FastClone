@@ -24,6 +24,9 @@
     <ClInclude Include="hash_memcache.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="net_topology.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="protocol.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -54,6 +57,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="net_topology.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="protocol.cpp">

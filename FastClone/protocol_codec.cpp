@@ -6,6 +6,58 @@
 
 namespace fc {
 
+std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info) {
+    std::vector<uint8_t> payload;
+    payload.push_back(static_cast<uint8_t>(info.role));
+    AppendString(payload, info.sessionId);
+    if (info.serverAddrs.size() > UINT16_MAX) {
+        throw std::runtime_error("AuthOk server address list too long");
+    }
+    AppendU16(payload, static_cast<uint16_t>(info.serverAddrs.size()));
+    for (const AdvertisedEndpoint& addr : info.serverAddrs) {
+        AppendString(payload, addr.endpoint);
+        AppendU16(payload, addr.nicGroup);
+    }
+    return payload;
+}
+
+AuthOkInfo DecodeAuthOk(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    if (payload.empty()) {
+        throw std::runtime_error("AuthOk payload too short");
+    }
+    AuthOkInfo info;
+    const uint8_t roleByte = payload[cursor++];
+    info.role = (roleByte == static_cast<uint8_t>(AuthOkRole::JoinAck))
+                    ? AuthOkRole::JoinAck
+                    : AuthOkRole::NewSession;
+    info.sessionId = ReadString(payload, cursor);
+    const uint16_t addrCount = ReadU16(payload, cursor);
+    info.serverAddrs.reserve(addrCount);
+    for (uint16_t i = 0; i < addrCount; ++i) {
+        AdvertisedEndpoint adv;
+        adv.endpoint = ReadString(payload, cursor);
+        adv.nicGroup = ReadU16(payload, cursor);
+        info.serverAddrs.push_back(std::move(adv));
+    }
+    return info;
+}
+
+std::vector<uint8_t> EncodeSessionJoin(const SessionJoinInfo& info) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, info.sessionId);
+    AppendString(payload, info.password);
+    return payload;
+}
+
+SessionJoinInfo DecodeSessionJoin(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    SessionJoinInfo info;
+    info.sessionId = ReadString(payload, cursor);
+    info.password = ReadString(payload, cursor);
+    return info;
+}
+
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
     std::vector<uint8_t> payload;
     payload.push_back(entry.isDirectory ? 1 : 0);

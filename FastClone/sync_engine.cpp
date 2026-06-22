@@ -2,6 +2,7 @@
 
 #include "file_index.h"
 #include "hash_memcache.h"
+#include "net_topology.h"
 #include "path_utils.h"
 #include "protocol.h"
 #include "protocol_codec.h"
@@ -32,9 +33,11 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -49,7 +52,7 @@ namespace fc {
 
 namespace {
 
-constexpr const char* kProtocolVersion = "FC5";
+constexpr const char* kProtocolVersion = "FC6";
 
 // Schedule the next reconnect attempt after a transient failure (session drop or
 // server-not-ready connect/handshake). Returns the process exit code when the
@@ -201,7 +204,11 @@ void SendSimple(const SocketHandle& socket, MsgType type, const std::string& tex
     SendFrame(socket, frame);
 }
 
-void EnsureHandshakeAsServer(const SocketHandle& socket, const std::string& password) {
+// --- FC6 handshake: version negotiation is shared; session claim differs (design §3, §5) ---
+
+// Server side: exchange Hello and validate the protocol version (FR-018 / AC-013). On
+// mismatch sends Error and throws so the version-reject path is identical to FC5.
+void NegotiateHelloAsServer(const SocketHandle& socket) {
     const Frame hello = RecvFrame(socket);
     if (hello.type != MsgType::Hello) {
         throw std::runtime_error("Expected HELLO");
@@ -212,20 +219,146 @@ void EnsureHandshakeAsServer(const SocketHandle& socket, const std::string& pass
         throw std::runtime_error("Protocol version mismatch: server=" + std::string(kProtocolVersion) + " client=" + clientVersion);
     }
     SendSimple(socket, MsgType::Hello, kProtocolVersion);
-
-    const Frame auth = RecvFrame(socket);
-    if (auth.type != MsgType::Auth) {
-        throw std::runtime_error("Expected AUTH");
-    }
-    const std::string got(reinterpret_cast<const char*>(auth.payload.data()), auth.payload.size());
-    if (got != password) {
-        SendSimple(socket, MsgType::AuthFail, "bad password");
-        throw std::runtime_error("Authentication failed");
-    }
-    SendSimple(socket, MsgType::AuthOk, "ok");
 }
 
-void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& password) {
+// Server-side logical session shared by all connections that carry the same sessionId
+// (FR-003/004). Per D-02 it only carries merge identity + lifecycle, not transfer state.
+struct ServerSession {
+    std::string sessionId;
+    std::atomic<uint32_t> liveConns{0};
+    // Lifecycle field: ALWAYS access under SessionRegistry::mu_ (Create/Join/SweepExpired/
+    // OnConnectionClosed). It is not atomic, so any unlocked access is a data race.
+    std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
+};
+
+// Process-wide registry: sessionId -> session, with idle TTL reclaim (design §5.1/§5.3).
+class SessionRegistry {
+public:
+    // New first connection: mint an unguessable token (NFR-007) and register it with one
+    // live connection already counted for the creating connection.
+    std::shared_ptr<ServerSession> CreateSession() {
+        auto session = std::make_shared<ServerSession>();
+        session->sessionId = GenerateSessionToken();
+        session->liveConns.store(1, std::memory_order_relaxed);
+        session->lastActivity = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mu_);
+        byId_.emplace(session->sessionId, session);
+        return session;
+    }
+
+    // Follow-up connection: look up an existing session and count this connection.
+    // Returns nullptr if the id is unknown (reclaimed / forged).
+    std::shared_ptr<ServerSession> Join(const std::string& sessionId) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = byId_.find(sessionId);
+        if (it == byId_.end()) {
+            return nullptr;
+        }
+        it->second->liveConns.fetch_add(1, std::memory_order_relaxed);
+        it->second->lastActivity = std::chrono::steady_clock::now();
+        return it->second;
+    }
+
+    void OnConnectionClosed(const std::shared_ptr<ServerSession>& session) {
+        if (!session) {
+            return;
+        }
+        // lastActivity must only ever be touched under mu_ (it is read/written by Join /
+        // SweepExpired under the same lock). Updating it here without the lock raced with
+        // those paths from connection-close threads (review B-02), so take mu_ as well.
+        std::lock_guard<std::mutex> lock(mu_);
+        if (session->liveConns.load(std::memory_order_relaxed) > 0) {
+            session->liveConns.fetch_sub(1, std::memory_order_relaxed);
+        }
+        session->lastActivity = std::chrono::steady_clock::now();
+    }
+
+    // Event-driven reclaim (D-03): drop sessions with no live connection that have been
+    // idle past the TTL. Never reclaims while liveConns > 0 (FR-004).
+    void SweepExpired() {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto it = byId_.begin(); it != byId_.end();) {
+            const bool idle = it->second->liveConns.load(std::memory_order_relaxed) == 0;
+            const bool expired = (now - it->second->lastActivity) > kSessionIdleTtl;
+            if (idle && expired) {
+                it = byId_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    size_t SessionCount() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return byId_.size();
+    }
+
+private:
+    static constexpr std::chrono::seconds kSessionIdleTtl{60};  // gatekeeper default
+    std::mutex mu_;
+    std::unordered_map<std::string, std::shared_ptr<ServerSession>> byId_;
+};
+
+SessionRegistry& GetSessionRegistry() {
+    static SessionRegistry registry;
+    return registry;
+}
+
+// Full server handshake: Hello negotiation + session claim (Auth=new / SessionJoin=join).
+// On success returns the resolved session (with this connection already counted in
+// liveConns); the caller must call OnConnectionClosed exactly once. Throws on rejection.
+std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& socket,
+                                                          const std::string& password,
+                                                          const std::vector<AdvertisedEndpoint>& serverAddrs) {
+    NegotiateHelloAsServer(socket);
+    const Frame claim = RecvFrame(socket);
+    if (claim.type == MsgType::Auth) {
+        const std::string got(reinterpret_cast<const char*>(claim.payload.data()), claim.payload.size());
+        if (got != password) {
+            SendSimple(socket, MsgType::AuthFail, "bad password");
+            throw std::runtime_error("Authentication failed");
+        }
+        std::shared_ptr<ServerSession> session = GetSessionRegistry().CreateSession();
+        AuthOkInfo info;
+        info.role = AuthOkRole::NewSession;
+        info.sessionId = session->sessionId;
+        info.serverAddrs = serverAddrs;
+        try {
+            SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
+        } catch (...) {
+            GetSessionRegistry().OnConnectionClosed(session);
+            throw;
+        }
+        return session;
+    }
+    if (claim.type == MsgType::SessionJoin) {
+        const SessionJoinInfo join = DecodeSessionJoin(claim.payload);
+        if (join.password != password) {
+            SendSimple(socket, MsgType::AuthFail, "bad password");
+            throw std::runtime_error("Authentication failed");
+        }
+        std::shared_ptr<ServerSession> session = GetSessionRegistry().Join(join.sessionId);
+        if (!session) {
+            SendSimple(socket, MsgType::AuthFail, "unknown or expired session");
+            throw std::runtime_error("SessionJoin for unknown session");
+        }
+        AuthOkInfo info;
+        info.role = AuthOkRole::JoinAck;
+        info.sessionId = session->sessionId;
+        try {
+            SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
+        } catch (...) {
+            GetSessionRegistry().OnConnectionClosed(session);
+            throw;
+        }
+        return session;
+    }
+    throw std::runtime_error("Expected AUTH or SessionJoin");
+}
+
+// Client side: Hello negotiation (FR-018 / AC-013). Throws on mismatch / server error.
+void NegotiateHelloAsClient(const SocketHandle& socket) {
     SendSimple(socket, MsgType::Hello, kProtocolVersion);
     Frame helloBack = RecvFrame(socket);
     if (helloBack.type == MsgType::Error) {
@@ -239,10 +372,62 @@ void EnsureHandshakeAsClient(const SocketHandle& socket, const std::string& pass
     if (serverVersion != kProtocolVersion) {
         throw std::runtime_error("Protocol version mismatch: client=" + std::string(kProtocolVersion) + " server=" + serverVersion);
     }
+}
+
+// Client first connection: Hello -> Auth -> AuthOk(NewSession). Returns the session
+// identity + server-advertised endpoint list (design §3.2 / FR-003/005/017).
+AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password) {
+    NegotiateHelloAsClient(socket);
     SendSimple(socket, MsgType::Auth, password);
     Frame authResult = RecvFrame(socket);
     if (authResult.type != MsgType::AuthOk) {
-        throw std::runtime_error("Server authentication rejected");
+        const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
+        throw std::runtime_error("Server authentication rejected: " + payload);
+    }
+    AuthOkInfo info = DecodeAuthOk(authResult.payload);
+    // The first connection must receive a NewSession AuthOk carrying a session id; any
+    // other role (or an empty id) is a non-retryable protocol violation (review B-04).
+    if (info.role != AuthOkRole::NewSession) {
+        throw std::runtime_error(
+            "Protocol error: expected AuthOk role NewSession on first connection, got JoinAck");
+    }
+    if (info.sessionId.empty()) {
+        throw std::runtime_error("Protocol error: AuthOk(NewSession) carried an empty sessionId");
+    }
+    return info;
+}
+
+// Client follow-up connection: Hello -> SessionJoin(sessionId,pwd) -> AuthOk(JoinAck).
+void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
+                         const std::string& sessionId) {
+    NegotiateHelloAsClient(socket);
+    SessionJoinInfo join;
+    join.sessionId = sessionId;
+    join.password = password;
+    SendFrame(socket, Frame{MsgType::SessionJoin, 0, EncodeSessionJoin(join)});
+    Frame authResult = RecvFrame(socket);
+    if (authResult.type != MsgType::AuthOk) {
+        const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
+        throw std::runtime_error("Server rejected session join: " + payload);
+    }
+    // A follow-up connection must be acknowledged with role JoinAck; receiving NewSession
+    // here means the server treated us as a brand-new session and the lane cannot be joined
+    // to the pool. Non-retryable protocol violation (review B-04).
+    const AuthOkInfo info = DecodeAuthOk(authResult.payload);
+    if (info.role != AuthOkRole::JoinAck) {
+        throw std::runtime_error(
+            "Protocol error: expected AuthOk role JoinAck on session join, got NewSession");
+    }
+    // The JoinAck must echo back the session id we asked to join. An empty id, or one that
+    // does not match our request, means the lane is not bound to the intended session pool
+    // (a misrouted/buggy server reply). Non-retryable protocol violation (review B-04 / B4-R1).
+    if (info.sessionId.empty()) {
+        throw std::runtime_error("Protocol error: AuthOk(JoinAck) carried an empty sessionId");
+    }
+    if (info.sessionId != sessionId) {
+        throw std::runtime_error(
+            "Protocol error: AuthOk(JoinAck) sessionId mismatch, requested=" + sessionId +
+            " got=" + info.sessionId);
     }
 }
 
@@ -980,8 +1165,10 @@ ServerHashMemCache& GetServerHashMemCache() {
     return cache;
 }
 
+// Per-connection session server. The FC6 handshake + session merge has already been
+// performed by the caller (HandshakeAndResolveSession); this body is unchanged from the
+// single-connection model and runs independently per connection (D-02).
 void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
-    EnsureHandshakeAsServer(client, options.password);
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
     const bool hashMemcacheEnabled = GetServerHashMemCache().Enabled();
@@ -1650,6 +1837,242 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     }
 }
 
+// One client-side transport connection in the multipath pool (design §4.2). connId 0 is
+// the primary link. Non-copyable/non-movable (atomics + thread); held via unique_ptr.
+struct ClientConnection {
+    uint32_t connId = 0;
+    SocketHandle socket;
+    std::string localBind;            // source IP / iface bound (diagnostics)
+    std::string serverAddr;           // "host:port" of the peer
+    bool isPrimary = false;
+    uint32_t nextStreamId = 1;        // per-connection streamId space (main-loop only)
+    std::atomic<uint64_t> bytesRecv{0};   // recvThread writes; throughput sampling
+    uint64_t lastBytesRecvSample = 0; // main-loop only (EWMA delta base)
+    double ewmaThroughput = 0.0;      // bytes/sec, main-loop only (FR-014 weight)
+    std::atomic<bool> healthy{true};
+    std::string downReason;          // recvThread failure cause (set once on failure)
+    size_t inFlight = 0;             // active streams on this connection (main-loop only)
+    bool drained = false;            // failover requeue already performed
+    std::thread recvThread;
+};
+
+// A connection successfully established + joined to the session, returned by the
+// auxiliary-connection establishment helper for the caller to wrap into the pool.
+struct EstablishedLink {
+    SocketHandle socket;
+    std::string localBind;
+    std::string serverAddr;
+};
+
+// Heuristic: a textual local endpoint is a source IP if it looks like a numeric address
+// (contains '.' for IPv4 or ':' for IPv6); otherwise it is an interface name (design §6.5).
+ConnectBinding BindingFromLocal(const std::string& local) {
+    ConnectBinding binding;
+    if (local.empty()) {
+        return binding;
+    }
+    if (local.find('.') != std::string::npos || local.find(':') != std::string::npos) {
+        binding.localAddr = local;
+    } else {
+        binding.ifaceName = local;
+    }
+    return binding;
+}
+
+// Parse "host:port" into host + port. Supported forms (review D-01):
+//   - "ipv4:port" / "host:port"      -> split on the single ':'
+//   - "ipv4" / "host"                -> defaultPort
+//   - "[ipv6]:port"                  -> host = bare ipv6 literal (brackets stripped)
+//   - "[ipv6]"                       -> bare ipv6 literal, defaultPort
+//   - "ipv6" (bare literal, '::1')   -> kept whole, defaultPort (no split)
+// The returned host is always the bare literal/name (no brackets) so it can be fed
+// directly to getaddrinfo.
+std::pair<std::string, uint16_t> SplitServerKey(const std::string& key, uint16_t defaultPort) {
+    // Bracketed IPv6 literal, optionally followed by ":port".
+    if (!key.empty() && key.front() == '[') {
+        const size_t close = key.find(']');
+        if (close != std::string::npos) {
+            const std::string host = key.substr(1, close - 1);
+            // Bare "[ipv6]" with no trailing port.
+            if (close + 1 >= key.size()) {
+                return {host, defaultPort};
+            }
+            if (key[close + 1] == ':') {
+                const std::string portStr = key.substr(close + 2);
+                try {
+                    const int port = std::stoi(portStr);
+                    if (port > 0 && port <= 65535) {
+                        return {host, static_cast<uint16_t>(port)};
+                    }
+                } catch (...) {
+                }
+            }
+            // Malformed trailing data: fall back to the bracketed host on the default port.
+            return {host, defaultPort};
+        }
+    }
+    const size_t colon = key.rfind(':');
+    if (colon == std::string::npos) {
+        return {key, defaultPort};
+    }
+    const std::string portStr = key.substr(colon + 1);
+    // A bare IPv6 literal (multiple ':') without an explicit port should not be split.
+    if (key.find(':') != colon) {
+        return {key, defaultPort};
+    }
+    try {
+        const int port = std::stoi(portStr);
+        if (port > 0 && port <= 65535) {
+            return {key.substr(0, colon), static_cast<uint16_t>(port)};
+        }
+    } catch (...) {
+    }
+    return {key, defaultPort};
+}
+
+// Establish the auxiliary (non-primary) connections of the pool and JOIN them to the
+// session (design §6, FR-005/007/008/009). Best-effort: a failed lane is skipped, never
+// fatal (FR-016 / NFR-002). The primary lane (already connected) is excluded via
+// primaryServerKey. Explicit --link pins bypass automatic selection (FR-008 / AC-005).
+std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& options,
+                                                           const std::string& sessionId,
+                                                           const std::string& primaryServerKey,
+                                                           const std::string& primaryLocal,
+                                                           const std::string& primaryActualLocal,
+                                                           const AuthOkInfo& authInfo,
+                                                           bool debugEnabled) {
+    std::vector<EstablishedLink> links;
+    const size_t maxAux = (options.maxConnections > 0) ? (options.maxConnections - 1) : 0;
+    if (maxAux == 0) {
+        return links;
+    }
+
+    struct Plan {
+        std::string local;
+        std::string host;
+        uint16_t port = 0;
+    };
+    std::vector<Plan> plans;
+
+    // NIC lookup table for debug logging: ip → LocalAddress (friendlyName, ifaceKey).
+    // Populated lazily only when debug output is enabled.
+    std::unordered_map<std::string, LocalAddress> nicLookup;
+    if (debugEnabled) {
+        for (const LocalAddress& c : EnumerateLocalCandidates()) {
+            nicLookup.emplace(c.ip, c);
+        }
+    }
+
+    if (!options.linkPins.empty()) {
+        // Explicit mode: pins[0] is the primary (already up); the rest are auxiliaries.
+        for (size_t i = 1; i < options.linkPins.size(); ++i) {
+            plans.push_back(Plan{options.linkPins[i].local, options.linkPins[i].server,
+                                 options.linkPins[i].port});
+        }
+    } else {
+        // Automatic mode: server endpoint set = CLI servers + server-advertised addrs.
+        // CLI endpoints have no NIC group (unknown); advertised endpoints carry the server's
+        // physical-NIC group as "g<n>". When an advertised endpoint matches a CLI entry
+        // (e.g. --server 30.29.53.25 == the primary), backfill the real group onto it so the
+        // primary lane's server endpoint resolves to its true NIC for dedup (L-r6-01 / §7.1).
+        std::vector<ServerEndpoint> serverEndpoints;
+        std::unordered_map<std::string, size_t> serverIndex;  // "host:port" -> index
+        auto addServer = [&](const std::string& host, uint16_t port, const std::string& nicGroup) {
+            const std::string key = host + ":" + std::to_string(port);
+            auto it = serverIndex.find(key);
+            if (it == serverIndex.end()) {
+                serverIndex.emplace(key, serverEndpoints.size());
+                serverEndpoints.push_back(ServerEndpoint{host, port, nicGroup});
+            } else if (!nicGroup.empty() && serverEndpoints[it->second].nicGroup.empty()) {
+                serverEndpoints[it->second].nicGroup = nicGroup;
+            }
+        };
+        for (const auto& ep : options.servers) {
+            addServer(ep.first, ep.second, std::string());
+        }
+        for (const AdvertisedEndpoint& adv : authInfo.serverAddrs) {
+            const auto hp = SplitServerKey(adv.endpoint, options.port);
+            addServer(hp.first, hp.second, "g" + std::to_string(adv.nicGroup));
+        }
+        // Use probe-filtered candidates: deprecated and temporary/privacy IPv6 are
+        // excluded, and at most one stable address per (NIC, family) is kept, reducing
+        // the probe count from ~60 to a small constant on machines with many deprecated
+        // or privacy-extension IPv6 addresses.
+        std::vector<LocalAddress> localCands = EnumerateProbeCandidates();
+        // Only probe when there is genuine topology to exploit; otherwise stay single-link
+        // (degenerate == FC5 behavior, FR-020-adjacent).
+        if (serverEndpoints.size() > 1 || localCands.size() > 1) {
+            const ReachabilityMatrix matrix = ProbeReachability(localCands, serverEndpoints);
+            // Seed the heuristic with the primary's REAL source IP (resolved via
+            // getsockname when it used the OS default route), mapped to its physical NIC,
+            // plus its server endpoint, so the primary participates in same-NIC + same-side
+            // dedup and auxiliaries cannot open a second connection on the primary's NIC
+            // (FR-009 / review B-01).
+            const std::string primaryDedupLocal =
+                !primaryActualLocal.empty() ? primaryActualLocal : primaryLocal;
+            const std::string primaryIface = InterfaceKeyForLocalAddress(primaryDedupLocal);
+            // Fall back to the IP literal as the seed key when the primary's source IP is
+            // not on an enumerable NIC (still blocks the server endpoint via primaryServerKey).
+            const std::string primaryDedupIface =
+                !primaryIface.empty() ? primaryIface : primaryDedupLocal;
+            const std::vector<LinkPlan> auto_ =
+                SelectAutoLinks(matrix, options.maxConnections, primaryDedupIface, primaryServerKey);
+            for (const LinkPlan& lp : auto_) {
+                plans.push_back(Plan{lp.localAddr, lp.serverHost, lp.serverPort});
+            }
+        }
+    }
+
+    std::set<std::string> establishedKeys;
+    establishedKeys.insert(primaryLocal + "=>" + primaryServerKey);
+    if (!primaryActualLocal.empty()) {
+        establishedKeys.insert(primaryActualLocal + "=>" + primaryServerKey);
+    }
+    for (const Plan& plan : plans) {
+        if (links.size() >= maxAux) {
+            break;
+        }
+        const std::string serverKey = plan.host + ":" + std::to_string(plan.port);
+        const std::string laneKey = plan.local + "=>" + serverKey;
+        if (!establishedKeys.insert(laneKey).second) {
+            continue;  // duplicate lane (incl. the primary) -> skip
+        }
+        try {
+            SocketHandle aux = ConnectTo(plan.host, plan.port, BindingFromLocal(plan.local));
+            HandshakeClientJoin(aux, options.password, sessionId);
+            EstablishedLink link;
+            link.socket = std::move(aux);
+            link.localBind = plan.local;
+            link.serverAddr = serverKey;
+            links.push_back(std::move(link));
+            if (debugEnabled) {
+                std::cout << "[mp] conn_join connId=" << links.size()
+                          << " sessionId=" << sessionId << " local=" << plan.local
+                          << " server=" << serverKey << " primary=0" << std::endl;
+            }
+            if (debugEnabled) {
+                const auto nicIt = nicLookup.find(plan.local);
+                const std::string& nicName =
+                    (nicIt != nicLookup.end()) ? nicIt->second.friendlyName : std::string();
+                const std::string& ifaceKey =
+                    (nicIt != nicLookup.end()) ? nicIt->second.ifaceKey : std::string();
+                std::cerr << "[mp][debug] conn_join_nic connId=" << links.size()
+                          << " nic=\"" << nicName << "\""
+                          << " ifaceKey=" << ifaceKey
+                          << " local=" << plan.local
+                          << " server=" << serverKey << std::endl;
+            }
+        } catch (const std::exception& ex) {
+            if (debugEnabled) {
+                std::cerr << "[mp] conn_join_failed local=" << plan.local
+                          << " server=" << serverKey << " reason=\"" << ex.what() << "\""
+                          << std::endl;
+            }
+        }
+    }
+    return links;
+}
+
 struct DownloadState {
     std::ofstream output;
     std::string relPath;
@@ -1685,6 +2108,7 @@ void PrintClientCounters(size_t enumerated,
                          size_t failed,
                          size_t transferred,
                          size_t deleted,
+                         size_t connections,
                          size_t& lastEnumerated,
                          size_t& lastCompared,
                          size_t& lastUnchanged,
@@ -1719,7 +2143,7 @@ void PrintClientCounters(size_t enumerated,
               << "  Unchanged: " << unchanged
               << "  Failed: " << failed
               << "  Transfered: " << transferred
-              << "  Deleted: " << deleted
+              << "  Connections: " << connections
               << std::endl;
 }
 
@@ -1742,21 +2166,78 @@ int RunServer(const CliOptions& options) {
                   << std::endl;
     }
     SocketHandle listener = CreateServer(options.port);
-    std::atomic<uint64_t> sessionIdCounter{0};
+
+    // Collect the server's advertised endpoint list once at startup (FR-005 / §6.1, r6 §6.1).
+    // Sent to the first connection in AuthOk so the client can extend the connection pool.
+    // Each endpoint carries a dense per-physical-NIC group: all addresses of one adapter
+    // (its IPv4 + IPv6) share one group, letting the client dedup by server NIC (L-r6-01).
+    std::vector<AdvertisedEndpoint> serverAddrs;
+    {
+        std::unordered_map<std::string, uint16_t> ifaceToGroup;  // adapter key -> dense group id
+        uint16_t nextGroup = 0;
+        for (const LocalAddress& cand : EnumerateLocalCandidates()) {
+            // IPv6 literals contain ':' and must be bracketed so the host/port split on the
+            // client side is unambiguous: "[ipv6]:port" vs the bare IPv4 "ip:port" (review D-01).
+            const bool isIpv6 = cand.ip.find(':') != std::string::npos;
+            const std::string endpoint = isIpv6
+                                             ? "[" + cand.ip + "]:" + std::to_string(options.port)
+                                             : cand.ip + ":" + std::to_string(options.port);
+            // Group by the physical-interface key; addresses with no key (rare) each get a
+            // distinct group so they are never falsely merged onto one NIC.
+            const std::string groupKey =
+                !cand.ifaceKey.empty() ? cand.ifaceKey : ("addr:" + cand.ip);
+            auto it = ifaceToGroup.find(groupKey);
+            if (it == ifaceToGroup.end()) {
+                it = ifaceToGroup.emplace(groupKey, nextGroup++).first;
+            }
+            serverAddrs.push_back(AdvertisedEndpoint{endpoint, it->second});
+        }
+    }
+    std::cout << "[mp] advertised_endpoints=" << serverAddrs.size() << std::endl;
+
+    const bool debugEnabled = IsDebugEnabled();
+    std::atomic<uint64_t> connIdCounter{0};
     std::atomic<uint32_t> activeSessions{0};
     while (true) {
-        std::cout << "Waiting for client... active_sessions=" << activeSessions.load() << std::endl;
+        std::cout << "Waiting for client... active_connections=" << activeSessions.load()
+                  << " sessions=" << GetSessionRegistry().SessionCount() << std::endl;
         SocketHandle client = AcceptClient(listener);
-        const uint64_t sessionId = sessionIdCounter.fetch_add(1) + 1;
+        const uint64_t connSeq = connIdCounter.fetch_add(1) + 1;
         activeSessions.fetch_add(1);
-        std::thread([sessionId, &activeSessions, options, client = std::move(client)]() mutable {
+        std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
+                     client = std::move(client)]() mutable {
+            std::shared_ptr<ServerSession> session;
             try {
-                std::cout << "Session#" << sessionId << " started" << std::endl;
+                session = HandshakeAndResolveSession(client, options.password, serverAddrs);
+                std::cout << "[mp] conn_accept conn=" << connSeq
+                          << " sessionId=" << session->sessionId
+                          << " live_conns=" << session->liveConns.load() << std::endl;
                 RunSessionServer(client, options);
-                std::cout << "Session#" << sessionId << " completed" << std::endl;
+                std::cout << "[mp] conn_done conn=" << connSeq
+                          << " sessionId=" << session->sessionId << std::endl;
             } catch (const std::exception& ex) {
-                std::cerr << "Session#" << sessionId << " error: " << ex.what() << std::endl;
+                // Distinguish pre-handshake close (reachability probe: client connects
+                // then immediately closes before sending any bytes → recv returns 0,
+                // WSA=0 / errno=0) from a real session error. Pre-handshake closes are
+                // benign; suppress [mp] conn_error noise and demote to debug.
+                const bool preHandshake = (session == nullptr);
+                const std::string errMsg = ex.what();
+                const bool isCleanClose =
+                    errMsg.find("recv failed WSA=0") != std::string::npos ||
+                    errMsg.find("recv failed errno=0") != std::string::npos;
+                if (preHandshake && isCleanClose) {
+                    if (debugEnabled) {
+                        std::cerr << "[mp][debug] probe_or_preauth_close conn=" << connSeq
+                                  << std::endl;
+                    }
+                } else {
+                    std::cerr << "[mp] conn_error conn=" << connSeq << " error: " << errMsg
+                              << std::endl;
+                }
             }
+            // Release this connection's session count and run the event-driven TTL sweep.
+            GetSessionRegistry().OnConnectionClosed(session);
+            GetSessionRegistry().SweepExpired();
             activeSessions.fetch_sub(1);
         }).detach();
     }
@@ -1828,10 +2309,71 @@ int RunClient(const CliOptions& options) {
     // ConnectTo + handshake failures (server not ready) reuse the same reconnect budget
     // as mid-session drops; see ScheduleClientReconnectOrExit().
     while (true) {
-    SocketHandle socket;
+    // Multipath connection pool (design §4.2). pool[0] is the primary link.
+    std::vector<std::unique_ptr<ClientConnection>> pool;
+    std::string sessionId;
     try {
-        socket = ConnectTo(options.host, options.port);
-        EnsureHandshakeAsClient(socket, options.password);
+        // Primary lane + new-session handshake. Explicit mode: linkPins[0] is the primary
+        // (FR-002). Otherwise servers[0] with the OS-default source route.
+        ConnectBinding primaryBinding;
+        std::string primaryHost = options.host;
+        uint16_t primaryPort = options.port;
+        std::string primaryLocal;
+        if (!options.linkPins.empty()) {
+            primaryLocal = options.linkPins.front().local;
+            primaryBinding = BindingFromLocal(primaryLocal);
+            primaryHost = options.linkPins.front().server;
+            primaryPort = options.linkPins.front().port;
+        }
+        SocketHandle primarySocket = ConnectTo(primaryHost, primaryPort, primaryBinding);
+        const AuthOkInfo authInfo = HandshakeClientNew(primarySocket, options.password);
+        sessionId = authInfo.sessionId;
+
+        auto primaryConn = std::make_unique<ClientConnection>();
+        primaryConn->connId = 0;
+        primaryConn->socket = std::move(primarySocket);
+        primaryConn->localBind = primaryLocal;
+        primaryConn->serverAddr = primaryHost + ":" + std::to_string(primaryPort);
+        primaryConn->isPrimary = true;
+        pool.push_back(std::move(primaryConn));
+        if (debugEnabled) {
+            std::cout << "[mp] conn_join connId=0 sessionId=" << sessionId
+                      << " local=" << primaryLocal << " server=" << pool[0]->serverAddr
+                      << " primary=1" << std::endl;
+        }
+
+        // Resolve the primary's REAL bound source IP so it joins same-side dedup even when
+        // it was connected via the OS default route with no explicit bind (review B-01).
+        const std::string primaryActualLocal = LocalAddressOf(pool[0]->socket);
+        if (debugEnabled) {
+            const std::string& lookupIp =
+                !primaryActualLocal.empty() ? primaryActualLocal : primaryLocal;
+            if (!lookupIp.empty()) {
+                for (const LocalAddress& c : EnumerateLocalCandidates()) {
+                    if (c.ip == lookupIp) {
+                        std::cerr << "[mp][debug] conn_join_nic connId=0"
+                                  << " nic=\"" << c.friendlyName << "\""
+                                  << " ifaceKey=" << c.ifaceKey
+                                  << " local=" << lookupIp
+                                  << " server=" << pool[0]->serverAddr << std::endl;
+                        break;
+                    }
+                }
+            }
+        }
+        // Auxiliary lanes (best-effort; a failed lane is skipped, FR-016 / NFR-002).
+        std::vector<EstablishedLink> auxLinks = EstablishAuxiliaryConnections(
+            options, sessionId, pool[0]->serverAddr, primaryLocal, primaryActualLocal,
+            authInfo, debugEnabled);
+        for (auto& link : auxLinks) {
+            auto conn = std::make_unique<ClientConnection>();
+            conn->connId = static_cast<uint32_t>(pool.size());
+            conn->socket = std::move(link.socket);
+            conn->localBind = link.localBind;
+            conn->serverAddr = link.serverAddr;
+            conn->isPrimary = false;
+            pool.push_back(std::move(conn));
+        }
     } catch (const std::exception& ex) {
         const std::string connectReason = ex.what();
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
@@ -1844,6 +2386,10 @@ int RunClient(const CliOptions& options) {
         }
         continue;
     }
+    ClientConnection& primary = *pool[0];
+    if (debugEnabled) {
+        std::cout << "[mp] pool_size=" << pool.size() << " sessionId=" << sessionId << std::endl;
+    }
     if (options.streamAutoTune || options.chunkAutoTune) {
         std::cout << "[auto-tune] streams=" << streamLimit
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
@@ -1855,12 +2401,44 @@ int RunClient(const CliOptions& options) {
                   << std::endl;
     }
 
-    SendFrame(socket, Frame{MsgType::ManifestRequest, 0, {}});
+    // Manifest is requested only on the primary link (design §7.5): the server enumerates
+    // and streams the manifest on the first connection; auxiliary lanes carry file data only.
+    // A peer reset between the handshake and this request (mid-session drop, e.g. server
+    // killed) must not be fatal: no manifest was received, so honor the reconnect budget and
+    // otherwise exit 3 exactly like the post-loop incomplete-manifest gate (FR-016 / AC-012,
+    // IT-3). This send precedes the recv threads / failover machinery, so it is handled here.
+    try {
+        SendFrame(primary.socket, Frame{MsgType::ManifestRequest, 0, {}});
+    } catch (const std::exception& ex) {
+        for (auto& cptr : pool) {
+            ShutdownBoth(cptr->socket);
+        }
+        std::cout << "Sync aborted (incomplete manifest). changed_files=0 failed_files=0"
+                  << " enumerated=0 elapsed=" << formatElapsed() << std::endl;
+        if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
+                ex.what(), options.reconnectRetries, options.reconnectWindowMs,
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/3)) {
+            return *exitCode;
+        }
+        continue;
+    }
     std::unordered_map<std::string, FileEntry> remoteFiles;
     std::unordered_set<std::string> remoteDirs;
-    std::unordered_map<uint32_t, DownloadState> activeDownloads;
-    std::unordered_map<uint32_t, BatchDownloadState> activeBatchDownloads;
-    std::unordered_map<uint32_t, std::string> streamToPath;
+    // Transfer state is keyed by a composite (connId, streamId) so each lane has an
+    // independent streamId space and frames never collide across connections (design §7.5).
+    // Invariant: connId and streamId each occupy a disjoint 32-bit half of the 64-bit key.
+    // connId is sourced from a uint32_t connection counter and streamId from a uint32_t
+    // stream counter, so neither can overflow its half today. The static_assert pins the
+    // parameter widths so a future widening of either id (e.g. to uint64_t) fails to
+    // compile here rather than silently aliasing keys across lanes (review S-03).
+    auto streamKey = [](uint32_t connId, uint32_t streamId) -> uint64_t {
+        static_assert(sizeof(connId) * 8 + sizeof(streamId) * 8 <= 64,
+                      "streamKey requires connId+streamId to fit in 64 bits without aliasing");
+        return (static_cast<uint64_t>(connId) << 32) | static_cast<uint64_t>(streamId);
+    };
+    std::unordered_map<uint64_t, DownloadState> activeDownloads;
+    std::unordered_map<uint64_t, BatchDownloadState> activeBatchDownloads;
+    std::unordered_map<uint64_t, std::string> streamToPath;
     std::deque<std::string> pendingTransfers;
     std::deque<std::string> pendingBatchTransfers;
     std::deque<std::string> pendingRetryTransfers;
@@ -1982,7 +2560,6 @@ int RunClient(const CliOptions& options) {
     }
 
     bool manifestDone = false;
-    uint32_t nextStreamId = 1;
     std::deque<FileEntry> delayedCompareEntries;
 
     size_t enumerated = 0;
@@ -2052,10 +2629,16 @@ int RunClient(const CliOptions& options) {
         reservedEntryCapacity = newCapacity;
     };
 
+    // Incoming frames carry their originating connId so the main loop can demux transfer
+    // streams per connection (design §7.5). All lanes share one queue + worker pool.
+    struct IncomingFrame {
+        uint32_t connId = 0;
+        Frame frame;
+    };
     std::mutex incomingMu;
     std::condition_variable incomingDataCv;
-    std::deque<Frame> incomingPriorityFrames;
-    std::deque<Frame> incomingManifestFrames;
+    std::deque<IncomingFrame> incomingPriorityFrames;
+    std::deque<IncomingFrame> incomingManifestFrames;
     uint64_t incomingQueuedBytes = 0;
     const uint64_t incomingSoftLimitBytes = std::max<uint64_t>(256ULL * 1024ULL * 1024ULL, options.queuedFileSizeBytes);
     // Upper bound on bytes buffered in flight by the async write pool (received but not
@@ -2092,101 +2675,97 @@ int RunClient(const CliOptions& options) {
         }
         std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
     };
-    std::thread recvThread([&]() {
-        // Manifest frames are tiny and arrive in a continuous flood; pushing each one
-        // under incomingMu (with a notify) made the receiver monopolise the lock and
-        // starve the single consumer (main loop), capping enumeration throughput.
-        // Accumulate manifest frames locally and hand them off in batches under ONE
-        // lock + one notify. Priority frames (file/hash traffic) are still flushed
-        // immediately to keep transfer latency low.
-        constexpr size_t kRecvManifestBatchFrames = 1024;
-        constexpr uint64_t kRecvManifestBatchBytes = 4ULL * 1024ULL * 1024ULL;
-        std::vector<Frame> manifestBatch;
-        manifestBatch.reserve(kRecvManifestBatchFrames);
-        uint64_t manifestBatchBytes = 0;
-        try {
-            auto flushManifestBatch = [&]() {
-                if (manifestBatch.empty()) {
-                    return;
-                }
-                uint64_t queuedBytesSnapshot = 0;
-                {
-                    std::lock_guard<std::mutex> lock(incomingMu);
-                    for (Frame& mf : manifestBatch) {
-                        incomingManifestFrames.push_back(std::move(mf));
+    // Per-connection receiver (design §7.5). One thread per lane, all feeding the SAME
+    // shared incoming queues + worker pool. Frames are tagged with the lane's connId so
+    // the main loop can demux transfer streams. On failure the lane is marked unhealthy
+    // (failover is decided by the main loop); recvClosed is only set when ALL lanes die.
+    auto startRecvThread = [&](ClientConnection* conn) {
+        conn->recvThread = std::thread([&, conn]() {
+            constexpr size_t kRecvManifestBatchFrames = 1024;
+            constexpr uint64_t kRecvManifestBatchBytes = 4ULL * 1024ULL * 1024ULL;
+            std::vector<IncomingFrame> manifestBatch;
+            manifestBatch.reserve(kRecvManifestBatchFrames);
+            uint64_t manifestBatchBytes = 0;
+            try {
+                auto flushManifestBatch = [&]() {
+                    if (manifestBatch.empty()) {
+                        return;
                     }
-                    incomingQueuedBytes += manifestBatchBytes;
-                    queuedBytesSnapshot = incomingQueuedBytes;
-                }
-                incomingDataCv.notify_one();
-                manifestBatch.clear();
-                manifestBatchBytes = 0;
-                applyRecvBackpressure(queuedBytesSnapshot);
-            };
-
-            while (!recvStop.load()) {
-                Frame f = RecvFrame(socket);
-                // Direction guard (desync diagnostics): the server must only ever send the
-                // response/stream frame types below. Receiving anything else (e.g. a
-                // client->server request type, a handshake type, or Error) means the byte
-                // stream is misaligned or the peer is misbehaving. Detect it HERE, in wire
-                // order, with the per-thread recent-frame history -- this is strictly more
-                // informative than the later main-thread "unexpected frame" throw, because
-                // the priority/manifest split reorders frames before the main loop sees them.
-                switch (f.type) {
-                    case MsgType::ManifestEntry:
-                    case MsgType::ManifestProgress:
-                    case MsgType::ManifestEnd:
-                    case MsgType::HashResponse:
-                    case MsgType::FileChunk:
-                    case MsgType::FileEnd:
-                    case MsgType::FileError:
-                    case MsgType::FileBatchOpen:
-                    case MsgType::FileBatchChunk:
-                    case MsgType::FileBatchEnd:
-                        break;  // legitimately server -> client
-                    default: {
-                        std::ostringstream os;
-                        os << "client received wrong-direction/unknown frame: type="
-                           << static_cast<int>(static_cast<uint8_t>(f.type)) << " ("
-                           << MsgTypeName(static_cast<uint8_t>(f.type)) << ") streamId="
-                           << f.streamId << " payloadLen=" << f.payload.size() << " "
-                           << DescribeRecentFrames();
-                        throw std::runtime_error(os.str());
-                    }
-                }
-                if (isManifestFrame(f.type)) {
-                    const bool forceFlush = (f.type == MsgType::ManifestEnd);
-                    manifestBatchBytes += frameWireBytes(f);
-                    manifestBatch.push_back(std::move(f));
-                    if (forceFlush || manifestBatch.size() >= kRecvManifestBatchFrames ||
-                        manifestBatchBytes >= kRecvManifestBatchBytes) {
-                        flushManifestBatch();
-                    }
-                } else {
-                    // Keep any buffered manifest frames ahead of nothing in particular,
-                    // but flush them first so queue accounting stays monotonic, then
-                    // push the priority frame immediately.
-                    flushManifestBatch();
                     uint64_t queuedBytesSnapshot = 0;
                     {
                         std::lock_guard<std::mutex> lock(incomingMu);
-                        incomingPriorityFrames.push_back(std::move(f));
-                        incomingQueuedBytes += frameWireBytes(incomingPriorityFrames.back());
+                        for (IncomingFrame& mf : manifestBatch) {
+                            incomingManifestFrames.push_back(std::move(mf));
+                        }
+                        incomingQueuedBytes += manifestBatchBytes;
                         queuedBytesSnapshot = incomingQueuedBytes;
                     }
                     incomingDataCv.notify_one();
+                    manifestBatch.clear();
+                    manifestBatchBytes = 0;
                     applyRecvBackpressure(queuedBytesSnapshot);
+                };
+
+                while (!recvStop.load()) {
+                    Frame f = RecvFrame(conn->socket);
+                    conn->bytesRecv.fetch_add(frameWireBytes(f), std::memory_order_relaxed);
+                    switch (f.type) {
+                        case MsgType::ManifestEntry:
+                        case MsgType::ManifestProgress:
+                        case MsgType::ManifestEnd:
+                        case MsgType::HashResponse:
+                        case MsgType::FileChunk:
+                        case MsgType::FileEnd:
+                        case MsgType::FileError:
+                        case MsgType::FileBatchOpen:
+                        case MsgType::FileBatchChunk:
+                        case MsgType::FileBatchEnd:
+                            break;  // legitimately server -> client
+                        default: {
+                            std::ostringstream os;
+                            os << "client received wrong-direction/unknown frame: type="
+                               << static_cast<int>(static_cast<uint8_t>(f.type)) << " ("
+                               << MsgTypeName(static_cast<uint8_t>(f.type)) << ") streamId="
+                               << f.streamId << " payloadLen=" << f.payload.size() << " "
+                               << DescribeRecentFrames();
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                    if (isManifestFrame(f.type)) {
+                        const bool forceFlush = (f.type == MsgType::ManifestEnd);
+                        manifestBatchBytes += frameWireBytes(f);
+                        manifestBatch.push_back(IncomingFrame{conn->connId, std::move(f)});
+                        if (forceFlush || manifestBatch.size() >= kRecvManifestBatchFrames ||
+                            manifestBatchBytes >= kRecvManifestBatchBytes) {
+                            flushManifestBatch();
+                        }
+                    } else {
+                        flushManifestBatch();
+                        uint64_t queuedBytesSnapshot = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(incomingMu);
+                            incomingPriorityFrames.push_back(IncomingFrame{conn->connId, std::move(f)});
+                            incomingQueuedBytes += frameWireBytes(incomingPriorityFrames.back().frame);
+                            queuedBytesSnapshot = incomingQueuedBytes;
+                        }
+                        incomingDataCv.notify_one();
+                        applyRecvBackpressure(queuedBytesSnapshot);
+                    }
+                }
+            } catch (const std::exception& ex) {
+                if (!recvStop.load()) {
+                    conn->downReason = ex.what();
+                    conn->healthy.store(false);
+                    // Wake the main loop so it can run failover (requeue this lane's files
+                    // to healthy lanes, or tear down if this was the last lane).
+                    incomingDataCv.notify_all();
                 }
             }
-        } catch (const std::exception& ex) {
-            if (!recvStop.load()) {
-                recvError = ex.what();
-                recvClosed.store(true);
-                incomingDataCv.notify_all();
-            }
-        }
-    });
+        });
+    };
+    for (auto& cptr : pool) {
+        startRecvThread(cptr.get());
+    }
 
     uint64_t smallFileBatchThreshold = 1920 * 1024;
     size_t smallBatchMaxFiles = 7680;
@@ -2237,6 +2816,14 @@ int RunClient(const CliOptions& options) {
                           << " attempt=" << static_cast<uint32_t>(retries)
                           << "/" << static_cast<uint32_t>(kMaxTransferRetries)
                           << std::endl;
+            }
+            // Observable requeue (AC-018 / design §11): a file/batch entry put back into the
+            // pending pool for redistribution to a healthy lane (the dead lane's connId is
+            // reported by the adjacent "[mp] conn_down ... requeued_files=" line).
+            if (debugEnabled) {
+                std::cout << "[mp] requeue sessionId=" << sessionId << " path=" << rel
+                          << " attempt=" << static_cast<uint32_t>(retries)
+                          << "/" << static_cast<uint32_t>(kMaxTransferRetries) << std::endl;
             }
             enqueueTransfer(rel, true);
         } else {
@@ -2567,12 +3154,56 @@ int RunClient(const CliOptions& options) {
                 pendingHashRequests.push_back(r.relPath);
             }
         }
-        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+    };
+
+    // A SYNCHRONOUS send failure (peer reset mid-sync, e.g. WSA 10054) is just another way
+    // a lane dies; treat it exactly like a recvThread failure so failoverScan() requeues its
+    // in-flight work to healthy lanes (FR-015) or, once EVERY lane is down, trips recvClosed
+    // -> the incomplete-manifest abort path (FR-016 / AC-012). Previously such a send threw
+    // out of the main loop and aborted the whole sync fatally instead of going through the
+    // reconnect/exit-3 contract. exchange() guarantees only the first writer records the
+    // reason, matching the "set once on failure" contract the recvThread uses.
+    auto markConnDown = [&](ClientConnection* c, const std::string& reason) {
+        if (c->healthy.exchange(false)) {
+            c->downReason = reason;
+        }
+    };
+
+    // Control-plane lane for hash/manifest traffic: the primary if healthy, otherwise the
+    // first healthy lane. Each per-connection server session answers HashRequests
+    // independently (D-02), so any healthy lane is correct; the response's connId is
+    // irrelevant to HashResponse handling.
+    auto controlConn = [&]() -> ClientConnection* {
+        if (pool[0]->healthy.load()) {
+            return pool[0].get();
+        }
+        for (auto& cptr : pool) {
+            if (cptr->healthy.load()) {
+                return cptr.get();
+            }
+        }
+        return pool[0].get();
     };
 
     auto dispatchHashRequests = [&]() {
+        ClientConnection* ctrl = controlConn();
         std::vector<Frame> outboundFrames;
         outboundFrames.reserve(256);
+        // A failed control-lane send must not be fatal: mark the lane down (FR-016) and stop
+        // for this pass. If a healthy lane remains it becomes the new controlConn() next pass;
+        // if every lane is down, failoverScan() trips recvClosed and the loop aborts to exit 3.
+        auto flushOutbound = [&]() -> bool {
+            try {
+                SendFrameBatch(ctrl->socket, outboundFrames);
+                outboundFrames.clear();
+                return true;
+            } catch (const std::exception& ex) {
+                outboundFrames.clear();
+                markConnDown(ctrl, ex.what());
+                return false;
+            }
+        };
         while (!pendingHashRequests.empty() && (hashRequestsSent - hashResponsesReceived) < maxInFlightHashRequests) {
             const std::string rel = pendingHashRequests.front();
             pendingHashRequests.pop_front();
@@ -2584,26 +3215,68 @@ int RunClient(const CliOptions& options) {
             }
             hashTaskCv.notify_one();
             if (outboundFrames.size() >= 256) {
-                SendFrameBatch(socket, outboundFrames);
-                outboundFrames.clear();
+                if (!flushOutbound()) {
+                    return;
+                }
             }
         }
         if (!outboundFrames.empty()) {
-            SendFrameBatch(socket, outboundFrames);
+            flushOutbound();
         }
     };
 
+    // Adaptive connection selection (design §8). Picks a healthy lane with a free slot,
+    // weighted by measured EWMA throughput (FR-014): score = (ewma+1) / (inFlight+1), so
+    // a faster, less-loaded lane wins and a slow/saturated lane sheds work. forcePrimary
+    // (large files, FR-012) pins to the primary lane when it is healthy.
+    auto pickConnection = [&](bool forcePrimary) -> ClientConnection* {
+        if (forcePrimary) {
+            ClientConnection* p = pool[0].get();
+            if (p->healthy.load() && p->inFlight < streamLimit) {
+                return p;
+            }
+            if (p->healthy.load()) {
+                return nullptr;  // primary saturated: large file waits (FR-020 degenerate)
+            }
+            // Primary dead: degrade to best-effort placement on a surviving lane.
+        }
+        ClientConnection* best = nullptr;
+        double bestScore = -1.0;
+        for (auto& cptr : pool) {
+            ClientConnection* c = cptr.get();
+            if (!c->healthy.load() || c->inFlight >= streamLimit) {
+                continue;
+            }
+            const double score = (c->ewmaThroughput + 1.0) / static_cast<double>(c->inFlight + 1);
+            if (score > bestScore) {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best;
+    };
+    auto healthyConnCount = [&]() -> size_t {
+        size_t n = 0;
+        for (auto& cptr : pool) {
+            if (cptr->healthy.load()) {
+                ++n;
+            }
+        }
+        return n;
+    };
+
     auto tryStartTransfers = [&]() {
-        auto activeTransferSlots = [&]() -> size_t {
+        auto totalActiveSlots = [&]() -> size_t {
             return activeDownloads.size() + activeBatchDownloads.size();
         };
         auto hasBatchBacklog = [&]() -> bool {
             return !pendingBatchTransfers.empty() || !pendingRetryBatchTransfers.empty();
         };
-        while (activeTransferSlots() < streamLimit) {
-            // Backpressure: stop opening new transfers while the async write pool still
-            // has a large backlog of buffered (received-but-unwritten) bytes, so memory
-            // stays bounded. In-flight streams keep draining and the watermark recovers.
+        // Global in-flight bound = streamLimit per healthy lane (design §8.3); with the
+        // <=8 pool cap this is the R-05 safeguard against fan-out exploding server fds.
+        const size_t healthy = std::max<size_t>(1, healthyConnCount());
+        const size_t globalSlotCap = static_cast<size_t>(streamLimit) * healthy;
+        while (totalActiveSlots() < globalSlotCap) {
             if (ioInFlightBytes.load(std::memory_order_relaxed) > ioInFlightLimitBytes) {
                 break;
             }
@@ -2621,6 +3294,12 @@ int RunClient(const CliOptions& options) {
             }
 
             if (batchQueue != nullptr) {
+                // Small-file batches are never "large", so they are distributed across all
+                // healthy lanes by throughput weight.
+                ClientConnection* conn = pickConnection(false);
+                if (conn == nullptr) {
+                    break;  // all lanes saturated
+                }
                 std::vector<std::string> batchPaths;
                 batchPaths.reserve(smallBatchMaxFiles);
                 size_t batchBytes = 0;
@@ -2637,21 +3316,55 @@ int RunClient(const CliOptions& options) {
                     }
                 }
                 if (!batchPaths.empty()) {
-                    const uint32_t sid = nextStreamId++;
+                    const uint32_t sid = conn->nextStreamId++;
+                    const uint64_t key = streamKey(conn->connId, sid);
                     BatchDownloadState batchState;
-                    activeBatchDownloads.emplace(sid, std::move(batchState));
-                    SendFrame(socket, Frame{MsgType::FileBatchOpen, sid, EncodeFileBatchRequest(batchPaths)});
+                    activeBatchDownloads.emplace(key, std::move(batchState));
+                    streamToPath.emplace(key, std::string());  // marks lane ownership for failover
+                    try {
+                        SendFrame(conn->socket, Frame{MsgType::FileBatchOpen, sid, EncodeFileBatchRequest(batchPaths)});
+                    } catch (const std::exception& ex) {
+                        // The batch header never reached the wire, so this stream holds no
+                        // server-acknowledged entries yet and failoverScan() cannot recover
+                        // batchPaths from it. Undo the speculative bookkeeping and requeue the
+                        // files explicitly (FR-015), then mark the lane down so failoverScan /
+                        // the session abort take it from here (FR-016).
+                        activeBatchDownloads.erase(key);
+                        streamToPath.erase(key);
+                        markConnDown(conn, ex.what());
+                        for (const std::string& bp : batchPaths) {
+                            retryOrFail(bp);
+                        }
+                        break;
+                    }
+                    ++conn->inFlight;
+                    // Observable link-task allocation (AC-018 / design §11): which lane a
+                    // small-file batch was assigned to, with size and primary flag.
+                    if (debugEnabled) {
+                        std::cout << "[mp] alloc kind=batch connId=" << conn->connId
+                                  << " sessionId=" << sessionId << " stream=" << sid
+                                  << " files=" << batchPaths.size() << " bytes=" << batchBytes
+                                  << " primary=" << (conn->isPrimary ? 1 : 0) << std::endl;
+                    }
                     started = true;
                 }
             } else if (regularQueue != nullptr) {
-                // Reserve one transfer slot for batch work whenever batch backlog exists.
-                // This prevents regular streams from starving batch streams under low stream limits.
-                const size_t reservedBatchSlots = (streamLimit > 1 && hasBatchBacklog()) ? 1 : 0;
-                const size_t regularLimit = static_cast<size_t>(streamLimit) - reservedBatchSlots;
-                if (activeDownloads.size() >= regularLimit) {
+                // Reserve one slot for batch work when batch backlog exists, mirroring the
+                // single-link behavior but against the pool-wide cap.
+                const size_t reservedBatchSlots = (globalSlotCap > 1 && hasBatchBacklog()) ? 1 : 0;
+                if (activeDownloads.size() >= (globalSlotCap - reservedBatchSlots)) {
                     break;
                 }
                 const std::string rel = regularQueue->front();
+                // Route by size: files >= largeFileThreshold are pinned to the primary
+                // link (FR-012); others go to the best-weighted healthy lane (FR-013).
+                const auto itMeta = remoteFiles.find(rel);
+                const bool isLarge = (itMeta != remoteFiles.end() &&
+                                      itMeta->second.fileSize >= options.largeFileThresholdBytes);
+                ClientConnection* conn = pickConnection(isLarge);
+                if (conn == nullptr) {
+                    break;  // no eligible lane right now; leave file queued and retry later
+                }
                 regularQueue->pop_front();
                 const fs::path abs = JoinRel(options.rootDir, rel);
                 EnsureParentDir(abs);
@@ -2660,14 +3373,35 @@ int RunClient(const CliOptions& options) {
                 d.output.open(abs, std::ios::binary | std::ios::trunc);
                 if (!d.output) {
                     retryOrFail(rel);
-                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
                 } else {
-                    const uint32_t sid = nextStreamId++;
+                    const uint32_t sid = conn->nextStreamId++;
+                    const uint64_t key = streamKey(conn->connId, sid);
                     d.flushThreshold = downloadFlushThreshold;
                     d.writeBuffer.reserve(d.flushThreshold);
-                    activeDownloads.emplace(sid, std::move(d));
-                    streamToPath.emplace(sid, rel);
-                    SendFrame(socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
+                    const uint64_t fileBytes =
+                        (itMeta != remoteFiles.end()) ? itMeta->second.fileSize : 0;
+                    activeDownloads.emplace(key, std::move(d));
+                    streamToPath.emplace(key, rel);
+                    try {
+                        SendFrame(conn->socket, Frame{MsgType::FileOpen, sid, EncodeFileOpen(rel)});
+                    } catch (const std::exception& ex) {
+                        // The activeDownloads/streamToPath entry just added carries rel, so
+                        // failoverScan() will requeue it once the lane is marked down
+                        // (FR-015 / FR-016). Stop dispatching onto this dead lane.
+                        markConnDown(conn, ex.what());
+                        break;
+                    }
+                    ++conn->inFlight;
+                    // Observable link-task allocation (AC-018 / design §11): which lane a
+                    // file was assigned to, incl. large-file primary-pin routing (FR-012).
+                    if (debugEnabled) {
+                        std::cout << "[mp] alloc kind=file connId=" << conn->connId
+                                  << " sessionId=" << sessionId << " stream=" << sid
+                                  << " path=" << rel << " bytes=" << fileBytes
+                                  << " large=" << (isLarge ? 1 : 0)
+                                  << " primary=" << (conn->isPrimary ? 1 : 0) << std::endl;
+                    }
                 }
                 started = true;
             }
@@ -2711,7 +3445,7 @@ int RunClient(const CliOptions& options) {
             }
         }
         entry.finalized = true;
-        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
     };
 
     // Hand a fully-received file off to the async I/O pool instead of writing it on the
@@ -2785,7 +3519,7 @@ int RunClient(const CliOptions& options) {
             }
             hashResolved.insert(rel);
             ++fallbackResolved;
-            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         }
     };
 
@@ -2841,7 +3575,7 @@ int RunClient(const CliOptions& options) {
             hashResolved.insert(rel);
             ++fallbackResolved;
             std::cerr << "[warn][client] fallback_force_transfer path=" << rel << std::endl;
-            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
                                 lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         }
     };
@@ -2872,7 +3606,24 @@ int RunClient(const CliOptions& options) {
         compareDispatchBuffer.clear();
     };
 
-    auto processIncomingFrame = [&](Frame& frame) {
+    auto processIncomingFrame = [&](uint32_t connId, Frame& frame) {
+        // Resolve the originating lane (connId == pool index; pool never reorders). Used
+        // for per-connection (connId,streamId) demux and in-flight accounting.
+        ClientConnection* conn = (connId < pool.size()) ? pool[connId].get() : nullptr;
+        const uint64_t key = streamKey(connId, frame.streamId);
+        auto releaseSlot = [&]() {
+            if (conn != nullptr && conn->inFlight > 0) {
+                --conn->inFlight;
+            }
+        };
+        // A file frame for an unknown (connId,streamId) is a hard desync on a HEALTHY lane,
+        // but during failover the lane's recvThread can have queued chunks that arrive after
+        // failoverScan() already erased + requeued that lane's streams (FR-015). Those stale
+        // frames must be dropped, not treated as a protocol error that aborts the session
+        // (FR-016 / AC-011 / AC-012).
+        auto staleFromDeadLane = [&]() -> bool {
+            return conn == nullptr || !conn->healthy.load();
+        };
         if (frame.type == MsgType::ManifestEntry) {
             FileEntry e = DecodeManifestEntry(frame.payload);
             if (e.isDirectory) {
@@ -2919,8 +3670,9 @@ int RunClient(const CliOptions& options) {
             }
             ++hashResponsesReceived;
         } else if (frame.type == MsgType::FileBatchOpen) {
-            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            auto itBatch = activeBatchDownloads.find(key);
             if (itBatch == activeBatchDownloads.end()) {
+                if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received batch open for unknown stream");
             }
             BatchDownloadState& batch = itBatch->second;
@@ -2952,8 +3704,9 @@ int RunClient(const CliOptions& options) {
             }
             batch.headerReady = true;
         } else if (frame.type == MsgType::FileBatchChunk) {
-            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            auto itBatch = activeBatchDownloads.find(key);
             if (itBatch == activeBatchDownloads.end()) {
+                if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received batch chunk for unknown stream");
             }
             BatchDownloadState& batch = itBatch->second;
@@ -2997,8 +3750,9 @@ int RunClient(const CliOptions& options) {
                 }
             }
         } else if (frame.type == MsgType::FileBatchEnd) {
-            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            auto itBatch = activeBatchDownloads.find(key);
             if (itBatch == activeBatchDownloads.end()) {
+                if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received batch end for unknown stream");
             }
             BatchDownloadState& batch = itBatch->second;
@@ -3013,9 +3767,12 @@ int RunClient(const CliOptions& options) {
                 }
             }
             activeBatchDownloads.erase(itBatch);
+            streamToPath.erase(key);
+            releaseSlot();
         } else if (frame.type == MsgType::FileChunk) {
-            auto it = activeDownloads.find(frame.streamId);
+            auto it = activeDownloads.find(key);
             if (it == activeDownloads.end()) {
+                if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received chunk for unknown stream");
             }
             DownloadState& d = it->second;
@@ -3024,8 +3781,9 @@ int RunClient(const CliOptions& options) {
                 flushBufferedWrites(d);
             }
         } else if (frame.type == MsgType::FileEnd) {
-            auto it = activeDownloads.find(frame.streamId);
+            auto it = activeDownloads.find(key);
             if (it == activeDownloads.end()) {
+                if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received end for unknown stream");
             }
             flushBufferedWrites(it->second);
@@ -3035,13 +3793,14 @@ int RunClient(const CliOptions& options) {
             const FileEntry& meta = remoteFiles.at(rel);
             SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
             activeDownloads.erase(it);
-            streamToPath.erase(frame.streamId);
+            streamToPath.erase(key);
+            releaseSlot();
             ++compared;
             ++transferred;
             transferRetryCounts.erase(rel);
-            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::FileError) {
-            auto itBatch = activeBatchDownloads.find(frame.streamId);
+            auto itBatch = activeBatchDownloads.find(key);
             if (itBatch != activeBatchDownloads.end()) {
                 for (auto& entry : itBatch->second.entries) {
                     if (!entry.finalized) {
@@ -3050,15 +3809,18 @@ int RunClient(const CliOptions& options) {
                     }
                 }
                 activeBatchDownloads.erase(itBatch);
+                streamToPath.erase(key);
+                releaseSlot();
                 return;
             }
-            auto itPath = streamToPath.find(frame.streamId);
-            auto itDl = activeDownloads.find(frame.streamId);
+            auto itPath = streamToPath.find(key);
+            auto itDl = activeDownloads.find(key);
             if (itDl != activeDownloads.end()) {
                 itDl->second.writeBuffer.clear();
                 itDl->second.output.close();
                 activeDownloads.erase(itDl);
             }
+            releaseSlot();
             std::string relPath;
             bool hasRelPath = false;
             if (itPath != streamToPath.end()) {
@@ -3066,7 +3828,7 @@ int RunClient(const CliOptions& options) {
                 hasRelPath = true;
                 streamToPath.erase(itPath);
             }
-            if (hasRelPath) {
+            if (hasRelPath && !relPath.empty()) {
                 retryOrFail(relPath);
             } else {
                 ++compared;
@@ -3075,7 +3837,7 @@ int RunClient(const CliOptions& options) {
                     std::cerr << "[debug][client] transfer_failed path=<unknown> stream=" << frame.streamId << std::endl;
                 }
             }
-            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+            PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else {
             {
                 std::ostringstream os;
@@ -3214,10 +3976,114 @@ int RunClient(const CliOptions& options) {
     const size_t kDelayedLowWater = 256 * 1024;
     bool ingestPaused = false;
 
+    auto lastEwmaSample = std::chrono::steady_clock::now();
+
+    // Refresh per-connection EWMA throughput from received-byte deltas (design §8.1). The
+    // scheduler weights lane selection by this, so a slow/shared-bottleneck lane sheds
+    // work toward faster lanes (FR-014). Cheap; runs at most ~twice per second.
+    auto updateThroughputEwma = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - lastEwmaSample).count();
+        if (dt < 0.5) {
+            return;
+        }
+        for (auto& cptr : pool) {
+            ClientConnection* c = cptr.get();
+            const uint64_t total = c->bytesRecv.load(std::memory_order_relaxed);
+            const uint64_t delta = (total >= c->lastBytesRecvSample) ? (total - c->lastBytesRecvSample) : 0;
+            c->lastBytesRecvSample = total;
+            const double tput = static_cast<double>(delta) / dt;  // bytes/sec
+            c->ewmaThroughput = (c->ewmaThroughput <= 0.0) ? tput : (0.5 * c->ewmaThroughput + 0.5 * tput);
+        }
+        lastEwmaSample = now;
+    };
+
+    // Per-connection failover (design §10). A lane whose recvThread failed is drained:
+    // its in-flight files are requeued to healthy lanes (FR-015), reusing the existing
+    // retry budget (FR-019). Only when EVERY lane is down do we set recvClosed to trigger
+    // the session-level reconnect path (FR-016 / AC-012).
+    auto failoverScan = [&]() {
+        for (auto& cptr : pool) {
+            ClientConnection* c = cptr.get();
+            if (c->healthy.load() || c->drained) {
+                continue;
+            }
+            const uint32_t connId = c->connId;
+            size_t requeued = 0;
+            // Regular downloads on this lane.
+            std::vector<uint64_t> regularKeys;
+            for (auto& kv : activeDownloads) {
+                if (static_cast<uint32_t>(kv.first >> 32) == connId) {
+                    regularKeys.push_back(kv.first);
+                }
+            }
+            for (uint64_t k : regularKeys) {
+                auto it = activeDownloads.find(k);
+                if (it != activeDownloads.end()) {
+                    const std::string rel = it->second.relPath;
+                    if (it->second.output.is_open()) {
+                        it->second.output.close();
+                    }
+                    activeDownloads.erase(it);
+                    streamToPath.erase(k);
+                    if (!rel.empty()) {
+                        retryOrFail(rel);
+                        ++requeued;
+                    }
+                }
+            }
+            // Batch downloads on this lane: requeue not-yet-finalized entries.
+            std::vector<uint64_t> batchKeys;
+            for (auto& kv : activeBatchDownloads) {
+                if (static_cast<uint32_t>(kv.first >> 32) == connId) {
+                    batchKeys.push_back(kv.first);
+                }
+            }
+            for (uint64_t k : batchKeys) {
+                auto it = activeBatchDownloads.find(k);
+                if (it != activeBatchDownloads.end()) {
+                    for (auto& entry : it->second.entries) {
+                        if (!entry.finalized) {
+                            if (entry.output.is_open()) {
+                                entry.output.close();
+                            }
+                            retryOrFail(entry.relPath);
+                            ++requeued;
+                        }
+                    }
+                    activeBatchDownloads.erase(it);
+                    streamToPath.erase(k);
+                }
+            }
+            c->inFlight = 0;
+            c->drained = true;
+            ShutdownBoth(c->socket);
+            if (debugEnabled) {
+                std::cout << "[mp] conn_down connId=" << connId << " reason=\"" << c->downReason
+                          << "\" requeued_files=" << requeued << std::endl;
+            }
+        }
+        if (healthyConnCount() == 0 && !recvClosed.load()) {
+            // All lanes dead: hand off to the session-level reconnect path.
+            for (auto& cptr : pool) {
+                if (!cptr->downReason.empty()) {
+                    recvError = cptr->downReason;
+                    break;
+                }
+            }
+            if (recvError.empty()) {
+                recvError = "all connections closed";
+            }
+            recvClosed.store(true);
+        }
+    };
+
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
             bool loopHadForwardProgress = false;
+            updateThroughputEwma();
+            failoverScan();
             resolveFallbackIfReady();
             dispatchHashRequests();
             refreshSmallBatchTuning();
@@ -3254,7 +4120,7 @@ int RunClient(const CliOptions& options) {
                     } else {
                         retryOrFail(r.relPath);
                     }
-                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+                    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
                                         lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
                 }
                 if (!ioDone.empty()) {
@@ -3348,7 +4214,12 @@ int RunClient(const CliOptions& options) {
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
                                           (hashResponsesReceived < hashRequestsSent);
             sweepUnresolvedFallbackIfQuiescent();
-            if (!needNetworkFrame) {
+            // recvClosed means EVERY lane is down (failoverScan). When a send-side failure
+            // requeued the last lane's work, there may be no in-flight network state left, so
+            // needNetworkFrame is false even though the session is gone. Don't spin here: fall
+            // through to the drain path, which observes recvClosed and breaks into the
+            // incomplete-manifest gate (FR-016 / AC-012, IT-3 exit 3).
+            if (!needNetworkFrame && !recvClosed.load()) {
                 updateStallWatchdog(loopHadForwardProgress);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
@@ -3364,7 +4235,7 @@ int RunClient(const CliOptions& options) {
                 ingestPaused = true;
             }
 
-            std::deque<Frame> readyFrames;
+            std::deque<IncomingFrame> readyFrames;
             {
                 std::lock_guard<std::mutex> lock(incomingMu);
                 size_t kDrainBudget = 512;
@@ -3395,9 +4266,9 @@ int RunClient(const CliOptions& options) {
                 const size_t kPriorityBudget = (kDrainBudget * 3) / 4;
                 const size_t prioCount = std::min<size_t>(incomingPriorityFrames.size(), kPriorityBudget);
                 for (size_t i = 0; i < prioCount; ++i) {
-                    Frame frame = std::move(incomingPriorityFrames.front());
+                    IncomingFrame frame = std::move(incomingPriorityFrames.front());
                     incomingPriorityFrames.pop_front();
-                    const uint64_t sz = frameWireBytes(frame);
+                    const uint64_t sz = frameWireBytes(frame.frame);
                     incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
                     readyFrames.push_back(std::move(frame));
                 }
@@ -3407,9 +4278,9 @@ int RunClient(const CliOptions& options) {
                     const size_t remaining = kDrainBudget - readyFrames.size();
                     const size_t manifestCount = std::min<size_t>(incomingManifestFrames.size(), remaining);
                     for (size_t i = 0; i < manifestCount; ++i) {
-                        Frame frame = std::move(incomingManifestFrames.front());
+                        IncomingFrame frame = std::move(incomingManifestFrames.front());
                         incomingManifestFrames.pop_front();
-                        const uint64_t sz = frameWireBytes(frame);
+                        const uint64_t sz = frameWireBytes(frame.frame);
                         incomingQueuedBytes = (incomingQueuedBytes >= sz) ? (incomingQueuedBytes - sz) : 0;
                         readyFrames.push_back(std::move(frame));
                     }
@@ -3456,8 +4327,8 @@ int RunClient(const CliOptions& options) {
                 updateStallWatchdog(loopHadForwardProgress);
                 continue;
             }
-            for (auto& frame : readyFrames) {
-                processIncomingFrame(frame);
+            for (auto& rf : readyFrames) {
+                processIncomingFrame(rf.connId, rf.frame);
             }
             // Single lock + notify_all for the whole drained batch (see comment at
             // compareDispatchBuffer): replaces the former per-entry lock/notify.
@@ -3466,7 +4337,7 @@ int RunClient(const CliOptions& options) {
                 loopHadForwardProgress = true;
                 // Manifest hot path no longer prints per entry; emit one throttled
                 // progress line per drained batch instead.
-                PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted,
+                PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
                                     lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
             }
             updateStallWatchdog(loopHadForwardProgress);
@@ -3474,7 +4345,9 @@ int RunClient(const CliOptions& options) {
     } catch (...) {
         recvStop.store(true);
         incomingDataCv.notify_all();
-        ShutdownBoth(socket);
+        for (auto& cptr : pool) {
+            ShutdownBoth(cptr->socket);
+        }
         compareStop.store(true);
         compareTaskCv.notify_all();
         hashStop.store(true);
@@ -3483,7 +4356,9 @@ int RunClient(const CliOptions& options) {
         dirTaskCv.notify_all();
         ioStop.store(true);
         ioTaskCv.notify_all();
-        JoinDiag(recvThread, "client-catch-recv");
+        for (auto& cptr : pool) {
+            JoinDiag(cptr->recvThread, "client-catch-recv");
+        }
         for (auto& w : compareWorkers) {
             JoinDiag(w, "client-catch-compare");
         }
@@ -3573,8 +4448,12 @@ int RunClient(const CliOptions& options) {
         }
         recvStop.store(true);
         incomingDataCv.notify_all();
-        ShutdownBoth(socket);
-        JoinDiag(recvThread, "client-recv-incomplete");
+        for (auto& cptr : pool) {
+            ShutdownBoth(cptr->socket);
+        }
+        for (auto& cptr : pool) {
+            JoinDiag(cptr->recvThread, "client-recv-incomplete");
+        }
         std::cout << "Sync aborted (incomplete manifest). changed_files=" << transferred
                   << " failed_files=" << failed << " enumerated=" << enumerated
                   << " elapsed=" << formatElapsed() << std::endl;
@@ -3662,12 +4541,26 @@ int RunClient(const CliOptions& options) {
     for (auto& w : dirWorkers) {
         JoinDiag(w, "client-dir");
     }
-    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
-    SendFrame(socket, Frame{MsgType::SyncDone, 0, {}});
+    PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
+    // SyncDone is sent on every live lane so each per-connection server session (D-02)
+    // terminates cleanly; auxiliary lanes that already failed are skipped.
+    for (auto& cptr : pool) {
+        if (cptr->healthy.load()) {
+            try {
+                SendFrame(cptr->socket, Frame{MsgType::SyncDone, 0, {}});
+            } catch (...) {
+                // A lane that died between the last check and here is harmless at teardown.
+            }
+        }
+    }
     recvStop.store(true);
     incomingDataCv.notify_all();
-    ShutdownBoth(socket);
-    JoinDiag(recvThread, "client-recv-final");
+    for (auto& cptr : pool) {
+        ShutdownBoth(cptr->socket);
+    }
+    for (auto& cptr : pool) {
+        JoinDiag(cptr->recvThread, "client-recv-final");
+    }
     const bool success = (failed == 0);
     std::cout << "Sync completed. changed_files=" << transferred
               << " failed_files=" << failed

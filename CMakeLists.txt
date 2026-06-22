@@ -12,6 +12,7 @@ add_executable(FastClone
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
     FastClone/main.cpp
+    FastClone/net_topology.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
     FastClone/sync_engine.cpp
@@ -50,7 +51,7 @@ endif()
 
 if(WIN32)
     target_compile_definitions(FastClone PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(FastClone PRIVATE ws2_32)
+    target_link_libraries(FastClone PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
 
 enable_testing()
@@ -59,12 +60,17 @@ add_executable(FastCloneTests
     FastClone/cli.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
+    FastClone/net_topology.cpp
+    FastClone/protocol.cpp
+    FastClone/protocol_codec.cpp
     FastClone/sync_util.cpp
+    FastClone/win_socket.cpp
     tests/test_main.cpp
     tests/test_cli.cpp
     tests/test_file_index.cpp
     tests/test_hash_memcache.cpp
     tests/test_reconnect.cpp
+    tests/test_route_selection.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)
@@ -82,6 +88,9 @@ endif()
 
 if(WIN32)
     target_compile_definitions(FastCloneTests PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+    # net_topology.cpp (address enumeration / RNG) and win_socket.cpp pull in Winsock,
+    # IP Helper and CNG; link them explicitly for the test target (design §8.4 / R-05).
+    target_link_libraries(FastCloneTests PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
 add_test(NAME FastCloneTests COMMAND FastCloneTests)
 

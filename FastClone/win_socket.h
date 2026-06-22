@@ -56,7 +56,20 @@ private:
     SocketNative raw_ = kInvalidSocket;
 };
 
+// Optional source binding for a multipath connection (design §6.5). Empty fields mean
+// "do not bind". localAddr pins the source IP (strong-host on Windows); ifaceName pins
+// the egress interface on weak-host platforms (macOS IP_BOUND_IF / Linux SO_BINDTODEVICE).
+struct ConnectBinding {
+    std::string localAddr;
+    std::string ifaceName;
+};
+
 SocketHandle ConnectTo(const std::string& host, uint16_t port);
+SocketHandle ConnectTo(const std::string& host, uint16_t port, const ConnectBinding& binding);
+// Return the actual source IP the OS bound a connected socket to (getsockname), as a
+// numeric literal. Empty on failure. Used so the primary lane's real NIC participates in
+// the multipath same-side dedup even when it was connected via the OS default route.
+std::string LocalAddressOf(const SocketHandle& socket);
 SocketHandle CreateServer(uint16_t port);
 SocketHandle AcceptClient(const SocketHandle& listener);
 void SendAll(const SocketHandle& socket, const void* data, size_t length);

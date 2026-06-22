@@ -4,12 +4,14 @@
 #include <Windows.h>
 #endif
 
+#include <algorithm>
 #include <cstdlib>
 #include <cctype>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -44,8 +46,14 @@ void PrintUsage() {
     std::cerr
         << "Usage:\n"
         << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>\n"
-        << "  fastclone client --server <host:port> --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
-        << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n";
+        << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
+        << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
+        << "      [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]...\n"
+        << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
+        << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
+        << "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
+        << "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
+        << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n";
 }
 
 long ParseLongStrict(const std::string& value, const char* name) {
@@ -141,6 +149,45 @@ std::pair<std::string, uint16_t> ParseHostPort(const std::string& input, uint16_
     return {host, static_cast<uint16_t>(parsedPort)};
 }
 
+// Split a comma-separated endpoint list ("A:port,B,C:port") into host/port pairs,
+// each parsed via ParseHostPort with the current default port (FR-005 / design §9.2).
+std::vector<std::pair<std::string, uint16_t>> ParseServerList(const std::string& input,
+                                                              uint16_t defaultPort) {
+    std::vector<std::pair<std::string, uint16_t>> endpoints;
+    size_t start = 0;
+    while (start <= input.size()) {
+        const size_t comma = input.find(',', start);
+        const std::string token = (comma == std::string::npos)
+                                      ? input.substr(start)
+                                      : input.substr(start, comma - start);
+        if (!token.empty()) {
+            endpoints.push_back(ParseHostPort(token, defaultPort));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (endpoints.empty()) {
+        throw std::runtime_error("Invalid --server, no endpoints parsed");
+    }
+    return endpoints;
+}
+
+// Parse "<localIP|iface>=<serverIP[:port]>" into a LinkPin (FR-008 / design §9.3).
+LinkPin ParseLinkPin(const std::string& input, uint16_t defaultPort) {
+    const size_t eq = input.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 >= input.size()) {
+        throw std::runtime_error("Invalid --link, expected <localIP|iface>=<serverIP[:port]>");
+    }
+    LinkPin pin;
+    pin.local = input.substr(0, eq);
+    const auto serverHostPort = ParseHostPort(input.substr(eq + 1), defaultPort);
+    pin.server = serverHostPort.first;
+    pin.port = serverHostPort.second;
+    return pin;
+}
+
 CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (args.empty()) {
         PrintUsage();
@@ -172,9 +219,29 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             }
             options.port = static_cast<uint16_t>(port);
         } else if (arg == "--server") {
-            auto hostPort = ParseHostPort(ArgAt(args, ++i), options.port);
-            options.host = hostPort.first;
-            options.port = hostPort.second;
+            auto endpoints = ParseServerList(ArgAt(args, ++i), options.port);
+            // Accumulate across repeated --server flags (FR-005), de-duplicating exact
+            // host:port repeats while preserving first-seen order.
+            for (auto& ep : endpoints) {
+                const bool dup = std::any_of(options.servers.begin(), options.servers.end(),
+                                             [&](const auto& e) { return e == ep; });
+                if (!dup) {
+                    options.servers.push_back(ep);
+                }
+            }
+            // host/port mirror servers[0] for call-site compatibility.
+            options.host = options.servers.front().first;
+            options.port = options.servers.front().second;
+        } else if (arg == "--large-file-threshold") {
+            const uint64_t sizeBytes = ParseSizeBytesStrict(ArgAt(args, ++i), "--large-file-threshold");
+            constexpr uint64_t kMin = 1ULL * 1024ULL * 1024ULL;            // 1M lower bound
+            constexpr uint64_t kMax = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1T upper bound
+            if (sizeBytes < kMin || sizeBytes > kMax) {
+                throw std::runtime_error("Invalid --large-file-threshold (range: 1M..1T)");
+            }
+            options.largeFileThresholdBytes = sizeBytes;
+        } else if (arg == "--link") {
+            options.linkPins.push_back(ParseLinkPin(ArgAt(args, ++i), options.port));
         } else if (arg == "--password") {
             options.password = ArgAt(args, ++i);
         } else if (arg == "--streams") {
@@ -236,6 +303,10 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     }
     if (options.mode == Mode::Client && options.enableHashMemcache) {
         throw std::runtime_error("--enable-hash-memcache is server-only");
+    }
+    // Normalize the endpoint list so the engine always sees servers[0] == host/port.
+    if (options.servers.empty()) {
+        options.servers.push_back({options.host, options.port});
     }
     options.rootDir = fs::weakly_canonical(options.rootDir);
     return options;

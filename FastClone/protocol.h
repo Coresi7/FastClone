@@ -13,6 +13,9 @@ enum class MsgType : uint8_t {
     Auth = 2,
     AuthOk = 3,
     AuthFail = 4,
+    // Multipath (FC6): a follow-up connection claims an existing logical session by
+    // sessionId instead of starting a new one. Sent by the client in place of Auth.
+    SessionJoin = 5,
     ManifestRequest = 10,
     ManifestEntry = 11,
     ManifestEnd = 12,

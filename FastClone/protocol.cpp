@@ -132,6 +132,7 @@ const char* MsgTypeName(uint8_t typeByte) {
         case MsgType::Auth: return "Auth";
         case MsgType::AuthOk: return "AuthOk";
         case MsgType::AuthFail: return "AuthFail";
+        case MsgType::SessionJoin: return "SessionJoin";
         case MsgType::ManifestRequest: return "ManifestRequest";
         case MsgType::ManifestEntry: return "ManifestEntry";
         case MsgType::ManifestEnd: return "ManifestEnd";
@@ -157,6 +158,7 @@ bool IsKnownMsgType(uint8_t typeByte) {
         case MsgType::Auth:
         case MsgType::AuthOk:
         case MsgType::AuthFail:
+        case MsgType::SessionJoin:
         case MsgType::ManifestRequest:
         case MsgType::ManifestEntry:
         case MsgType::ManifestEnd:

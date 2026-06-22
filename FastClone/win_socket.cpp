@@ -11,6 +11,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #else
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -110,7 +111,56 @@ void SocketHandle::Reset(SocketNative raw) {
     raw_ = raw;
 }
 
-SocketHandle ConnectTo(const std::string& host, uint16_t port) {
+namespace {
+
+// Apply the per-OS multipath source binding to a fresh socket, between socket() and
+// connect() (design §6.5). Returns false only on a hard failure that should disqualify
+// this address-family attempt. addrFamily is the family of the socket being bound.
+bool ApplyConnectBinding(SocketNative s, int addrFamily, const ConnectBinding& binding) {
+    // Egress interface pin (weak-host platforms). Windows uses strong-host source-IP
+    // binding instead, so ifaceName is a no-op there.
+    if (!binding.ifaceName.empty()) {
+#if defined(__APPLE__)
+        const unsigned int idx = if_nametoindex(binding.ifaceName.c_str());
+        if (idx != 0) {
+            if (addrFamily == AF_INET6) {
+                setsockopt(s, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx));
+            } else {
+                setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+            }
+        }
+#elif defined(__linux__)
+        // SO_BINDTODEVICE needs CAP_NET_RAW/root; on failure we degrade to source-IP
+        // binding below and only warn (design risk R-03, gatekeeper-approved default).
+        if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, binding.ifaceName.c_str(),
+                       static_cast<socklen_t>(binding.ifaceName.size())) != 0) {
+            // Non-fatal: continue with source-IP bind / default route.
+        }
+#endif
+    }
+
+    // Source-IP bind (strong-host on Windows; supplemental elsewhere).
+    if (!binding.localAddr.empty()) {
+        addrinfo hints{};
+        hints.ai_family = addrFamily;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
+        addrinfo* localInfo = nullptr;
+        if (getaddrinfo(binding.localAddr.c_str(), nullptr, &hints, &localInfo) != 0 ||
+            localInfo == nullptr) {
+            return false;  // local address not valid for this family -> skip attempt
+        }
+        const int rc = bind(s, localInfo->ai_addr, static_cast<int>(localInfo->ai_addrlen));
+        freeaddrinfo(localInfo);
+        if (rc != 0) {
+            return false;  // cannot bind the requested source on this family
+        }
+    }
+    return true;
+}
+
+SocketHandle ConnectToImpl(const std::string& host, uint16_t port, const ConnectBinding& binding) {
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -129,6 +179,9 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port) {
         if (!attempt.Valid()) {
             continue;
         }
+        if (!ApplyConnectBinding(attempt.Get(), p->ai_family, binding)) {
+            continue;  // binding incompatible with this address family; try the next one
+        }
         TuneSocketForThroughput(attempt.Get());
         if (connect(attempt.Get(), p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
             connected = std::move(attempt);
@@ -138,9 +191,44 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port) {
     freeaddrinfo(result);
 
     if (!connected.Valid()) {
-        throw std::runtime_error("connect failed to " + host + ":" + std::to_string(port));
+        std::string detail = host + ":" + std::to_string(port);
+        if (!binding.localAddr.empty()) {
+            detail += " (bind " + binding.localAddr + ")";
+        }
+        throw std::runtime_error("connect failed to " + detail);
     }
     return connected;
+}
+
+}  // namespace
+
+SocketHandle ConnectTo(const std::string& host, uint16_t port) {
+    return ConnectToImpl(host, port, ConnectBinding{});
+}
+
+SocketHandle ConnectTo(const std::string& host, uint16_t port, const ConnectBinding& binding) {
+    return ConnectToImpl(host, port, binding);
+}
+
+std::string LocalAddressOf(const SocketHandle& socket) {
+    if (!socket.Valid()) {
+        return std::string();
+    }
+    sockaddr_storage ss{};
+#ifdef _WIN32
+    int len = sizeof(ss);
+#else
+    socklen_t len = sizeof(ss);
+#endif
+    if (getsockname(socket.Get(), reinterpret_cast<sockaddr*>(&ss), &len) != 0) {
+        return std::string();
+    }
+    char host[NI_MAXHOST] = {0};
+    if (getnameinfo(reinterpret_cast<sockaddr*>(&ss), len, host, sizeof(host), nullptr, 0,
+                    NI_NUMERICHOST) != 0) {
+        return std::string();
+    }
+    return std::string(host);
 }
 
 SocketHandle CreateServer(uint16_t port) {
