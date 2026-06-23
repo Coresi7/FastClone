@@ -45,7 +45,7 @@ const std::string& ArgAt(const std::vector<std::string>& args, size_t index) {
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
-        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>\n"
+        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>\n"
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -73,7 +73,14 @@ uint64_t ParseSizeBytesStrict(const std::string& value, const char* name) {
         throw std::runtime_error(std::string(name) + " is empty");
     }
     size_t idx = 0;
-    const unsigned long long base = std::stoull(value, &idx, 10);
+    unsigned long long base = 0;
+    try {
+        base = std::stoull(value, &idx, 10);
+    } catch (const std::exception&) {
+        // std::stoull throws raw std::invalid_argument / std::out_of_range on non-numeric or
+        // overflowing input; surface a name-tagged error instead (matches ParseLongStrict).
+        throw std::runtime_error(std::string("Invalid ") + name);
+    }
     std::string suffix = value.substr(idx);
     for (char& c : suffix) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -104,7 +111,14 @@ uint64_t ParseDurationMsStrict(const std::string& value, const char* name) {
         throw std::runtime_error(std::string(name) + " is empty");
     }
     size_t idx = 0;
-    const unsigned long long base = std::stoull(value, &idx, 10);
+    unsigned long long base = 0;
+    try {
+        base = std::stoull(value, &idx, 10);
+    } catch (const std::exception&) {
+        // std::stoull throws raw std::invalid_argument / std::out_of_range on non-numeric or
+        // overflowing input; surface a name-tagged error instead (matches ParseLongStrict).
+        throw std::runtime_error(std::string("Invalid ") + name);
+    }
     std::string suffix = value.substr(idx);
     for (char& c : suffix) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -274,6 +288,8 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.serverHashWorkers = static_cast<uint32_t>(workers);
         } else if (arg == "--enable-hash-memcache") {
             options.enableHashMemcache = true;
+        } else if (arg == "--once") {
+            options.exitAfterSync = true;
         } else if (arg == "--diag") {
             options.diagnostics = true;
         } else if (arg == "--reconnect-retries") {
@@ -303,6 +319,12 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     }
     if (options.mode == Mode::Client && options.enableHashMemcache) {
         throw std::runtime_error("--enable-hash-memcache is server-only");
+    }
+    if (options.mode == Mode::Client && options.exitAfterSync) {
+        throw std::runtime_error("--once is server-only");
+    }
+    if (options.exitAfterSync && options.enableHashMemcache) {
+        throw std::runtime_error("--once and --enable-hash-memcache are mutually exclusive");
     }
     // Normalize the endpoint list so the engine always sees servers[0] == host/port.
     if (options.servers.empty()) {

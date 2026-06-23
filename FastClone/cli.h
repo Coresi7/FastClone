@@ -32,6 +32,8 @@ struct CliOptions {
     uint64_t queuedFileSizeBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     uint32_t serverHashWorkers = 0;
     bool enableHashMemcache = false;
+    // OneShot 服务端模式（--once）。仅服务端有效；服务完一个真实会话后进程退出。
+    bool exitAfterSync = false;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
     bool diagnostics = false;

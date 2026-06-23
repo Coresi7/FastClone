@@ -27,9 +27,9 @@ int main(int argc, char** argv) {
                   << " message=\"" << ex.code().message() << "\""
                   << " main_thread=" << std::this_thread::get_id()
                   << std::endl;
-        return 1;
+        return fc::kExitUsage;
     } catch (const std::exception& ex) {
         std::cerr << "FastClone error: " << ex.what() << std::endl;
-        return 1;
+        return fc::kExitUsage;
     }
 }

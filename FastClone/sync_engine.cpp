@@ -207,6 +207,11 @@ struct ServerSession {
     // Lifecycle field: ALWAYS access under SessionRegistry::mu_ (Create/Join/SweepExpired/
     // OnConnectionClosed). It is not atomic, so any unlocked access is a data race.
     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
+    // --once: set ONLY on the conn_done clean-return path (FR-07A). Defaults keep
+    // non-once behavior unchanged.
+    std::atomic<bool> completedOk{false};
+    // --once: set when any lane of this session enters conn_error (FR-07).
+    std::atomic<bool> hadError{false};
 };
 
 // Process-wide registry: sessionId -> session, with idle TTL reclaim (design §5.1/§5.3).
@@ -237,18 +242,24 @@ public:
         return it->second;
     }
 
-    void OnConnectionClosed(const std::shared_ptr<ServerSession>& session) {
+    // Returns the session's live-connection count AFTER decrement. The decrement and the
+    // read-of-zero happen under the same mu_, so the --once terminal check (RunServer) can
+    // observe "this lane closed AND no lane remains" atomically (NFR-02, no TOCTOU). The
+    // single existing caller may ignore the return value, leaving non-once behavior intact.
+    uint32_t OnConnectionClosed(const std::shared_ptr<ServerSession>& session) {
         if (!session) {
-            return;
+            return 0;
         }
         // lastActivity must only ever be touched under mu_ (it is read/written by Join /
         // SweepExpired under the same lock). Updating it here without the lock raced with
         // those paths from connection-close threads (review B-02), so take mu_ as well.
         std::lock_guard<std::mutex> lock(mu_);
-        if (session->liveConns.load(std::memory_order_relaxed) > 0) {
-            session->liveConns.fetch_sub(1, std::memory_order_relaxed);
+        uint32_t remaining = session->liveConns.load(std::memory_order_relaxed);
+        if (remaining > 0) {
+            remaining = session->liveConns.fetch_sub(1, std::memory_order_relaxed) - 1;
         }
         session->lastActivity = std::chrono::steady_clock::now();
+        return remaining;
     }
 
     // Event-driven reclaim (D-03): drop sessions with no live connection that have been
@@ -2002,6 +2013,73 @@ void PrintClientCounters(size_t enumerated,
 
 }  // namespace
 
+namespace {
+
+// --- OneShot server mode (--once) process-wide state (design §2.3 / §3.5/§3.6) ---
+// Single-instance per process: main() calls RunServer at most once (R-04). All only ever
+// read/written when options.exitAfterSync is true; default values are inert otherwise.
+std::atomic<bool>         g_onceShouldExit{false};
+std::atomic<int>          g_onceExitCode{kExitOk};
+std::atomic<SocketNative> g_onceListenSock{kInvalidSocket};
+std::atomic<bool>         g_onceTerminalFired{false};
+std::mutex                g_onceMu;
+std::weak_ptr<ServerSession> g_onceTarget;  // guarded by g_onceMu
+
+// g_onceListenSock is written/exchanged from a non-main (terminal) thread and read on the
+// accept loop, so it must be a real lock-free atomic. This holds on every target we ship
+// (x64, ARM64 incl. Windows-on-ARM / Apple Silicon, and POSIX int sockets); the only way it
+// could degrade to a locking fallback is an exotic 32-bit platform with a 64-bit socket handle
+// and no 64-bit atomics, which we do not target. Enforce the assumption at compile time.
+static_assert(std::atomic<SocketNative>::is_always_lock_free,
+              "g_onceListenSock must be lock-free on supported platforms");
+
+// Claim the first real session as the once-target, or report whether this session IS the
+// once-target (its own SessionJoin lanes match). Returns false for a second, independent
+// real session, which RunServer then refuses to serve (FR-05 / FR-10).
+bool ClaimOrMatchOnceTarget(const std::shared_ptr<ServerSession>& s) {
+    std::lock_guard<std::mutex> lk(g_onceMu);
+    auto cur = g_onceTarget.lock();
+    if (!cur) {
+        g_onceTarget = s;
+        return true;
+    }
+    return cur == s;
+}
+
+// Close the listening socket to interrupt a blocking accept() on the main thread (FR-09).
+// exchange() guarantees the socket is closed exactly once; the main loop's accept catch
+// then calls listener.Release() so SocketHandle's destructor does not double-close.
+void WakeAcceptLoop() {
+    const SocketNative s = g_onceListenSock.exchange(kInvalidSocket);
+    if (s != kInvalidSocket) {
+#ifdef _WIN32
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+#else
+        shutdown(s, SHUT_RDWR);
+        ::close(s);
+#endif
+    }
+}
+
+// Record the terminal verdict for the once-target session and wake the accept loop. Fires
+// exactly once (NFR-02): success -> kExitOk, otherwise -> kExitOnceSessionFailed.
+void FireOnceTerminal(bool success) {
+    if (g_onceTerminalFired.exchange(true)) {
+        return;
+    }
+    // Publish order is load-bearing: exitCode is written first, then shouldExit is released
+    // last, so any reader that observes shouldExit==true (acquire) is guaranteed to read the
+    // final exitCode. This release/acquire pairing (with the accept loop below) is required on
+    // weak-memory architectures (ARM64 / Apple Silicon / Windows-on-ARM); x86/x64 TSO would
+    // otherwise mask a relaxed ordering bug.
+    g_onceExitCode.store(success ? kExitOk : kExitOnceSessionFailed, std::memory_order_relaxed);
+    g_onceShouldExit.store(true, std::memory_order_release);
+    WakeAcceptLoop();
+}
+
+}  // namespace
+
 int RunServer(const CliOptions& options) {
     WsaContext wsa;
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
@@ -2019,6 +2097,9 @@ int RunServer(const CliOptions& options) {
                   << std::endl;
     }
     SocketHandle listener = CreateServer(options.port);
+    // Publish the listener fd so a connection-close thread can interrupt accept() on
+    // terminal (--once, FR-09). Harmless for non-once: it is only ever read via WakeAcceptLoop.
+    g_onceListenSock.store(listener.Get());
 
     // Collect the server's advertised endpoint list once at startup (FR-005 / §6.1, r6 §6.1).
     // Sent to the first connection in AuthOk so the client can extend the connection pool.
@@ -2052,9 +2133,26 @@ int RunServer(const CliOptions& options) {
     std::atomic<uint64_t> connIdCounter{0};
     std::atomic<uint32_t> activeSessions{0};
     while (true) {
+        // --once: a terminal verdict may have fired while we were dispatching; bail before
+        // blocking again so we never serve a second session (FR-10) and return cleanly (FR-09).
+        if (options.exitAfterSync && g_onceShouldExit.load(std::memory_order_acquire)) {
+            listener.Release();  // fd already closed by WakeAcceptLoop; drop ownership.
+            return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
+        }
         std::cout << "Waiting for client... active_connections=" << activeSessions.load()
                   << " sessions=" << GetSessionRegistry().SessionCount() << std::endl;
-        SocketHandle client = AcceptClient(listener);
+        SocketHandle client;
+        try {
+            client = AcceptClient(listener);
+        } catch (const std::exception&) {
+            // --once: the terminal thread closed the listener to wake us. Tolerate this one
+            // accept failure and return the recorded exit code (never exit() mid-flight, FR-09).
+            if (options.exitAfterSync && g_onceShouldExit.load(std::memory_order_acquire)) {
+                listener.Release();
+                return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
+            }
+            throw;  // non-once: preserve existing "accept error -> main catch -> exit 1".
+        }
         const uint64_t connSeq = connIdCounter.fetch_add(1) + 1;
         activeSessions.fetch_add(1);
         std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
@@ -2065,9 +2163,20 @@ int RunServer(const CliOptions& options) {
                 std::cout << "[mp] conn_accept conn=" << connSeq
                           << " sessionId=" << session->sessionId
                           << " live_conns=" << session->liveConns.load() << std::endl;
-                RunSessionServer(client, options);
-                std::cout << "[mp] conn_done conn=" << connSeq
-                          << " sessionId=" << session->sessionId << std::endl;
+                if (options.exitAfterSync && !ClaimOrMatchOnceTarget(session)) {
+                    // --once: a second independent real session arrived while the once-target
+                    // is still in flight. Refuse to serve it (FR-05/FR-10): skip RunSessionServer
+                    // so completedOk stays false; it is reclaimed via the shared close path below.
+                    std::cerr << "[mp] once_reject_second_session conn=" << connSeq
+                              << " sessionId=" << session->sessionId << std::endl;
+                } else {
+                    RunSessionServer(client, options);
+                    std::cout << "[mp] conn_done conn=" << connSeq
+                              << " sessionId=" << session->sessionId << std::endl;
+                    if (options.exitAfterSync) {
+                        session->completedOk.store(true, std::memory_order_relaxed);  // FR-06/07A
+                    }
+                }
             } catch (const std::exception& ex) {
                 // Distinguish pre-handshake close (reachability probe: client connects
                 // then immediately closes before sending any bytes → recv returns 0,
@@ -2087,10 +2196,31 @@ int RunServer(const CliOptions& options) {
                     std::cerr << "[mp] conn_error conn=" << connSeq << " error: " << errMsg
                               << std::endl;
                 }
+                // --once: any real-session lane error marks the session failed (FR-07).
+                // A pre-handshake close has session == null and never sets this (FR-08.1).
+                if (options.exitAfterSync && session) {
+                    session->hadError.store(true, std::memory_order_relaxed);
+                }
             }
             // Release this connection's session count and run the event-driven TTL sweep.
-            GetSessionRegistry().OnConnectionClosed(session);
+            // OnConnectionClosed returns the live-lane count after decrement, read under the
+            // registry lock (NFR-02).
+            const uint32_t remaining = GetSessionRegistry().OnConnectionClosed(session);
             GetSessionRegistry().SweepExpired();
+            // --once terminal check: when the last lane of the once-target closes, decide the
+            // verdict (FR-06/07/07A) and wake the accept loop. completedOk is set only on the
+            // clean conn_done path, so success requires it AND the absence of any lane error.
+            if (options.exitAfterSync && session) {
+                bool isTarget;
+                {
+                    std::lock_guard<std::mutex> lk(g_onceMu);
+                    isTarget = (g_onceTarget.lock() == session);
+                }
+                if (isTarget && remaining == 0) {
+                    FireOnceTerminal(session->completedOk.load(std::memory_order_relaxed) &&
+                                     !session->hadError.load(std::memory_order_relaxed));
+                }
+            }
             activeSessions.fetch_sub(1);
         }).detach();
     }
