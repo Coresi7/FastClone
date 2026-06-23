@@ -24,13 +24,14 @@ Supported platforms:
 ### Server
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>
 ```
 
 - `--dir`: server root directory (default: current directory)
 - `--port`: listening port (default: `27842`)
 - `--server-hash-workers`: global hash worker threads for all sessions (`0` = auto, range `0..512`, default auto)
 - `--enable-hash-memcache`: enable in-memory hash cache on server; reuses hash when `path + mtime + size` match
+- `--once`: OneShot server mode — serve exactly one real session then exit (server-only, mutually exclusive with `--enable-hash-memcache`)
 - `--password`: pre-shared password (required)
 
 ### Client
@@ -49,6 +50,26 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
 - `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
 - `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
+
+## OneShot Server Mode (`--once`)
+
+The `--once` flag enables a single-use server mode designed for CI/CD pipelines: the server accepts **exactly one real session**, completes the transfer, and exits immediately.
+
+**Behavior:**
+
+- The server listens for incoming connections. Pre-handshake probes (e.g. reachability checks that close before sending bytes) are silently ignored and do not count as a real session.
+- When a real session completes cleanly (all connections finish without any lane error), the server exits with code `0`.
+- If any lane of the single session encounters an error, the server exits with code `2` (session failed/aborted).
+- If a second independent session arrives while the first is still in flight, it is rejected (the server refuses to serve it).
+- Mutually exclusive with `--enable-hash-memcache` (the server process exits after one session, so a long-lived cache is pointless).
+
+**Exit workflow:**
+
+1. A working thread on the final connection sets a terminal verdict and closes the listening socket.
+2. The main accept loop is woken by the socket close, reads the recorded verdict, and returns the exit code.
+3. The process exits cleanly — no `exit()` or `abort()` calls mid-flight.
+
+This mode is **server-only**; passing `--once` on the client side produces a CLI error.
 
 ## Progress Counters
 
@@ -109,11 +130,17 @@ If the connection drops before the manifest is fully received, the client automa
 
 ## Exit Codes
 
+**Client:**
 - `0`: sync succeeded (no failed files)
 - `1`: argument error or runtime exception
 - `2`: sync completed with failed files (try lowering concurrency, e.g. `--streams`)
 - `3`: sync incomplete and auto-reconnect disabled (`--reconnect-retries 0`), or connection dropped without reconnect enabled
 - `4`: auto-reconnect budget exhausted with the sync still incomplete
+
+**Server `--once`:**
+- `0`: the single real session completed cleanly
+- `1`: argument error or runtime exception
+- `2`: the single real session failed or was aborted (any lane error)
 
 ## Cross-Platform Build (Linux/macOS)
 

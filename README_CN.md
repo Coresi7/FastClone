@@ -23,13 +23,14 @@
 ### 服务端
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>
 ```
 
 - `--dir`：服务根目录；默认当前目录
 - `--port`：监听端口；默认 `27842`
 - `--server-hash-workers`：服务进程级 hash 线程数（对所有 session 生效）；`0` 表示自动，范围 `0..512`
 - `--enable-hash-memcache`：启用服务端内存 hash 缓存；当 `path + mtime + size` 一致时复用缓存 hash
+- `--once`：一次性服务端模式——服务完一个真实会话后进程退出（仅服务端可用，与 `--enable-hash-memcache` 互斥）
 - `--password`：预共享口令（必填）
 
 ### 客户端
@@ -48,6 +49,26 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
 - `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+
+## 一次性服务端模式（`--once`）
+
+`--once` 标志启用面向 CI/CD 场景的一次性服务端模式：服务端接受**恰好一个真实会话**，完成传输后立即退出。
+
+**行为：**
+
+- 服务端监听等待连接。握手前的探测连接（如可达性检查，在发送任何字节前即关闭）会被静默忽略，不计入真实会话。
+- 当唯一的真实会话干净完成（所有连接正常结束，无任何 lane 错误）时，服务端以退出码 `0` 退出。
+- 若该会话的任意一条 lane 发生错误，服务端以退出码 `2` 退出（会话失败/中止）。
+- 若首个会话仍在传输中时有第二个独立会话到达，会被拒绝服务。
+- 与 `--enable-hash-memcache` 互斥（服务端进程仅服务一次即退出，长生命周期缓存无意义）。
+
+**退出流程：**
+
+1. 最后一个连接的工作线程设定终止判定并关闭监听 socket。
+2. 主 accept 循环被 socket 关闭唤醒，读取已记录的判定结果，返回对应退出码。
+3. 进程干净退出——整个过程中无 `exit()` 或 `abort()` 调用。
+
+此模式**仅服务端可用**；在客户端传入 `--once` 会导致 CLI 报错。
 
 ## 进度输出
 
@@ -114,11 +135,17 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 
 ## 退出码
 
+**客户端：**
 - `0`：同步成功（无失败文件）
 - `1`：参数错误或运行时异常
 - `2`：同步完成但存在失败文件（可结合 `--streams` 降低并发后重试）
 - `3`：同步未完成且自动重连已禁用（`--reconnect-retries 0`），或连接中断后未启用重连
 - `4`：自动重连预算耗尽，同步仍未完成
+
+**服务端 `--once`：**
+- `0`：唯一真实会话干净完成
+- `1`：参数错误或运行时异常
+- `2`：唯一真实会话失败或中止（任意 lane 发生错误）
 
 ## 跨平台构建（Linux/macOS）
 
