@@ -259,6 +259,36 @@ void TC10_PrimaryGroupPreemption() {
             "TC-10 must exclude every g0 column (primary NIC), landing on g1");
 }
 
+// ---- TC-11: greedy counter-example, max-cardinality matching (V-01) --------------------
+// The single best-scored edge (Ca-Sx, same /24) shares both NICs with the only other
+// reachable edges; a plain greedy that takes it first collapses to one lane. The optimal
+// matcher must skip it and pick Ca-Sy + Cb-Sx for two lanes. All-IPv4 isolates the family
+// dimension so only the cardinality guard decides the outcome.
+void TC11_GreedyCounterExample() {
+    MatrixBuilder b;
+    b.row("10.0.0.2", "Ca", 24);  // 0
+    b.row("10.0.1.2", "Cb", 24);  // 1
+    b.col("10.0.0.9", "gx");      // 0 Sx: same /24 as Ca
+    b.col("10.9.9.9", "gy");      // 1 Sy: different subnet
+    b.finalize();
+    b.reach(0, 0, 5);  // Ca-Sx: family0, subnet0 (best-scored edge)
+    b.reach(0, 1, 5);  // Ca-Sy: family0, subnet1
+    b.reach(1, 0, 5);  // Cb-Sx: family0, subnet1 (Cb is a different /24 than Sx)
+    // (Cb,Sy) intentionally unreachable.
+
+    const std::vector<fc::LinkPlan> plans = fc::SelectAutoLinks(b.m, 4);
+    Require(plans.size() == 2, "TC-11 must build two lanes, not collapse to the greedy one");
+    // best-first acceptance order: Ca-Sy (subnet1, clientNic 'Ca') before Cb-Sx.
+    bool sawCaSy = false;
+    bool sawCbSx = false;
+    for (const fc::LinkPlan& p : plans) {
+        if (p.localAddr == "10.0.0.2" && p.serverHost == "10.9.9.9") sawCaSy = true;
+        if (p.localAddr == "10.0.1.2" && p.serverHost == "10.0.0.9") sawCbSx = true;
+    }
+    Require(sawCaSy, "TC-11 must keep Ca->Sy (10.0.0.2 -> 10.9.9.9)");
+    Require(sawCbSx, "TC-11 must keep Cb->Sx (10.0.1.2 -> 10.0.0.9)");
+}
+
 // ---- FamilyRank / SameSubnet direct checks (L-r6-02 / D-02 scoring) --------------------
 void TC_ScoringHelpers() {
     Require(fc::FamilyRank("30.29.53.12") == 0, "FamilyRank IPv4 must be 0");
@@ -318,6 +348,7 @@ void RunRouteSelectionTests() {
     TC08_MaxConnectionsTruncation();
     TC09_LegacyDegradation();
     TC10_PrimaryGroupPreemption();
+    TC11_GreedyCounterExample();
     TC_ScoringHelpers();
     TC_AuthOkRoundTrip();
 }

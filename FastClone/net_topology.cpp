@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <map>
 #include <set>
@@ -26,6 +27,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -368,117 +370,228 @@ std::vector<LocalAddress> EnumerateProbeCandidates() {
 
 namespace {
 
-// One bind(local) -> connect(server) attempt with a timeout. Returns rttMs on success
-// or -1 on failure/timeout. localAddr "" means do not bind (OS default route).
-long ProbeOnce(const std::string& localAddr, const ServerEndpoint& server, int timeoutMs) {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    addrinfo* servInfo = nullptr;
-    const std::string portStr = std::to_string(server.port);
-    if (getaddrinfo(server.host.c_str(), portStr.c_str(), &hints, &servInfo) != 0 ||
-        servInfo == nullptr) {
-        return -1;
-    }
+// Portable probe-socket primitives. Keeps the rest of the concurrent core free of per-OS
+// socket-type / close / poll branching.
+#ifdef _WIN32
+using probe_socket_t = SOCKET;
+using probe_pollfd_t = WSAPOLLFD;
+inline bool ProbeSocketValid(probe_socket_t s) { return s != INVALID_SOCKET; }
+inline void CloseProbeSocket(probe_socket_t s) { closesocket(s); }
+inline void SetProbeNonBlocking(probe_socket_t s) {
+    u_long nonBlock = 1;
+    ioctlsocket(s, FIONBIO, &nonBlock);
+}
+// True when a non-blocking connect() has not yet completed (still in progress).
+inline bool ConnectInProgress() { return WSAGetLastError() == WSAEWOULDBLOCK; }
+inline bool PollWasInterrupted() { return WSAGetLastError() == WSAEINTR; }
+inline int ProbePoll(probe_pollfd_t* fds, size_t n, int timeoutMs) {
+    return WSAPoll(fds, static_cast<ULONG>(n), timeoutMs);
+}
+inline int ProbeConnect(probe_socket_t s, const sockaddr* addr, size_t addrlen) {
+    return connect(s, addr, static_cast<int>(addrlen));
+}
+inline int ProbeBind(probe_socket_t s, const sockaddr* addr, size_t addrlen) {
+    return bind(s, addr, static_cast<int>(addrlen));
+}
+inline bool ProbeSoError(probe_socket_t s) {
+    int soErr = 0;
+    int len = sizeof(soErr);
+    return getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len) == 0 &&
+           soErr == 0;
+}
+#else
+using probe_socket_t = int;
+using probe_pollfd_t = struct pollfd;
+inline bool ProbeSocketValid(probe_socket_t s) { return s >= 0; }
+inline void CloseProbeSocket(probe_socket_t s) { close(s); }
+inline void SetProbeNonBlocking(probe_socket_t s) {
+    const int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+}
+inline bool ConnectInProgress() { return errno == EINPROGRESS; }
+inline bool PollWasInterrupted() { return errno == EINTR; }
+inline int ProbePoll(probe_pollfd_t* fds, size_t n, int timeoutMs) {
+    return poll(fds, static_cast<nfds_t>(n), timeoutMs);
+}
+inline int ProbeConnect(probe_socket_t s, const sockaddr* addr, size_t addrlen) {
+    return connect(s, addr, static_cast<socklen_t>(addrlen));
+}
+inline int ProbeBind(probe_socket_t s, const sockaddr* addr, size_t addrlen) {
+    return bind(s, addr, static_cast<socklen_t>(addrlen));
+}
+inline bool ProbeSoError(probe_socket_t s) {
+    int soErr = 0;
+    socklen_t len = sizeof(soErr);
+    return getsockopt(s, SOL_SOCKET, SO_ERROR, &soErr, &len) == 0 && soErr == 0;
+}
+#endif
 
-    long resultMs = -1;
-    const auto start = std::chrono::steady_clock::now();
-    for (addrinfo* p = servInfo; p != nullptr && resultMs < 0; p = p->ai_next) {
-        // If a source address is requested, only try server addresses of the same family.
-        addrinfo* localInfo = nullptr;
-        if (!localAddr.empty()) {
-            if (!ResolveNumericAddr(localAddr, localInfo)) {
-                continue;
+// One concurrent "socket-level" probe attempt. A single matrix cell (i,j) expands into one
+// attempt per same-family server address (D-01: all candidates raced, first to connect wins).
+struct ProbeAttempt {
+    size_t i = 0;                                       // row (localAddr)
+    size_t j = 0;                                       // column (serverEndpoint)
+    probe_socket_t fd{};                                // non-blocking socket
+    std::chrono::steady_clock::time_point startTime;    // connect() instant (rtt origin)
+    bool pending = false;                               // true while waiting for POLLOUT verdict
+};
+
+// Stamp a successful attempt into its cell: first success sets reachable+rtt; a later success
+// for the same cell keeps the smaller rtt ("best latency" semantics, never re-clears).
+void RecordReachable(ReachabilityMatrix& matrix, const ProbeAttempt& a) {
+    const long rtt = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - a.startTime).count());
+    ReachabilityCell& cell = matrix.cells[a.i][a.j];
+    if (!cell.reachable) {
+        cell.reachable = true;
+        cell.rttMs = rtt;
+    } else if (rtt < cell.rttMs) {
+        cell.rttMs = rtt;
+    }
+}
+
+// Phase B: resolve every (i,j), create a non-blocking socket per same-family server address,
+// optionally bind the source, and fire connect(). Immediate successes are recorded in-place;
+// in-progress connects are appended to `pending`. socket/bind/cross-family failures contribute
+// nothing (the cell keeps its default reachable=false / rttMs=-1).
+void LaunchAttempts(ReachabilityMatrix& matrix, std::vector<ProbeAttempt>& pending) {
+    const size_t rows = matrix.localAddrs.size();
+    const size_t cols = matrix.serverEndpoints.size();
+    for (size_t i = 0; i < rows; ++i) {
+        const std::string& localAddr = matrix.localAddrs[i];
+        const bool haveLocal = !localAddr.empty();
+        for (size_t j = 0; j < cols; ++j) {
+            const ServerEndpoint& server = matrix.serverEndpoints[j];
+            addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            addrinfo* servInfo = nullptr;
+            const std::string portStr = std::to_string(server.port);
+            if (getaddrinfo(server.host.c_str(), portStr.c_str(), &hints, &servInfo) != 0 ||
+                servInfo == nullptr) {
+                continue;  // unresolved server -> cell stays unreachable
             }
-            if (localInfo->ai_family != p->ai_family) {
+            // Resolve the source once per cell; it must stay valid for every bind() below.
+            addrinfo* localInfo = nullptr;
+            if (haveLocal && !ResolveNumericAddr(localAddr, localInfo)) {
+                freeaddrinfo(servInfo);
+                continue;  // unparseable source -> cell stays unreachable
+            }
+            for (addrinfo* p = servInfo; p != nullptr; p = p->ai_next) {
+                // Cross-family pairs are never connected (== unreachable contribution).
+                if (haveLocal && localInfo->ai_family != p->ai_family) {
+                    continue;
+                }
+                probe_socket_t s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+                if (!ProbeSocketValid(s)) {
+                    continue;  // immediate unreachable contribution
+                }
+                SetProbeNonBlocking(s);
+                if (haveLocal &&
+                    ProbeBind(s, localInfo->ai_addr, localInfo->ai_addrlen) != 0) {
+                    CloseProbeSocket(s);
+                    continue;  // bind failure -> immediate unreachable contribution
+                }
+                ProbeAttempt attempt;
+                attempt.i = i;
+                attempt.j = j;
+                attempt.fd = s;
+                attempt.startTime = std::chrono::steady_clock::now();
+                const int cr = ProbeConnect(s, p->ai_addr, p->ai_addrlen);
+                if (cr == 0) {
+                    // Immediate success (e.g. loopback): record and close, never poll.
+                    RecordReachable(matrix, attempt);
+                    CloseProbeSocket(s);
+                } else if (ConnectInProgress()) {
+                    attempt.pending = true;
+                    pending.push_back(attempt);
+                } else {
+                    CloseProbeSocket(s);  // other immediate error -> attempt failed
+                }
+            }
+            if (localInfo != nullptr) {
                 freeaddrinfo(localInfo);
-                continue;
             }
-        }
-#ifdef _WIN32
-        SOCKET s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        const bool valid = (s != INVALID_SOCKET);
-#else
-        int s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        const bool valid = (s >= 0);
-#endif
-        if (!valid) {
-            if (localInfo) freeaddrinfo(localInfo);
-            continue;
-        }
-        bool bindOk = true;
-        if (localInfo != nullptr) {
-            if (bind(s, localInfo->ai_addr, static_cast<int>(localInfo->ai_addrlen)) != 0) {
-                bindOk = false;
-            }
-            freeaddrinfo(localInfo);
-            localInfo = nullptr;
-        }
-        if (bindOk) {
-            // Non-blocking connect + select() to bound the wait.
-#ifdef _WIN32
-            u_long nonBlock = 1;
-            ioctlsocket(s, FIONBIO, &nonBlock);
-            const int cr = connect(s, p->ai_addr, static_cast<int>(p->ai_addrlen));
-            bool connected = (cr == 0);
-            if (!connected && WSAGetLastError() == WSAEWOULDBLOCK) {
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(s, &wfds);
-                timeval tv{};
-                tv.tv_sec = timeoutMs / 1000;
-                tv.tv_usec = (timeoutMs % 1000) * 1000;
-                if (select(0, nullptr, &wfds, nullptr, &tv) > 0) {
-                    int soErr = 0;
-                    int len = sizeof(soErr);
-                    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr),
-                                   &len) == 0 && soErr == 0) {
-                        connected = true;
-                    }
-                }
-            }
-            if (connected) {
-                resultMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count());
-            }
-            closesocket(s);
-#else
-            int fl = fcntl(s, F_GETFL, 0);
-            fcntl(s, F_SETFL, fl | O_NONBLOCK);
-            const int cr = connect(s, p->ai_addr, p->ai_addrlen);
-            bool connected = (cr == 0);
-            if (!connected && errno == EINPROGRESS) {
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(s, &wfds);
-                timeval tv{};
-                tv.tv_sec = timeoutMs / 1000;
-                tv.tv_usec = (timeoutMs % 1000) * 1000;
-                if (select(s + 1, nullptr, &wfds, nullptr, &tv) > 0) {
-                    int soErr = 0;
-                    socklen_t len = sizeof(soErr);
-                    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soErr, &len) == 0 && soErr == 0) {
-                        connected = true;
-                    }
-                }
-            }
-            if (connected) {
-                resultMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count());
-            }
-            close(s);
-#endif
-        } else {
-#ifdef _WIN32
-            closesocket(s);
-#else
-            close(s);
-#endif
+            freeaddrinfo(servInfo);
         }
     }
-    freeaddrinfo(servInfo);
-    return resultMs;
+}
+
+// Phase C: a single WSAPoll/poll loop over all pending attempts, bounded by one shared
+// deadline (wall-clock ~= one timeoutMs window regardless of unreachable-cell count). Phase D:
+// any attempt still pending when the window closes is force-closed (no fd leak).
+void HarvestAttempts(ReachabilityMatrix& matrix, std::vector<ProbeAttempt>& pending,
+                     int timeoutMs) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::vector<probe_pollfd_t> pfds;
+    std::vector<size_t> backref;  // pfds[k] -> index into `pending`
+    while (true) {
+        bool anyPending = false;
+        for (const ProbeAttempt& a : pending) {
+            if (a.pending) {
+                anyPending = true;
+                break;
+            }
+        }
+        if (!anyPending) {
+            break;
+        }
+        long remaining = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count());
+        if (remaining <= 0) {
+            break;  // window exhausted
+        }
+        if (remaining > INT_MAX) {
+            remaining = INT_MAX;
+        }
+        // Rebuild pfds + backref from the current pending set each round (R-07: keep the
+        // pfd<->attempt mapping consistent, never re-poll a closed fd).
+        pfds.clear();
+        backref.clear();
+        for (size_t k = 0; k < pending.size(); ++k) {
+            if (!pending[k].pending) {
+                continue;
+            }
+            probe_pollfd_t pfd{};
+            pfd.fd = pending[k].fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            pfds.push_back(pfd);
+            backref.push_back(k);
+        }
+        const int n = ProbePoll(pfds.data(), pfds.size(), static_cast<int>(remaining));
+        if (n < 0) {
+            if (PollWasInterrupted()) {
+                continue;  // EINTR/WSAEINTR: retry with a freshly computed remaining (R-05)
+            }
+            break;  // rare hard error: remaining attempts stay unreachable
+        }
+        if (n == 0) {
+            break;  // timeout: remaining attempts stay unreachable
+        }
+        for (size_t k = 0; k < pfds.size(); ++k) {
+            // R-01: a failed connect may surface only as POLLERR/POLLHUP/POLLNVAL (not
+            // POLLOUT), so any non-zero revents triggers the SO_ERROR verdict.
+            if (pfds[k].revents == 0) {
+                continue;
+            }
+            ProbeAttempt& a = pending[backref[k]];
+            if (ProbeSoError(a.fd)) {
+                RecordReachable(matrix, a);
+            }
+            CloseProbeSocket(a.fd);
+            a.pending = false;
+        }
+    }
+    // Phase D fallback: close any fd left open by a deadline/hard-error exit.
+    for (ProbeAttempt& a : pending) {
+        if (a.pending) {
+            CloseProbeSocket(a.fd);
+            a.pending = false;
+        }
+    }
 }
 
 }  // namespace
@@ -500,15 +613,20 @@ ReachabilityMatrix ProbeReachabilityCore(std::vector<std::string> localAddrs,
     matrix.localIfaces = std::move(localIfaces);
     matrix.localPrefixLens = std::move(localPrefixLens);
     matrix.serverEndpoints = serverEndpoints;
+    // Phase A: matrix skeleton. Every cell defaults to unreachable (reachable=false,
+    // rttMs=-1); only a successful attempt overwrites it, so socket/bind/cross-family/timeout
+    // failures need no explicit write.
     matrix.cells.resize(matrix.localAddrs.size());
     for (size_t i = 0; i < matrix.localAddrs.size(); ++i) {
         matrix.cells[i].resize(matrix.serverEndpoints.size());
-        for (size_t j = 0; j < matrix.serverEndpoints.size(); ++j) {
-            const long rtt = ProbeOnce(matrix.localAddrs[i], matrix.serverEndpoints[j], timeoutMs);
-            matrix.cells[i][j].reachable = (rtt >= 0);
-            matrix.cells[i][j].rttMs = rtt;
-        }
     }
+
+    // Phase B/C/D: fire every same-family (local, server) connect non-blocking, then wait for
+    // all of them under one shared deadline. Wall-clock collapses from (failed cells x
+    // timeoutMs) to ~one timeoutMs window.
+    std::vector<ProbeAttempt> pending;
+    LaunchAttempts(matrix, pending);
+    HarvestAttempts(matrix, pending, timeoutMs);
     return matrix;
 }
 
@@ -798,7 +916,7 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     };
 
     // Keep the single best edge per (clientNIC, serverNIC) pair (e.g. an IPv4 row beats the
-    // IPv6 row to the same server NIC โ€” the L-r6-02 landing spot).
+    // IPv6 row to the same server NIC โÿÿ the L-r6-02 landing spot).
     std::map<std::pair<std::string, std::string>, Edge> bestEdge;
     for (size_t i = 0; i < matrix.localAddrs.size(); ++i) {
         const std::string cN = ifaceKeyOf(i);
@@ -832,8 +950,14 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
         }
     }
 
-    // Globally sort the per-pair best edges and greedily accept non-conflicting ones; an edge
-    // whose either side was already taken by an earlier (better) edge is dropped (B-01).
+    // Selection phase: maximum-cardinality bipartite matching with a best-first cost
+    // refinement (greedy + cardinality-protection guard). Unlike the old plain greedy, a
+    // best-scored edge that would shrink the achievable channel count is skipped, so the
+    // result is a maximum-cardinality matching whose edge-cost vector is lexicographically
+    // minimal (design ยง3.2/ยง3.3).
+
+    // Collect the per-pair best edges and order them best-first by `better`. The ordering is
+    // a strict total order independent of row/column enumeration (design ยง3.5/D-03).
     std::vector<Edge> edges;
     edges.reserve(bestEdge.size());
     for (auto& kv : bestEdge) {
@@ -841,20 +965,111 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     }
     std::sort(edges.begin(), edges.end(), better);
 
+    // Assign stable bipartite-vertex ids to the client/server NICs by sorted string, so the
+    // graph (and Kuhn's traversal order) is deterministic regardless of input order (D-03 A).
+    std::vector<std::string> clientNics;
+    std::vector<std::string> serverNics;
+    clientNics.reserve(edges.size());
+    serverNics.reserve(edges.size());
     for (const Edge& e : edges) {
-        if (plans.size() >= auxBudget) {
+        clientNics.push_back(e.clientNic);
+        serverNics.push_back(e.serverNic);
+    }
+    std::sort(clientNics.begin(), clientNics.end());
+    clientNics.erase(std::unique(clientNics.begin(), clientNics.end()), clientNics.end());
+    std::sort(serverNics.begin(), serverNics.end());
+    serverNics.erase(std::unique(serverNics.begin(), serverNics.end()), serverNics.end());
+    std::map<std::string, int> clientId;
+    std::map<std::string, int> serverId;
+    for (int i = 0; i < static_cast<int>(clientNics.size()); ++i) {
+        clientId[clientNics[i]] = i;
+    }
+    for (int j = 0; j < static_cast<int>(serverNics.size()); ++j) {
+        serverId[serverNics[j]] = j;
+    }
+    const int nC = static_cast<int>(clientNics.size());
+    const int nS = static_cast<int>(serverNics.size());
+
+    // adjacency[c] lists the server vertices client vertex c can reach; built in best-first
+    // edge order so adjacency traversal is deterministic.
+    std::vector<std::vector<int>> adjacency(nC);
+    for (const Edge& e : edges) {
+        adjacency[clientId[e.clientNic]].push_back(serverId[e.serverNic]);
+    }
+
+    // Kuhn augmenting-path routine, restricted to the not-yet-blocked vertices. Returns the
+    // matching cardinality of the residual graph (committed vertices passed in as blocked).
+    struct Kuhn {
+        const std::vector<std::vector<int>>& adjacency;
+        const std::vector<char>& blockedServer;
+        std::vector<int>& matchS;
+        std::vector<char>& visited;
+        bool augment(int c) {
+            for (int s : adjacency[c]) {
+                if (blockedServer[s] != 0 || visited[s] != 0) {
+                    continue;
+                }
+                visited[s] = 1;
+                if (matchS[s] == -1 || augment(matchS[s])) {
+                    matchS[s] = c;
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+    auto maxMatching = [&](const std::vector<char>& blockedClient,
+                           const std::vector<char>& blockedServer) -> int {
+        std::vector<int> matchS(nS, -1);  // server vertex -> matched client vertex
+        std::vector<char> visited(nS, 0);
+        Kuhn kuhn{adjacency, blockedServer, matchS, visited};
+        int matched = 0;
+        for (int c = 0; c < nC; ++c) {
+            if (blockedClient[c] != 0) {
+                continue;
+            }
+            std::fill(visited.begin(), visited.end(), 0);
+            if (kuhn.augment(c)) {
+                ++matched;
+            }
+        }
+        return matched;
+    };
+
+    // kMax = min(auxBudget, maximum matching cardinality): the channel-count ceiling.
+    std::vector<char> committedClient(nC, 0);
+    std::vector<char> committedServer(nS, 0);
+    const int m = maxMatching(committedClient, committedServer);
+    // Avoid std::min here: this TU is also built without NOMINMAX, where the Windows `min`
+    // macro would mangle the call.
+    const size_t matchMax = static_cast<size_t>(m);
+    const size_t kMax = auxBudget < matchMax ? auxBudget : matchMax;
+
+    // best-first edge greedy with a cardinality guard: tentatively commit edge e; if the
+    // residual graph can still reach kMax, keep it, otherwise skip e (it lies in no kMax
+    // matching, so dropping it loses no cardinality and improves cost lexicographically).
+    for (const Edge& e : edges) {
+        if (plans.size() >= kMax) {
             break;
         }
-        if (usedClient.count(e.clientNic) != 0 || usedServer.count(e.serverNic) != 0) {
+        const int c = clientId[e.clientNic];
+        const int s = serverId[e.serverNic];
+        if (committedClient[c] != 0 || committedServer[s] != 0) {
             continue;
         }
-        usedClient.insert(e.clientNic);
-        usedServer.insert(e.serverNic);
-        LinkPlan plan;
-        plan.localAddr = matrix.localAddrs[e.row];
-        plan.serverHost = matrix.serverEndpoints[e.col].host;
-        plan.serverPort = matrix.serverEndpoints[e.col].port;
-        plans.push_back(std::move(plan));
+        committedClient[c] = 1;
+        committedServer[s] = 1;
+        const int residual = maxMatching(committedClient, committedServer);
+        if (plans.size() + 1u + static_cast<size_t>(residual) >= kMax) {
+            LinkPlan plan;
+            plan.localAddr = matrix.localAddrs[e.row];
+            plan.serverHost = matrix.serverEndpoints[e.col].host;
+            plan.serverPort = matrix.serverEndpoints[e.col].port;
+            plans.push_back(std::move(plan));
+        } else {
+            committedClient[c] = 0;
+            committedServer[s] = 0;
+        }
     }
     return plans;
 }
