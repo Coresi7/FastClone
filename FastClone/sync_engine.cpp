@@ -65,7 +65,7 @@ std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
                                                   int exitWhenDisabled) {
     if (IsFatalClientDisconnectReason(reason)) {
         std::cerr << "[reconnect] fatal error, not retrying: \"" << reason << "\"" << std::endl;
-        return 1;
+        return kExitUsage;
     }
     if (reconnectRetries == 0) {
         return exitWhenDisabled;
@@ -76,7 +76,7 @@ std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
         (reconnectNow - reconnectWindowStart) > reconnectWindowLimit) {
         std::cerr << "[reconnect] budget exhausted attempts=" << reconnectAttemptsUsed
                   << "/" << reconnectRetries << " reason=\"" << reason << "\"" << std::endl;
-        return 4;
+        return kExitReconnectExhausted;
     }
     ++reconnectAttemptsUsed;
     const uint32_t backoffShift = std::min<uint32_t>(reconnectAttemptsUsed - 1, 5u);
@@ -2361,8 +2361,8 @@ int RunClient(const CliOptions& options) {
         const std::string connectReason = ex.what();
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
                 connectReason, options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/1)) {
-            if (*exitCode == 1) {
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitUsage)) {
+            if (*exitCode == kExitUsage) {
                 std::cerr << "FastClone error: " << connectReason << std::endl;
             }
             return *exitCode;
@@ -2400,7 +2400,7 @@ int RunClient(const CliOptions& options) {
                   << " enumerated=0 elapsed=" << formatElapsed() << std::endl;
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
                 ex.what(), options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/3)) {
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
             return *exitCode;
         }
         continue;
@@ -4445,7 +4445,7 @@ int RunClient(const CliOptions& options) {
             recvError.empty() ? "connection_closed" : recvError;
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
                 disconnectReason, options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/3)) {
+                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
             return *exitCode;
         }
         continue;
@@ -4548,7 +4548,7 @@ int RunClient(const CliOptions& options) {
     std::cout << "Sync completed. changed_files=" << transferred
               << " failed_files=" << failed
               << " elapsed=" << formatElapsed() << std::endl;
-    return success ? 0 : 2;
+    return success ? kExitOk : kExitFailedFiles;
     }  // while (reconnect session)
 }
 

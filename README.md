@@ -59,7 +59,7 @@ The `--once` flag enables a single-use server mode designed for CI/CD pipelines:
 
 - The server listens for incoming connections. Pre-handshake probes (e.g. reachability checks that close before sending bytes) are silently ignored and do not count as a real session.
 - When a real session completes cleanly (all connections finish without any lane error), the server exits with code `0`.
-- If any lane of the single session encounters an error, the server exits with code `2` (session failed/aborted).
+- If any lane of the single session encounters an error, the server exits with code `5` (session failed/aborted).
 - If a second independent session arrives while the first is still in flight, it is rejected (the server refuses to serve it).
 - Mutually exclusive with `--enable-hash-memcache` (the server process exits after one session, so a long-lived cache is pointless).
 
@@ -139,8 +139,8 @@ If the connection drops before the manifest is fully received, the client automa
 
 **Server `--once`:**
 - `0`: the single real session completed cleanly
-- `1`: argument error or runtime exception
-- `2`: the single real session failed or was aborted (any lane error)
+- `1`: argument/usage error (e.g. `--once` together with `--enable-hash-memcache`, or `--once` on the client)
+- `5`: the single real session failed or was aborted (any lane error) — distinct from the client's `2` so every exit code has one unambiguous meaning
 
 ## Cross-Platform Build (Linux/macOS)
 

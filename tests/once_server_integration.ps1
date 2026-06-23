@@ -4,7 +4,7 @@
 #
 # Covers (design §5.2):
 #   OS-1 success path   -> server --once auto-exits with code 0 (V-04 / AC-04/AC-08A/AC-12)
-#   OS-2 failure path   -> served session aborted -> server exit 2 (V-05/V-06 / AC-05/AC-06)
+#   OS-2 failure path   -> served session aborted -> server exit 5 (V-05/V-06 / AC-05/AC-06)
 #   OS-3 usage errors   -> client --once / --once+--enable-hash-memcache -> exit 1 (V-02/V-03)
 #   OS-4 probe (opt.)   -> pre-handshake close does not exit the server (V-07 / AC-07)
 
@@ -151,7 +151,7 @@ try {
     if ($code5 -eq 0) { throw "OS-5: second client unexpectedly succeeded (exit 0); server served a second session" }
     Write-Host "  OK second client refused (no server listening); client exit=$code5"
 
-    Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 2"
+    Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 5"
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", "--once"
     ) -OutLog "$logDir\os2-server.out" -ErrLog "$logDir\os2-server.err"
@@ -168,7 +168,7 @@ try {
     }
     Stop-Process -Id $cli2.Id -Force -ErrorAction SilentlyContinue
     $code2 = Wait-ExitCode -Proc $srv2 -TimeoutSec 30
-    if ($code2 -ne 2) { throw "OS-2: server --once expected exit 2, got $code2" }
+    if ($code2 -ne 5) { throw "OS-2: server --once expected exit 5, got $code2" }
     Write-Host "  OK server exit=$code2"
 
     Write-Host "[OS-3] usage errors -> exit 1"
