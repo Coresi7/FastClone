@@ -73,6 +73,20 @@ When the server and client each have multiple NICs, FastClone can use **several 
 - **Large files stay on the primary link**: a single file cannot be split across links, so files `>= --large-file-threshold` (default `1G`) are pinned to the primary link (assumed best); other files / small-file batches are spread across links adaptively by measured throughput.
 - With a single NIC / endpoint it degrades to a single connection, identical to prior behavior.
 
+#### How to Enable / Disable Reachability Probing
+
+**Server side** — endpoint advertisement is always on. When a client connects for the first time, the server automatically enumerates all local NIC addresses, groups them by physical interface, and sends them in the `AuthOk` frame. There is currently no CLI option to suppress advertisement; to prevent clients from probing extra endpoints, restrict reachability at the network/firewall level so that only one NIC is reachable from the client.
+
+**Client side** — reachability probing is controlled by whether `--link` is specified:
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| Auto (probing enabled) | No `--link` given, and server advertises > 1 endpoint **or** client has > 1 NIC candidate | Client enumerates local NICs, probes reachability to all server endpoints, then selects optimal link pairs |
+| Auto-degraded (probing skipped) | No `--link` given, but only 1 server endpoint + 1 local candidate | Probing is skipped; falls back to single-link behavior |
+| Explicit (probing bypassed) | One or more `--link` given | Client uses the pinned link(s) directly; no probing occurs |
+
+To **disable** probing entirely, use `--link` to explicitly pin link(s). Even a single `--link` (primary only) will bypass all automatic selection and probing.
+
 Diagnostics: the solution ships an **optionally-built** `FastCloneRouteProbe` project that probes a given server and prints the reachability matrix and the final link selection, to help diagnose link assignment in the field.
 
 ## Reconnect on Transient Network Failures
