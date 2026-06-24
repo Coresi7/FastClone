@@ -4,6 +4,8 @@
 #
 # Covers (design §5.2):
 #   OS-1 success path   -> server --once auto-exits with code 0 (V-04 / AC-04/AC-08A/AC-12)
+#   OS-5 terminal path  -> after once terminal, second client is refused (AC-10 / FR-10/FR-11)
+#   OS-5b in-flight path-> while target session is active, second Auth gets AuthFail (AC-10)
 #   OS-2 failure path   -> served session aborted -> server exit 5 (V-05/V-06 / AC-05/AC-06)
 #   OS-3 usage errors   -> client --once / --once+--enable-hash-memcache -> exit 1 (V-02/V-03)
 #   OS-4 probe (opt.)   -> pre-handshake close does not exit the server (V-07 / AC-07)
@@ -139,7 +141,7 @@ try {
     Write-Host "[OS-5] AC-10: after first session terminal, a second client is refused"
     # The OS-1 server already auto-exited after its single real session (FR-10/FR-11): it is
     # not kept alive for a second session. A new client must therefore fail to connect rather
-    # than be served (exit != 0). Guards against the server lingering for a second session.
+    # than be served (exit != 0). OS-5b below covers the in-flight rejection path.
     if (-not $srv1.HasExited) { throw "OS-5: server still alive after first session terminal" }
     $tgt5 = Join-Path $root "tgt5"
     New-Item -ItemType Directory -Force -Path $tgt5 | Out-Null
@@ -150,6 +152,41 @@ try {
     $code5 = Wait-ExitCode -Proc $cli5 -TimeoutSec 20
     if ($code5 -eq 0) { throw "OS-5: second client unexpectedly succeeded (exit 0); server served a second session" }
     Write-Host "  OK second client refused (no server listening); client exit=$code5"
+
+    Write-Host "[OS-5b] AC-10: while target session is active, second Auth is rejected"
+    $srv5b = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\os5b-server.out" -ErrLog "$logDir\os5b-server.err"
+    Start-Sleep -Seconds 1
+    $tgt5b1 = Join-Path $root "tgt5b1"
+    New-Item -ItemType Directory -Force -Path $tgt5b1 | Out-Null
+    $cli5b1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "client", "--server", $serverAddr, "--target", $tgt5b1, "--password", $password,
+        "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
+    ) -OutLog "$logDir\os5b-cli1.out" -ErrLog "$logDir\os5b-cli1.err"
+    Start-Sleep -Seconds 2
+    if ($cli5b1.HasExited) {
+        throw "OS-5b: first client finished too fast; fixture no longer in-flight"
+    }
+    $tgt5b2 = Join-Path $root "tgt5b2"
+    New-Item -ItemType Directory -Force -Path $tgt5b2 | Out-Null
+    $cli5b2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "client", "--server", $serverAddr, "--target", $tgt5b2, "--password", $password,
+        "--reconnect-retries", "0"
+    ) -OutLog "$logDir\os5b-cli2.out" -ErrLog "$logDir\os5b-cli2.err"
+    $code5b2 = Wait-ExitCode -Proc $cli5b2 -TimeoutSec 10
+    if ($code5b2 -ne 1) {
+        throw "OS-5b: second client expected fatal exit 1, got $code5b2"
+    }
+    $err5b2 = Get-Content "$logDir\os5b-cli2.err" -Raw -ErrorAction SilentlyContinue
+    if ($err5b2 -notmatch "authentication rejected|once: server already serving one session") {
+        throw "OS-5b: second client stderr missing AuthFail/once rejection text: $err5b2"
+    }
+    $code5b1 = Wait-ExitCode -Proc $cli5b1 -TimeoutSec 180
+    if ($code5b1 -ne 0) { throw "OS-5b: first client expected exit 0, got $code5b1" }
+    $code5b = Wait-ExitCode -Proc $srv5b -TimeoutSec 180
+    if ($code5b -ne 0) { throw "OS-5b: server --once expected exit 0, got $code5b" }
+    Write-Host "  OK second Auth rejected; first session completed; server exit=$code5b"
 
     Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 5"
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(

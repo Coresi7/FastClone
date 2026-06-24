@@ -198,6 +198,13 @@ CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, con
 // --- FC6 handshake: version negotiation + the client/server primitives live in
 // client_handshake.h/.cpp (fc namespace). HandshakeAndResolveSession below stays here
 // because it is coupled to the server-side session registry state. ---
+// Forward (non-defining) declaration, NOT external linkage. This and the definition near
+// RunServer both live inside fc's single unnamed namespace -- the multiple `namespace {}`
+// blocks in this TU are the SAME unnamed namespace -- so both have INTERNAL linkage and name
+// the one entity fc::<unnamed>::g_onceTargetClaimed. The `extern` here merely marks this as a
+// non-defining declaration so HandshakeAndResolveSession (below) can reference the once-claim
+// flag that is defined later; it does not (and cannot) promote it to external linkage.
+extern std::atomic<bool> g_onceTargetClaimed;
 
 // Server-side logical session shared by all connections that carry the same sessionId
 // (FR-003/004). Per D-02 it only carries merge identity + lifecycle, not transfer state.
@@ -299,7 +306,8 @@ SessionRegistry& GetSessionRegistry() {
 // liveConns); the caller must call OnConnectionClosed exactly once. Throws on rejection.
 std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& socket,
                                                           const std::string& password,
-                                                          const std::vector<AdvertisedEndpoint>& serverAddrs) {
+                                                          const std::vector<AdvertisedEndpoint>& serverAddrs,
+                                                          bool isOnce) {
     NegotiateHelloAsServer(socket);
     const Frame claim = RecvFrame(socket);
     if (claim.type == MsgType::Auth) {
@@ -307,6 +315,10 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         if (got != password) {
             SendSimple(socket, MsgType::AuthFail, "bad password");
             throw std::runtime_error("Authentication failed");
+        }
+        if (isOnce && g_onceTargetClaimed.load(std::memory_order_acquire)) {
+            SendSimple(socket, MsgType::AuthFail, "once: server already serving one session");
+            throw std::runtime_error("Authentication failed: once server already serving one session");
         }
         std::shared_ptr<ServerSession> session = GetSessionRegistry().CreateSession();
         AuthOkInfo info;
@@ -2022,6 +2034,7 @@ std::atomic<bool>         g_onceShouldExit{false};
 std::atomic<int>          g_onceExitCode{kExitOk};
 std::atomic<SocketNative> g_onceListenSock{kInvalidSocket};
 std::atomic<bool>         g_onceTerminalFired{false};
+std::atomic<bool>         g_onceTargetClaimed{false};  // write-once (false -> true), never reset
 std::mutex                g_onceMu;
 std::weak_ptr<ServerSession> g_onceTarget;  // guarded by g_onceMu
 
@@ -2038,12 +2051,15 @@ static_assert(std::atomic<SocketNative>::is_always_lock_free,
 // real session, which RunServer then refuses to serve (FR-05 / FR-10).
 bool ClaimOrMatchOnceTarget(const std::shared_ptr<ServerSession>& s) {
     std::lock_guard<std::mutex> lk(g_onceMu);
-    auto cur = g_onceTarget.lock();
-    if (!cur) {
+    if (!g_onceTargetClaimed.load(std::memory_order_relaxed)) {
         g_onceTarget = s;
+        // Publish "claimed" after g_onceTarget assignment so acquire readers never observe
+        // true without the matching target pointer initialized.
+        g_onceTargetClaimed.store(true, std::memory_order_release);
         return true;
     }
-    return cur == s;
+    auto cur = g_onceTarget.lock();
+    return cur && cur == s;
 }
 
 // Close the listening socket to interrupt a blocking accept() on the main thread (FR-09).
@@ -2159,15 +2175,16 @@ int RunServer(const CliOptions& options) {
                      client = std::move(client)]() mutable {
             std::shared_ptr<ServerSession> session;
             try {
-                session = HandshakeAndResolveSession(client, options.password, serverAddrs);
+                session = HandshakeAndResolveSession(client, options.password, serverAddrs,
+                                                     options.exitAfterSync);
                 std::cout << "[mp] conn_accept conn=" << connSeq
                           << " sessionId=" << session->sessionId
                           << " live_conns=" << session->liveConns.load() << std::endl;
                 if (options.exitAfterSync && !ClaimOrMatchOnceTarget(session)) {
-                    // --once: a second independent real session arrived while the once-target
-                    // is still in flight. Refuse to serve it (FR-05/FR-10): skip RunSessionServer
-                    // so completedOk stays false; it is reclaimed via the shared close path below.
-                    std::cerr << "[mp] once_reject_second_session conn=" << connSeq
+                    // Fallback guard for a tiny race window: if a second Auth slipped past the
+                    // pre-AuthFail check before claimed=true became visible, refuse to serve it.
+                    // This path should be rare; normal second Auth is rejected in handshake.
+                    std::cerr << "[mp] once_reject_post_auth_fallback conn=" << connSeq
                               << " sessionId=" << session->sessionId << std::endl;
                 } else {
                     RunSessionServer(client, options);
