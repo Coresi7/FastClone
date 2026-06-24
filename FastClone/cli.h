@@ -34,6 +34,10 @@ struct CliOptions {
     bool enableHashMemcache = false;
     // OneShot 服务端模式（--once）。仅服务端有效；服务完一个真实会话后进程退出。
     bool exitAfterSync = false;
+    // 服务端专用：多真实会话并发 + 空闲宽限后优雅退出（与 --once 互斥）。映射 --once-multi（FR-01）。
+    bool onceMulti = false;
+    // 空闲宽限毫秒数，默认 5s；仅在 onceMulti 下有效（FR-04）。--once-idle-grace。
+    uint64_t onceIdleGraceMs = 5000;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
     bool diagnostics = false;

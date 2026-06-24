@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,10 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port, const ConnectBind
 std::string LocalAddressOf(const SocketHandle& socket);
 SocketHandle CreateServer(uint16_t port);
 SocketHandle AcceptClient(const SocketHandle& listener);
+// Like AcceptClient but waits at most timeoutMs for an incoming connection. Returns nullopt
+// when the wait elapses with no pending connection (used by --once-multi so the accept loop
+// can periodically evaluate idle-grace, design §6.2). Throws on a hard accept/poll error.
+std::optional<SocketHandle> AcceptClientTimeout(const SocketHandle& listener, int timeoutMs);
 void SendAll(const SocketHandle& socket, const void* data, size_t length);
 void SendBuffersAll(const SocketHandle& socket, const SocketBuffer* buffers, size_t count);
 void RecvAll(const SocketHandle& socket, void* data, size_t length);

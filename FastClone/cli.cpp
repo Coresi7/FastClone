@@ -45,7 +45,7 @@ const std::string& ArgAt(const std::vector<std::string>& args, size_t index) {
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
-        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>\n"
+        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] --password <pwd>\n"
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -209,6 +209,9 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     }
 
     CliOptions options;
+    // Tracks whether --once-idle-grace was explicitly supplied (parse-time local only, so the
+    // default 5s in CliOptions stays uncontaminated). Used by validation #8 below (FR-05).
+    bool sawIdleGrace = false;
 
     if (args[0] == "server") {
         options.mode = Mode::Server;
@@ -290,6 +293,14 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.enableHashMemcache = true;
         } else if (arg == "--once") {
             options.exitAfterSync = true;
+        } else if (arg == "--once-multi") {
+            options.onceMulti = true;
+        } else if (arg == "--once-idle-grace") {
+            options.onceIdleGraceMs = ParseDurationMsStrict(ArgAt(args, ++i), "--once-idle-grace");
+            if (options.onceIdleGraceMs == 0) {
+                throw std::runtime_error("Invalid --once-idle-grace (must be > 0)");
+            }
+            sawIdleGrace = true;
         } else if (arg == "--diag") {
             options.diagnostics = true;
         } else if (arg == "--reconnect-retries") {
@@ -323,8 +334,22 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (options.mode == Mode::Client && options.exitAfterSync) {
         throw std::runtime_error("--once is server-only");
     }
+    // #5: --once-multi is server-only (FR-03 / AC-03). Checked before the once/once-multi
+    // mutual-exclusion so `client --once-multi` reports the server-only category.
+    if (options.mode == Mode::Client && options.onceMulti) {
+        throw std::runtime_error("--once-multi is server-only");
+    }
+    // #6: --once and --once-multi are mutually exclusive (FR-02 / AC-02).
+    if (options.exitAfterSync && options.onceMulti) {
+        throw std::runtime_error("--once and --once-multi are mutually exclusive");
+    }
     if (options.exitAfterSync && options.enableHashMemcache) {
         throw std::runtime_error("--once and --enable-hash-memcache are mutually exclusive");
+    }
+    // #8: --once-idle-grace only has meaning under --once-multi (FR-05 / AC-06). --once-multi
+    // with --enable-hash-memcache stays allowed (FR-06): no exclusion is added for that pair.
+    if (sawIdleGrace && !options.onceMulti) {
+        throw std::runtime_error("--once-idle-grace requires --once-multi");
     }
     // Normalize the endpoint list so the engine always sees servers[0] == host/port.
     if (options.servers.empty()) {

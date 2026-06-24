@@ -23,14 +23,16 @@
 ### 服务端
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once | --once-multi [--once-idle-grace <duration>]] --password <pwd>
 ```
 
 - `--dir`：服务根目录；默认当前目录
 - `--port`：监听端口；默认 `27842`
 - `--server-hash-workers`：服务进程级 hash 线程数（对所有 session 生效）；`0` 表示自动，范围 `0..512`
 - `--enable-hash-memcache`：启用服务端内存 hash 缓存；当 `path + mtime + size` 一致时复用缓存 hash
-- `--once`：一次性服务端模式——服务完一个真实会话后进程退出（仅服务端可用，与 `--enable-hash-memcache` 互斥）
+- `--once`：一次性服务端模式——服务完一个真实会话后进程退出（仅服务端可用；与 `--enable-hash-memcache`、`--once-multi` 互斥）
+- `--once-multi`：多客户端一次性模式——服务任意多个会话，待所有会话排空且空闲宽限期内无新连接后退出（仅服务端可用；与 `--once` 互斥；**与 `--enable-hash-memcache` 兼容**，多客户端下缓存有益）
+- `--once-idle-grace`：`--once-multi` 的空闲宽限时长（默认 `5s`，支持 `s`/`m`/`h` 后缀）；仅与 `--once-multi` 同用时有效
 - `--password`：预共享口令（必填）
 
 ### 客户端
@@ -69,6 +71,20 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 3. 进程干净退出——整个过程中无 `exit()` 或 `abort()` 调用。
 
 此模式**仅服务端可用**；在客户端传入 `--once` 会导致 CLI 报错。
+
+## 多客户端一次性模式（`--once-multi`）
+
+`--once-multi` 是 `--once` 的并列模式，面向"一台临时服务端服务多个客户端"的 CI/CD 场景：服务端接受**任意多个会话**，待全部结束、且监听器空闲达到宽限窗口后才退出。
+
+**行为：**
+
+- 会话可并发/顺序服务。一个会话可包含多条多路径连接（lane）；计数单位是**会话**而非连接。
+- 在已服务过 ≥1 个真实会话后，当活动会话数降为 `0`、且此后在空闲宽限窗口（`--once-idle-grace`，默认 `5s`）内无新的（握手完成的）连接时，服务端退出；宽限窗口内有新会话到达则取消/重置计时。
+- 握手前的探测连接不计入会话，也不重置宽限窗口。
+- 若从未有客户端连上，服务端不会自行退出（由 CI 超时兜底，与 `--once` 一致）。
+- 退出码按所有已服务会话聚合：全部干净完成则 `0`，任一会话失败/中止则 `5`。
+- 与 `--once` 不同，`--once-multi` **与 `--enable-hash-memcache` 兼容**——共享哈希缓存对同一次运行中的后续客户端有益。
+- 与 `--once` 互斥。
 
 ## 进度输出
 
@@ -142,10 +158,10 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `3`：同步未完成且自动重连已禁用（`--reconnect-retries 0`），或连接中断后未启用重连
 - `4`：自动重连预算耗尽，同步仍未完成
 
-**服务端 `--once`：**
-- `0`：唯一真实会话干净完成
-- `1`：参数/用法错误（如 `--once` 与 `--enable-hash-memcache` 同用，或客户端误用 `--once`）
-- `5`：唯一真实会话失败或中止（任意 lane 发生错误）——与客户端的 `2` 区分，确保每个退出码语义唯一
+**服务端 `--once` / `--once-multi`：**
+- `0`：已服务的会话全部干净完成（`--once`：唯一会话；`--once-multi`：每个会话）
+- `1`：参数/用法错误（如 `--once` 与 `--enable-hash-memcache` 同用、`--once` 与 `--once-multi` 同用、`--once-idle-grace` 未配 `--once-multi`，或在客户端误用这些开关）
+- `5`：某个已服务会话失败或中止（任意 lane 发生错误；`--once-multi` 按聚合，任一失败即 `5`）——与客户端的 `2` 区分，确保每个退出码语义唯一
 
 ## 跨平台构建（Linux/macOS）
 

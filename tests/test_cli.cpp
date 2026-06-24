@@ -149,4 +149,95 @@ void RunCliTests() {
                         "--enable-hash-memcache",
                     },
                     "mutually exclusive");
+
+    // OM-CLI-1 (AC-01): server --once-multi parses into onceMulti.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone",
+            "server",
+            "--password",
+            "pw",
+            "--once-multi",
+        });
+        Require(opt.mode == fc::Mode::Server, "Expected server mode for --once-multi");
+        Require(opt.onceMulti, "Expected onceMulti set by --once-multi");
+        Require(!opt.exitAfterSync, "Expected --once-multi to leave exitAfterSync false");
+    }
+
+    // OM-CLI-2 (AC-02): --once and --once-multi are mutually exclusive.
+    ExpectThrowWith({
+                        "FastClone",
+                        "server",
+                        "--password",
+                        "pw",
+                        "--once",
+                        "--once-multi",
+                    },
+                    "mutually exclusive");
+
+    // OM-CLI-3 (AC-03): --once-multi is server-only.
+    ExpectThrowWith({
+                        "FastClone",
+                        "client",
+                        "--server",
+                        "127.0.0.1:27842",
+                        "--target",
+                        ".",
+                        "--password",
+                        "pw",
+                        "--once-multi",
+                    },
+                    "server-only");
+
+    // OM-CLI-4 (AC-04): --once-idle-grace parses s/m/h via the shared duration parser.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+            "--once-idle-grace", "7s",
+        });
+        Require(opt.onceIdleGraceMs == 7000ULL, "Expected --once-idle-grace 7s -> 7000ms");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+            "--once-idle-grace", "2m",
+        });
+        Require(opt.onceIdleGraceMs == 120000ULL, "Expected --once-idle-grace 2m -> 120000ms");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+            "--once-idle-grace", "1h",
+        });
+        Require(opt.onceIdleGraceMs == 3600000ULL, "Expected --once-idle-grace 1h -> 3600000ms");
+    }
+
+    // OM-CLI-5 (AC-05): default idle-grace is 5s when not specified.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+        });
+        Require(opt.onceIdleGraceMs == 5000ULL, "Expected default --once-idle-grace 5000ms");
+    }
+
+    // OM-CLI-6 (AC-06): --once-idle-grace requires --once-multi.
+    ExpectThrowWith({
+                        "FastClone",
+                        "server",
+                        "--password",
+                        "pw",
+                        "--once-idle-grace",
+                        "5s",
+                    },
+                    "requires --once-multi");
+
+    // OM-CLI-7 (AC-07): --once-multi and --enable-hash-memcache may be combined.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+            "--enable-hash-memcache",
+        });
+        Require(opt.onceMulti, "Expected onceMulti set with memcache");
+        Require(opt.enableHashMemcache, "Expected enableHashMemcache set with once-multi");
+    }
 }

@@ -233,7 +233,31 @@ public:
         session->lastActivity = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mu_);
         byId_.emplace(session->sessionId, session);
+        // --once-multi: count every real session created (never probes / Join lanes), so the
+        // main thread can tell "has served >=1 real session" even after the session is swept
+        // (FR-08 served-marker / FR-12). Write under mu_, same as byId_.
+        ++createdTotal_;
         return session;
+    }
+
+    // --once-multi snapshot: number of real sessions still holding a live lane (multi-lane
+    // counts as 1, design §6.1 / FR-08) and the cumulative count of created real sessions.
+    // Derived from the single source of truth (liveConns) under mu_ so it stays consistent
+    // with concurrent Create/Join/Close (NFR-02). O(active sessions), polled ~5x/s.
+    struct IdleSnapshot {
+        size_t activeRealSessions = 0;
+        uint64_t createdTotal = 0;
+    };
+    IdleSnapshot SnapshotIdle() {
+        std::lock_guard<std::mutex> lock(mu_);
+        IdleSnapshot snap;
+        snap.createdTotal = createdTotal_;
+        for (const auto& kv : byId_) {
+            if (kv.second->liveConns.load(std::memory_order_relaxed) > 0) {
+                ++snap.activeRealSessions;
+            }
+        }
+        return snap;
     }
 
     // Follow-up connection: look up an existing session and count this connection.
@@ -294,6 +318,9 @@ private:
     static constexpr std::chrono::seconds kSessionIdleTtl{60};  // gatekeeper default
     std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<ServerSession>> byId_;
+    // --once-multi: monotonically increasing count of real sessions ever created. Guarded by
+    // mu_; never decremented (a TTL-swept session still counts as "served"). Inert otherwise.
+    uint64_t createdTotal_ = 0;
 };
 
 SessionRegistry& GetSessionRegistry() {
@@ -2094,6 +2121,58 @@ void FireOnceTerminal(bool success) {
     WakeAcceptLoop();
 }
 
+// --- --once-multi process-wide state (design §4.3 / §6.4-6.6) ---
+// Sticky failure aggregate: set true the first time any real session ends not-clean and never
+// reset (B5 / FR-13). Read once by the main thread when firing the terminal verdict. The
+// once-multi exit channel reuses g_onceShouldExit / g_onceExitCode / g_onceTerminalFired (D-04);
+// it deliberately does NOT touch g_onceTarget / g_onceMu (those stay --once-only, §8).
+std::atomic<bool> g_omAnyFailure{false};
+
+// Fire the once-multi terminal verdict from the main thread once idle-grace has elapsed. Mirrors
+// FireOnceTerminal's publish order (exitCode relaxed, then shouldExit release) so the accept-loop
+// top bail returns the final code. WakeAcceptLoop is redundant here (the main thread itself fires
+// this) but kept for FR-14 channel parity and harmless idempotence.
+void FireOnceMultiTerminal() {
+    if (g_onceTerminalFired.exchange(true)) {
+        return;
+    }
+    g_onceExitCode.store(g_omAnyFailure.load(std::memory_order_relaxed)
+                             ? kExitOnceSessionFailed
+                             : kExitOk,
+                         std::memory_order_relaxed);
+    g_onceShouldExit.store(true, std::memory_order_release);
+    WakeAcceptLoop();
+}
+
+// Main-thread idle-grace evaluator (design §6.4). idleSince lives on the RunServer stack and is
+// touched ONLY here, so arm/cancel can never race (D-01). State is derived purely from the
+// registry snapshot: served (createdTotal>0) gates entry (FR-12/B4); activeRealSessions==0 arms
+// the timer (FR-09) and any new real session re-arms it from zero (FR-10); probes never change
+// either field so they neither reset nor block the grace (FR-11).
+void EvaluateIdleGrace(uint64_t graceMs,
+                       std::optional<std::chrono::steady_clock::time_point>& idleSince) {
+    const SessionRegistry::IdleSnapshot snap = GetSessionRegistry().SnapshotIdle();
+    const bool served = snap.createdTotal > 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (served && snap.activeRealSessions == 0) {
+        if (!idleSince) {
+            idleSince = now;  // arm: enter S3 grace window (FR-09)
+            std::cout << "[om] idle_grace_armed grace_ms=" << graceMs << std::endl;
+        } else if (now - *idleSince >= std::chrono::milliseconds(graceMs)) {
+            std::cout << "[om] terminal exit="
+                      << (g_omAnyFailure.load(std::memory_order_relaxed)
+                              ? kExitOnceSessionFailed
+                              : kExitOk)
+                      << std::endl;
+            FireOnceMultiTerminal();  // S4: grace elapsed (FR-13/FR-14)
+        }
+    } else if (idleSince) {
+        // active>0 again (new/returning real session) -> cancel and reset the timer (FR-10/B4).
+        idleSince.reset();
+        std::cout << "[om] idle_grace_reset active=" << snap.activeRealSessions << std::endl;
+    }
+}
+
 }  // namespace
 
 int RunServer(const CliOptions& options) {
@@ -2148,6 +2227,11 @@ int RunServer(const CliOptions& options) {
     const bool debugEnabled = IsDebugEnabled();
     std::atomic<uint64_t> connIdCounter{0};
     std::atomic<uint32_t> activeSessions{0};
+    // --once-multi accept-loop evaluation tick (design §6.2). grace is measured by wall clock,
+    // so its resolution is +/- one tick (negligible for second-scale grace).
+    constexpr int kOnceMultiTickMs = 200;
+    // --once-multi idle timer: main-thread-only, so arm/cancel can never race (design §6.4/§7).
+    std::optional<std::chrono::steady_clock::time_point> idleSince;
     while (true) {
         // --once: a terminal verdict may have fired while we were dispatching; bail before
         // blocking again so we never serve a second session (FR-10) and return cleanly (FR-09).
@@ -2155,19 +2239,47 @@ int RunServer(const CliOptions& options) {
             listener.Release();  // fd already closed by WakeAcceptLoop; drop ownership.
             return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
         }
-        std::cout << "Waiting for client... active_connections=" << activeSessions.load()
-                  << " sessions=" << GetSessionRegistry().SessionCount() << std::endl;
+        // --once-multi: idle-grace fired (from this same thread) -> return the aggregated code.
+        if (options.onceMulti && g_onceShouldExit.load(std::memory_order_acquire)) {
+            listener.Release();
+            return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
+        }
         SocketHandle client;
-        try {
-            client = AcceptClient(listener);
-        } catch (const std::exception&) {
-            // --once: the terminal thread closed the listener to wake us. Tolerate this one
-            // accept failure and return the recorded exit code (never exit() mid-flight, FR-09).
-            if (options.exitAfterSync && g_onceShouldExit.load(std::memory_order_acquire)) {
-                listener.Release();
-                return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
+        if (options.onceMulti) {
+            // Poll-with-timeout accept so this thread regains control every tick to evaluate
+            // idle-grace, while accept stays open for new sessions (FR-07/FR-15). Per-tick
+            // "Waiting for client..." is intentionally suppressed to avoid a 5/s log flood.
+            std::optional<SocketHandle> maybe;
+            try {
+                maybe = AcceptClientTimeout(listener, kOnceMultiTickMs);
+            } catch (const std::exception&) {
+                if (g_onceShouldExit.load(std::memory_order_acquire)) {
+                    listener.Release();
+                    return g_onceExitCode.load(std::memory_order_relaxed);
+                }
+                throw;
             }
-            throw;  // non-once: preserve existing "accept error -> main catch -> exit 1".
+            if (!maybe) {
+                // Timeout tick: evaluate idle-grace ONLY when nothing was accepted this tick,
+                // so a just-accepted connection is never immediately judged idle (design §6.2/R-02).
+                EvaluateIdleGrace(options.onceIdleGraceMs, idleSince);
+                continue;
+            }
+            client = std::move(*maybe);
+        } else {
+            std::cout << "Waiting for client... active_connections=" << activeSessions.load()
+                      << " sessions=" << GetSessionRegistry().SessionCount() << std::endl;
+            try {
+                client = AcceptClient(listener);
+            } catch (const std::exception&) {
+                // --once: the terminal thread closed the listener to wake us. Tolerate this one
+                // accept failure and return the recorded exit code (never exit() mid-flight, FR-09).
+                if (options.exitAfterSync && g_onceShouldExit.load(std::memory_order_acquire)) {
+                    listener.Release();
+                    return g_onceExitCode.load(std::memory_order_relaxed);  // published-before shouldExit
+                }
+                throw;  // non-once: preserve existing "accept error -> main catch -> exit 1".
+            }
         }
         const uint64_t connSeq = connIdCounter.fetch_add(1) + 1;
         activeSessions.fetch_add(1);
@@ -2190,8 +2302,8 @@ int RunServer(const CliOptions& options) {
                     RunSessionServer(client, options);
                     std::cout << "[mp] conn_done conn=" << connSeq
                               << " sessionId=" << session->sessionId << std::endl;
-                    if (options.exitAfterSync) {
-                        session->completedOk.store(true, std::memory_order_relaxed);  // FR-06/07A
+                    if (options.exitAfterSync || options.onceMulti) {
+                        session->completedOk.store(true, std::memory_order_relaxed);  // FR-06/07A; om: D-03
                     }
                 }
             } catch (const std::exception& ex) {
@@ -2213,9 +2325,9 @@ int RunServer(const CliOptions& options) {
                     std::cerr << "[mp] conn_error conn=" << connSeq << " error: " << errMsg
                               << std::endl;
                 }
-                // --once: any real-session lane error marks the session failed (FR-07).
-                // A pre-handshake close has session == null and never sets this (FR-08.1).
-                if (options.exitAfterSync && session) {
+                // --once / --once-multi: any real-session lane error marks the session failed
+                // (FR-07). A pre-handshake close has session == null and never sets this (FR-08.1).
+                if ((options.exitAfterSync || options.onceMulti) && session) {
                     session->hadError.store(true, std::memory_order_relaxed);
                 }
             }
@@ -2236,6 +2348,17 @@ int RunServer(const CliOptions& options) {
                 if (isTarget && remaining == 0) {
                     FireOnceTerminal(session->completedOk.load(std::memory_order_relaxed) &&
                                      !session->hadError.load(std::memory_order_relaxed));
+                }
+            } else if (options.onceMulti && session) {
+                // --once-multi: when a real session's last lane closes, fold its verdict into the
+                // sticky failure aggregate (B5/FR-13). The main thread later reads it at terminal.
+                // No g_onceTarget involvement (§8): every real session is served, not just one.
+                if (remaining == 0) {
+                    const bool ok = session->completedOk.load(std::memory_order_relaxed) &&
+                                    !session->hadError.load(std::memory_order_relaxed);
+                    if (!ok) {
+                        g_omAnyFailure.store(true, std::memory_order_relaxed);
+                    }
                 }
             }
             activeSessions.fetch_sub(1);

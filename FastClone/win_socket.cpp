@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -271,6 +273,33 @@ SocketHandle AcceptClient(const SocketHandle& listener) {
     }
     TuneSocketForThroughput(client);
     return SocketHandle(client);
+}
+
+std::optional<SocketHandle> AcceptClientTimeout(const SocketHandle& listener, int timeoutMs) {
+#ifdef _WIN32
+    WSAPOLLFD pfd{};
+    pfd.fd = listener.Get();
+    pfd.events = POLLRDNORM;
+    const int rc = WSAPoll(&pfd, 1, timeoutMs);
+    if (rc == SOCKET_ERROR) {
+        throw std::runtime_error(LastSocketError("WSAPoll failed"));
+    }
+#else
+    struct pollfd pfd{};
+    pfd.fd = listener.Get();
+    pfd.events = POLLIN;
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeoutMs);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        throw std::runtime_error(LastSocketError("poll failed"));
+    }
+#endif
+    if (rc == 0) {
+        return std::nullopt;  // timeout: no pending connection this tick
+    }
+    return AcceptClient(listener);
 }
 
 void SendAll(const SocketHandle& socket, const void* data, size_t length) {

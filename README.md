@@ -24,14 +24,16 @@ Supported platforms:
 ### Server
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once | --once-multi [--once-idle-grace <duration>]] --password <pwd>
 ```
 
 - `--dir`: server root directory (default: current directory)
 - `--port`: listening port (default: `27842`)
 - `--server-hash-workers`: global hash worker threads for all sessions (`0` = auto, range `0..512`, default auto)
 - `--enable-hash-memcache`: enable in-memory hash cache on server; reuses hash when `path + mtime + size` match
-- `--once`: OneShot server mode — serve exactly one real session then exit (server-only, mutually exclusive with `--enable-hash-memcache`)
+- `--once`: OneShot server mode — serve exactly one real session then exit (server-only; mutually exclusive with `--enable-hash-memcache` and `--once-multi`)
+- `--once-multi`: multi-client OneShot mode — serve any number of sessions, then exit once all sessions have drained and no new connection arrives within the idle-grace window (server-only; mutually exclusive with `--once`; **compatible** with `--enable-hash-memcache`, which is useful across clients)
+- `--once-idle-grace`: idle-grace window for `--once-multi` (default `5s`, suffixes `s`/`m`/`h`); valid only together with `--once-multi`
 - `--password`: pre-shared password (required)
 
 ### Client
@@ -70,6 +72,20 @@ The `--once` flag enables a single-use server mode designed for CI/CD pipelines:
 3. The process exits cleanly — no `exit()` or `abort()` calls mid-flight.
 
 This mode is **server-only**; passing `--once` on the client side produces a CLI error.
+
+## Multi-Client OneShot Mode (`--once-multi`)
+
+`--once-multi` is a sibling of `--once` for CI/CD jobs where several clients must be served from one ephemeral server: the server accepts **any number of sessions** and exits once they have all finished and the listener has been idle for a grace window.
+
+**Behavior:**
+
+- Sessions are served concurrently/sequentially. A session may span multiple multipath connections (lanes); the **session**, not the connection, is the unit of accounting.
+- Once at least one real session has been served, the server exits when the active-session count reaches `0` **and** no new (handshake-completed) connection arrives within the idle-grace window (`--once-idle-grace`, default `5s`). A new session arriving during the window cancels/resets the timer.
+- Pre-handshake probes do not count as sessions and do not reset the grace window.
+- If no client ever connects, the server does not self-exit (CI timeouts are expected to bound it, same as `--once`).
+- Exit code aggregates across all served sessions: `0` if every session completed cleanly, `5` if any session failed or was aborted.
+- Unlike `--once`, `--once-multi` is **compatible with `--enable-hash-memcache`** — a shared hash cache benefits later clients in the same run.
+- Mutually exclusive with `--once`.
 
 ## Progress Counters
 
@@ -137,10 +153,10 @@ If the connection drops before the manifest is fully received, the client automa
 - `3`: sync incomplete and auto-reconnect disabled (`--reconnect-retries 0`), or connection dropped without reconnect enabled
 - `4`: auto-reconnect budget exhausted with the sync still incomplete
 
-**Server `--once`:**
-- `0`: the single real session completed cleanly
-- `1`: argument/usage error (e.g. `--once` together with `--enable-hash-memcache`, or `--once` on the client)
-- `5`: the single real session failed or was aborted (any lane error) — distinct from the client's `2` so every exit code has one unambiguous meaning
+**Server `--once` / `--once-multi`:**
+- `0`: the served session(s) completed cleanly (`--once`: the single session; `--once-multi`: every session)
+- `1`: argument/usage error (e.g. `--once` with `--enable-hash-memcache`, `--once` together with `--once-multi`, `--once-idle-grace` without `--once-multi`, or any of these on the client)
+- `5`: a served session failed or was aborted (any lane error; `--once-multi` aggregates: `5` if any session failed) — distinct from the client's `2` so every exit code has one unambiguous meaning
 
 ## Cross-Platform Build (Linux/macOS)
 
