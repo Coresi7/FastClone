@@ -16,8 +16,10 @@
 #include <Windows.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #elif defined(__linux__)
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
