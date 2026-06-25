@@ -317,4 +317,61 @@ void RunCliTests() {
                         "--wait-connect-timeout", "30s",
                     },
                     "requires --once or --once-multi");
+
+    // ---- aux-weight V-09 (AC-09/FR-09~FR-11): --aux-weight parsing ----------------------------
+    auto clientArgs = [](const std::vector<std::string>& extra) {
+        std::vector<std::string> args = {
+            "FastClone", "client", "--server", "127.0.0.1:27842",
+            "--target", ".", "--password", "pw",
+        };
+        args.insert(args.end(), extra.begin(), extra.end());
+        return args;
+    };
+
+    // Default is 1.0 when --aux-weight is absent.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({}));
+        Require(opt.auxWeight == 1.0, "Expected default --aux-weight 1.0");
+        Require(opt.largeFileLane == fc::LargeFileLane::Auto, "Expected default --large-file-lane auto");
+    }
+    // Legal values across the (0,16] range parse exactly.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--aux-weight", "2"}));
+        Require(opt.auxWeight == 2.0, "Expected --aux-weight 2 -> 2.0");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--aux-weight", "0.5"}));
+        Require(opt.auxWeight == 0.5, "Expected --aux-weight 0.5 -> 0.5");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--aux-weight", "16"}));
+        Require(opt.auxWeight == 16.0, "Expected --aux-weight 16 -> 16.0 (upper bound inclusive)");
+    }
+    // Out-of-range values are rejected.
+    ExpectThrowWith(clientArgs({"--aux-weight", "0"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "-1"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "16.1"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "100"}), "--aux-weight");
+    // Non-numeric / malformed text is rejected.
+    ExpectThrowWith(clientArgs({"--aux-weight", "abc"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "2x"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", ""}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "nan"}), "--aux-weight");
+    ExpectThrowWith(clientArgs({"--aux-weight", "inf"}), "--aux-weight");
+
+    // ---- aux-weight V-10 (AC-10/FR-12): --large-file-lane parsing ----------------------------
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-lane", "primary"}));
+        Require(opt.largeFileLane == fc::LargeFileLane::Primary, "Expected --large-file-lane primary");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-lane", "aux"}));
+        Require(opt.largeFileLane == fc::LargeFileLane::Aux, "Expected --large-file-lane aux");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-lane", "auto"}));
+        Require(opt.largeFileLane == fc::LargeFileLane::Auto, "Expected --large-file-lane auto");
+    }
+    ExpectThrowWith(clientArgs({"--large-file-lane", "foo"}), "--large-file-lane");
+    ExpectThrowWith(clientArgs({"--large-file-lane", ""}), "--large-file-lane");
 }

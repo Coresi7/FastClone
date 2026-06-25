@@ -40,7 +40,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### Client
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted); accepts a comma-separated list and/or may be repeated to supply multiple multipath endpoints
@@ -50,6 +50,8 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--chunk-kb`: chunk size in KB; auto-tuned when omitted, valid range `1..65536`
 - `--queued-file-size`: soft receive-queue memory target for adaptive throttling (default: `5G`, range: `256M..64G`, supports suffixes `K/M/G`)
 - `--large-file-threshold`: pins files `>=` this size to the primary link; default `1G`, range `1M..1T`, suffixes `K/M/G` (independent of the small-file batch threshold and the receive-queue target)
+- `--aux-weight`: per-link ordering weight applied to every auxiliary link in transfer scheduling; default `1.0`, range `(0,16]` (the primary link is fixed at `1.0`). Higher values pull proportionally more file transfers onto aux links
+- `--large-file-lane`: how large files (`>= --large-file-threshold`) are routed across links: `primary` (pin to the primary link), `aux` (schedule by weight like any other file), or `auto` (prefer aux when `--aux-weight >= 2.0`, otherwise pin to primary); default `auto`
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
 - `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
 - `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
@@ -119,7 +121,7 @@ When the server and client each have multiple NICs, FastClone can use **several 
 - A session is a **connection pool**: the primary link is established first (the first `--server` endpoint / the first `--link`), then auxiliary links are added best-effort.
 - **Automatic selection**: the client enumerates local NICs, probes reachability to the server-advertised endpoints, and pairs them by "address family (IPv4 first) > same-subnet > RTT", keeping **at most one connection per physical NIC on each side** (a dual-stack NIC's v4/v6 are not treated as two links).
 - **Explicit pinning**: `--link <localIP|iface>=<serverIP[:port]>` bypasses automatic selection; the first `--link` is the primary link.
-- **Large files stay on the primary link**: a single file cannot be split across links, so files `>= --large-file-threshold` (default `1G`) are pinned to the primary link (assumed best); other files / small-file batches are spread across links adaptively by measured throughput.
+- **File-to-link scheduling**: a single file cannot be split across links. Regular files and small-file batches are distributed across healthy links by a weighted shortest-queue policy (the link with the fewest outstanding streams wins; `--aux-weight` biases the choice toward aux links). Large files (`>= --large-file-threshold`, default `1G`) follow `--large-file-lane`: pinned to the primary link by default (assumed best), or scheduled by weight like other files when aux is preferred.
 - With a single NIC / endpoint it degrades to a single connection, identical to prior behavior.
 
 #### How to Enable / Disable Reachability Probing

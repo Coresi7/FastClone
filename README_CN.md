@@ -39,7 +39,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
@@ -49,6 +49,8 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--chunk-kb`：块大小（KB）；不传走 auto-tune，范围 `1..65536`
 - `--queued-file-size`：接收队列内存软目标（用于自适应限速）；默认 `5G`，范围 `256M..64G`，支持 `K/M/G` 后缀
 - `--large-file-threshold`：将 `>=` 该大小的文件固定走首要链路；默认 `1G`，范围 `1M..1T`，支持 `K/M/G` 后缀（与碎文件批处理阈值、接收队列阈值相互独立）
+- `--aux-weight`：传输调度中每条辅助链路的排序权重；默认 `1.0`，范围 `(0,16]`（首要链路固定为 `1.0`）。值越大，越多文件传输按比例倾斜到辅助链路
+- `--large-file-lane`：大文件（`>= --large-file-threshold`）在各链路间的路由方式：`primary`（固定走首要链路）、`aux`（与普通文件一样按权重调度）、`auto`（`--aux-weight >= 2.0` 时倾向辅助链路，否则固定走首要链路）；默认 `auto`
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
 - `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
@@ -136,7 +138,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - 一个会话由一个**连接池**组成：先建立首要链路（`--server` 的第一个端点 / `--link` 的第一条），再尽力建立辅助链路。
 - **自动选路**：客户端枚举本机网卡、对服务端下发的端点做可达性探测，按"地址族（IPv4 优先）> 同子网 > RTT"择优配对，并保证**每块物理网卡（客户端与服务端两侧）至多一条连接**（双栈网卡的 v4/v6 不会被当成两条链路）。
 - **显式指定**：用 `--link <本地IP|网卡名>=<服务端IP[:端口]>` 可绕过自动选路，列表第一条为首要链路。
-- **大文件固定走首要链路**：单个文件无法跨链路拆分，因此大小 `>= --large-file-threshold`（默认 `1G`）的文件固定走首要链路（假定其为最佳链路）；其余文件 / 碎文件批按实测吞吐自适应分摊到各链路。
+- **文件到链路的调度**：单个文件无法跨链路拆分。普通文件与碎文件批按"加权最短队列"策略分摊到各健康链路（在途流最少的链路优先；`--aux-weight` 让选择向辅助链路倾斜）。大文件（`>= --large-file-threshold`，默认 `1G`）按 `--large-file-lane` 路由：默认固定走首要链路（假定其为最佳链路），或在倾向辅助链路时与普通文件一样按权重调度。
 - 单网卡 / 单端点时自动退化为单连接，行为与此前一致。
 
 #### 如何启用 / 禁用可达性探测

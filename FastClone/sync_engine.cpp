@@ -3471,7 +3471,18 @@ int RunClient(const CliOptions& options) {
         std::vector<LaneLoad> lanes;
         lanes.reserve(pool.size());
         for (auto& cptr : pool) {
-            lanes.push_back(LaneLoad{cptr->healthy.load(), static_cast<uint32_t>(cptr->inFlight)});
+            LaneLoad ld;
+            ld.healthy = cptr->healthy.load();
+            ld.inFlight = static_cast<uint32_t>(cptr->inFlight);
+            // Weighted shortest-queue (aux-weight FR-04): primary stays 1.0, aux lanes share
+            // the CLI auxWeight. With the default auxWeight=1.0 every lane is 1.0 -> identical
+            // to the legacy least-inFlight policy (FR-06).
+            ld.weight = cptr->isPrimary ? 1.0 : options.auxWeight;
+            // Manifest bias (aux-weight FR-07/FR-08): while the manifest is still downloading,
+            // nudge the primary down by +1 so a little file work can flow to aux first; once
+            // manifestDone the bias is gone and ordering returns to pure weighted load.
+            ld.bias = (!manifestDone && cptr->isPrimary) ? 1u : 0u;
+            lanes.push_back(ld);
         }
         const int idx = SelectLeastLoadedLane(lanes, streamLimit, forcePrimary);
         return (idx >= 0) ? pool[static_cast<size_t>(idx)].get() : nullptr;
@@ -3577,12 +3588,24 @@ int RunClient(const CliOptions& options) {
                     break;
                 }
                 const std::string rel = regularQueue->front();
-                // Route by size: files >= largeFileThreshold are pinned to the primary
-                // link (FR-012); others go to the best-weighted healthy lane (FR-013).
+                // Route by size: files >= largeFileThreshold may be pinned to the primary link
+                // (legacy FR-012); others go to the best-weighted healthy lane (FR-013).
                 const auto itMeta = remoteFiles.find(rel);
                 const bool isLarge = (itMeta != remoteFiles.end() &&
                                       itMeta->second.fileSize >= options.largeFileThresholdBytes);
-                ClientConnection* conn = pickConnection(isLarge);
+                // Large-file lane policy (aux-weight FR-13~FR-16). largeFilePrefersAux is a
+                // PREFERENCE only: when true the large file uses normal weighted selection
+                // (forcePrimary=false), letting aux be favored via weight without bypassing
+                // candidate filtering or the streamLimit cap (FR-17). It never forces aux, so
+                // with no surviving aux it naturally falls back to the primary.
+                bool largeFilePrefersAux = false;
+                switch (options.largeFileLane) {
+                    case LargeFileLane::Primary: largeFilePrefersAux = false; break;
+                    case LargeFileLane::Aux:     largeFilePrefersAux = true; break;
+                    case LargeFileLane::Auto:    largeFilePrefersAux = (options.auxWeight >= 2.0); break;
+                }
+                const bool forcePrimary = isLarge && !largeFilePrefersAux;  // FR-16
+                ClientConnection* conn = pickConnection(forcePrimary);
                 if (conn == nullptr) {
                     break;  // no eligible lane right now; leave file queued and retry later
                 }

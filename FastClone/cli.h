@@ -13,6 +13,16 @@ enum class Mode {
     Client
 };
 
+// Large-file lane policy (aux-weight FR-12). Selects how files >= largeFileThresholdBytes are
+// routed: Primary hard-pins to the primary link (legacy FR-012 behavior), Aux lets them flow
+// through normal weighted selection (aux preferred via weight), Auto prefers aux only when
+// auxWeight >= 2.0 and otherwise behaves like Primary.
+enum class LargeFileLane {
+    Primary,
+    Aux,
+    Auto
+};
+
 // Explicit client->server link pin (design §9.3 / FR-008). Established verbatim; the
 // list order defines the primary link. local may be a source IP or an interface name.
 struct LinkPin {
@@ -51,6 +61,12 @@ struct CliOptions {
     // Files >= this size are pinned to the primary link (FR-011/012). Default 1GB,
     // semantically independent from smallFileBatchThreshold / queuedFileSizeBytes.
     uint64_t largeFileThresholdBytes = 1ULL << 30;
+    // Uniform ordering weight for all aux lanes in the weighted shortest-queue rule
+    // (aux-weight FR-09). Primary stays 1.0; range (0,16]; default 1.0 = zero regression.
+    double auxWeight = 1.0;
+    // Large-file lane policy (aux-weight FR-12). Default Auto; with default auxWeight (<2.0)
+    // Auto keeps the legacy primary-pin behavior, so the default is zero regression.
+    LargeFileLane largeFileLane = LargeFileLane::Auto;
     // Server endpoints for the connection pool (FR-005). servers[0] mirrors host/port for
     // call-site compatibility; multi-value via comma-separated or repeated --server.
     std::vector<std::pair<std::string, uint16_t>> servers;

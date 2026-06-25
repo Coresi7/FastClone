@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cctype>
 #include <iostream>
@@ -48,11 +49,16 @@ void PrintUsage() {
         << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] --password <pwd>\n"
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
-        << "      [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]...\n"
+        << "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
+        << "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
         << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
         << "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
         << "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
+        << "  --aux-weight sets the ordering weight of every aux link (default 1.0, range (0,16]); higher\n"
+        << "      values pull proportionally more transfers onto aux links.\n"
+        << "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
+        << "      --aux-weight >= 2.0, else primary); default auto.\n"
         << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
         << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
         << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
@@ -66,6 +72,21 @@ long ParseLongStrict(const std::string& value, const char* name) {
     char* end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
     if (end == nullptr || *end != '\0') {
+        throw std::runtime_error(std::string("Invalid ") + name);
+    }
+    return parsed;
+}
+
+// Strict floating-point parse for --aux-weight (aux-weight FR-10), mirroring the
+// name-tagged error style of ParseLongStrict / ParseSizeBytesStrict. Rejects empty input,
+// trailing characters, and non-finite values (nan/inf); range checking is the caller's job.
+double ParseDoubleStrict(const std::string& value, const char* name) {
+    if (value.empty()) {
+        throw std::runtime_error(std::string(name) + " is empty");
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    if (end == nullptr || *end != '\0' || !std::isfinite(parsed)) {
         throw std::runtime_error(std::string("Invalid ") + name);
     }
     return parsed;
@@ -263,6 +284,25 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --large-file-threshold (range: 1M..1T)");
             }
             options.largeFileThresholdBytes = sizeBytes;
+        } else if (arg == "--aux-weight") {
+            // Uniform aux-lane weight for weighted shortest-queue selection (FR-09~FR-11).
+            const double w = ParseDoubleStrict(ArgAt(args, ++i), "--aux-weight");
+            if (w <= 0.0 || w > 16.0) {
+                throw std::runtime_error("Invalid --aux-weight (range: (0,16])");
+            }
+            options.auxWeight = w;
+        } else if (arg == "--large-file-lane") {
+            // Large-file lane policy primary|aux|auto (FR-12).
+            const std::string& v = ArgAt(args, ++i);
+            if (v == "primary") {
+                options.largeFileLane = LargeFileLane::Primary;
+            } else if (v == "aux") {
+                options.largeFileLane = LargeFileLane::Aux;
+            } else if (v == "auto") {
+                options.largeFileLane = LargeFileLane::Auto;
+            } else {
+                throw std::runtime_error("Invalid --large-file-lane (expected primary|aux|auto)");
+            }
         } else if (arg == "--link") {
             options.linkPins.push_back(ParseLinkPin(ArgAt(args, ++i), options.port));
         } else if (arg == "--password") {
