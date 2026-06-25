@@ -72,6 +72,7 @@ add_executable(FastCloneTests
     tests/test_hash_memcache.cpp
     tests/test_reconnect.cpp
     tests/test_route_selection.cpp
+    tests/test_link_scheduler.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)

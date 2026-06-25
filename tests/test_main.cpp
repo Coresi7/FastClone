@@ -8,6 +8,7 @@ void RunHashMemCacheTests();
 void RunFileIndexTests();
 void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
+void RunLinkSchedulerTests();
 
 int main() {
     try {
@@ -18,6 +19,7 @@ int main() {
         RunHashMemCacheTests();
         RunFileIndexTests();
         RunRouteSelectionTests();
+        RunLinkSchedulerTests();
         std::cout << "All FastClone tests passed." << std::endl;
         return 0;
     } catch (const std::exception& ex) {

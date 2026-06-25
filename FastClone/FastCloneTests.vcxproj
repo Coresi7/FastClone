@@ -157,6 +157,7 @@
     <ClInclude Include="cli.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
+    <ClInclude Include="link_scheduler.h" />
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
@@ -184,6 +185,7 @@
     <ClCompile Include="..\tests\test_hash_memcache.cpp" />
     <ClCompile Include="..\tests\test_reconnect.cpp" />
     <ClCompile Include="..\tests\test_route_selection.cpp" />
+    <ClCompile Include="..\tests\test_link_scheduler.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

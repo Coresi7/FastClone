@@ -3,6 +3,7 @@
 #include "client_handshake.h"
 #include "file_index.h"
 #include "hash_memcache.h"
+#include "link_scheduler.h"
 #include "net_topology.h"
 #include "path_utils.h"
 #include "protocol.h"
@@ -1800,9 +1801,6 @@ struct ClientConnection {
     std::string serverAddr;           // "host:port" of the peer
     bool isPrimary = false;
     uint32_t nextStreamId = 1;        // per-connection streamId space (main-loop only)
-    std::atomic<uint64_t> bytesRecv{0};   // recvThread writes; throughput sampling
-    uint64_t lastBytesRecvSample = 0; // main-loop only (EWMA delta base)
-    double ewmaThroughput = 0.0;      // bytes/sec, main-loop only (FR-014 weight)
     std::atomic<bool> healthy{true};
     std::string downReason;          // recvThread failure cause (set once on failure)
     size_t inFlight = 0;             // active streams on this connection (main-loop only)
@@ -2945,7 +2943,6 @@ int RunClient(const CliOptions& options) {
 
                 while (!recvStop.load()) {
                     Frame f = RecvFrame(conn->socket);
-                    conn->bytesRecv.fetch_add(frameWireBytes(f), std::memory_order_relaxed);
                     switch (f.type) {
                         case MsgType::ManifestEntry:
                         case MsgType::ManifestProgress:
@@ -3462,35 +3459,20 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Adaptive connection selection (design §8). Picks a healthy lane with a free slot,
-    // weighted by measured EWMA throughput (FR-014): score = (ewma+1) / (inFlight+1), so
-    // a faster, less-loaded lane wins and a slow/saturated lane sheds work. forcePrimary
-    // (large files, FR-012) pins to the primary lane when it is healthy.
+    // Adaptive connection selection (design §8): shortest-queue / least-outstanding-requests.
+    // Among healthy lanes below streamLimit, pick the one with the fewest in-flight streams
+    // (SelectLeastLoadedLane). This is self-correcting on lane speed -- a slow lane holds its
+    // streams longer so its inFlight stays high and it stops drawing new work, while a fast
+    // lane drains and is refilled -- with no throughput measurement or feedback loop (FR-013 /
+    // FR-014). forcePrimary (large files, FR-012) hard-pins to the primary lane.
     auto pickConnection = [&](bool forcePrimary) -> ClientConnection* {
-        if (forcePrimary) {
-            ClientConnection* p = pool[0].get();
-            if (p->healthy.load() && p->inFlight < streamLimit) {
-                return p;
-            }
-            if (p->healthy.load()) {
-                return nullptr;  // primary saturated: large file waits (FR-020 degenerate)
-            }
-            // Primary dead: degrade to best-effort placement on a surviving lane.
-        }
-        ClientConnection* best = nullptr;
-        double bestScore = -1.0;
+        std::vector<LaneLoad> lanes;
+        lanes.reserve(pool.size());
         for (auto& cptr : pool) {
-            ClientConnection* c = cptr.get();
-            if (!c->healthy.load() || c->inFlight >= streamLimit) {
-                continue;
-            }
-            const double score = (c->ewmaThroughput + 1.0) / static_cast<double>(c->inFlight + 1);
-            if (score > bestScore) {
-                bestScore = score;
-                best = c;
-            }
+            lanes.push_back(LaneLoad{cptr->healthy.load(), static_cast<uint32_t>(cptr->inFlight)});
         }
-        return best;
+        const int idx = SelectLeastLoadedLane(lanes, streamLimit, forcePrimary);
+        return (idx >= 0) ? pool[static_cast<size_t>(idx)].get() : nullptr;
     };
     auto healthyConnCount = [&]() -> size_t {
         size_t n = 0;
@@ -4213,28 +4195,6 @@ int RunClient(const CliOptions& options) {
     const size_t kDelayedLowWater = 256 * 1024;
     bool ingestPaused = false;
 
-    auto lastEwmaSample = std::chrono::steady_clock::now();
-
-    // Refresh per-connection EWMA throughput from received-byte deltas (design §8.1). The
-    // scheduler weights lane selection by this, so a slow/shared-bottleneck lane sheds
-    // work toward faster lanes (FR-014). Cheap; runs at most ~twice per second.
-    auto updateThroughputEwma = [&]() {
-        const auto now = std::chrono::steady_clock::now();
-        const double dt = std::chrono::duration<double>(now - lastEwmaSample).count();
-        if (dt < 0.5) {
-            return;
-        }
-        for (auto& cptr : pool) {
-            ClientConnection* c = cptr.get();
-            const uint64_t total = c->bytesRecv.load(std::memory_order_relaxed);
-            const uint64_t delta = (total >= c->lastBytesRecvSample) ? (total - c->lastBytesRecvSample) : 0;
-            c->lastBytesRecvSample = total;
-            const double tput = static_cast<double>(delta) / dt;  // bytes/sec
-            c->ewmaThroughput = (c->ewmaThroughput <= 0.0) ? tput : (0.5 * c->ewmaThroughput + 0.5 * tput);
-        }
-        lastEwmaSample = now;
-    };
-
     // Per-connection failover (design §10). A lane whose recvThread failed is drained:
     // its in-flight files are requeued to healthy lanes (FR-015), reusing the existing
     // retry budget (FR-019). Only when EVERY lane is down do we set recvClosed to trigger
@@ -4319,7 +4279,6 @@ int RunClient(const CliOptions& options) {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
             bool loopHadForwardProgress = false;
-            updateThroughputEwma();
             failoverScan();
             resolveFallbackIfReady();
             dispatchHashRequests();

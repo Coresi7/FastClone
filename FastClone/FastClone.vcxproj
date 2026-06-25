@@ -148,6 +148,7 @@
     <ClInclude Include="client_handshake.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
+    <ClInclude Include="link_scheduler.h" />
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
