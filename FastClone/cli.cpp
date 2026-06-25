@@ -45,7 +45,7 @@ const std::string& ArgAt(const std::vector<std::string>& args, size_t index) {
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
-        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] --password <pwd>\n"
+        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] --password <pwd>\n"
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -53,7 +53,10 @@ void PrintUsage() {
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
         << "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
         << "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
-        << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n";
+        << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
+        << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
+        << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
+        << "      is permanently disabled once the first valid connection arrives.\n";
 }
 
 long ParseLongStrict(const std::string& value, const char* name) {
@@ -212,6 +215,9 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     // Tracks whether --once-idle-grace was explicitly supplied (parse-time local only, so the
     // default 5s in CliOptions stays uncontaminated). Used by validation #8 below (FR-05).
     bool sawIdleGrace = false;
+    // Tracks whether --wait-connect-timeout was explicitly supplied (parse-time local only, same
+    // "keep the default uncontaminated" discipline as sawIdleGrace). Used by scope check below (FR-04).
+    bool sawWaitConnectTimeout = false;
 
     if (args[0] == "server") {
         options.mode = Mode::Server;
@@ -301,6 +307,12 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --once-idle-grace (must be > 0)");
             }
             sawIdleGrace = true;
+        } else if (arg == "--wait-connect-timeout") {
+            options.waitConnectTimeoutMs = ParseDurationMsStrict(ArgAt(args, ++i), "--wait-connect-timeout");
+            if (options.waitConnectTimeoutMs == 0) {
+                throw std::runtime_error("Invalid --wait-connect-timeout (must be > 0)");
+            }
+            sawWaitConnectTimeout = true;
         } else if (arg == "--diag") {
             options.diagnostics = true;
         } else if (arg == "--reconnect-retries") {
@@ -350,6 +362,12 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     // with --enable-hash-memcache stays allowed (FR-06): no exclusion is added for that pair.
     if (sawIdleGrace && !options.onceMulti) {
         throw std::runtime_error("--once-idle-grace requires --once-multi");
+    }
+    // #9: --wait-connect-timeout only has meaning under server --once / --once-multi (FR-04). A
+    // single check covers both rejected cases: server resident mode (AC-05) and client mode
+    // (AC-06), since --once/--once-multi are themselves server-only so both stay false for clients.
+    if (sawWaitConnectTimeout && !(options.exitAfterSync || options.onceMulti)) {
+        throw std::runtime_error("--wait-connect-timeout requires --once or --once-multi");
     }
     // Normalize the endpoint list so the engine always sees servers[0] == host/port.
     if (options.servers.empty()) {

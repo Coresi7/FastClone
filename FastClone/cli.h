@@ -38,6 +38,9 @@ struct CliOptions {
     bool onceMulti = false;
     // 空闲宽限毫秒数，默认 5s；仅在 onceMulti 下有效（FR-04）。--once-idle-grace。
     uint64_t onceIdleGraceMs = 5000;
+    // 首连等待超时毫秒数，默认 300s；仅在 --once / --once-multi 下有效。--wait-connect-timeout。
+    // 仅覆盖「进入监听到首个有效连接达成之前」这一连续区间；首连后永久失效（FR-01/M3/FR-09）。
+    uint64_t waitConnectTimeoutMs = 300000;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
     bool diagnostics = false;

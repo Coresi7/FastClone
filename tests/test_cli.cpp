@@ -240,4 +240,81 @@ void RunCliTests() {
         Require(opt.onceMulti, "Expected onceMulti set with memcache");
         Require(opt.enableHashMemcache, "Expected enableHashMemcache set with once-multi");
     }
+
+    // WCT-CLI-1 (AC-01): default wait-connect-timeout is 300s for both --once and --once-multi.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once",
+        });
+        Require(opt.waitConnectTimeoutMs == 300000ULL,
+                "Expected default --wait-connect-timeout 300000ms under --once");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once-multi",
+        });
+        Require(opt.waitConnectTimeoutMs == 300000ULL,
+                "Expected default --wait-connect-timeout 300000ms under --once-multi");
+    }
+
+    // WCT-CLI-2 (AC-02): --wait-connect-timeout parses bare-seconds and s/m/h via the shared parser.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once",
+            "--wait-connect-timeout", "30",
+        });
+        Require(opt.waitConnectTimeoutMs == 30000ULL, "Expected --wait-connect-timeout 30 -> 30000ms");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once",
+            "--wait-connect-timeout", "30s",
+        });
+        Require(opt.waitConnectTimeoutMs == 30000ULL, "Expected --wait-connect-timeout 30s -> 30000ms");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once",
+            "--wait-connect-timeout", "2m",
+        });
+        Require(opt.waitConnectTimeoutMs == 120000ULL, "Expected --wait-connect-timeout 2m -> 120000ms");
+    }
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone", "server", "--password", "pw", "--once",
+            "--wait-connect-timeout", "1h",
+        });
+        Require(opt.waitConnectTimeoutMs == 3600000ULL, "Expected --wait-connect-timeout 1h -> 3600000ms");
+    }
+
+    // WCT-CLI-3 (AC-03): --wait-connect-timeout 0 is rejected ("must be > 0").
+    ExpectThrowWith({
+                        "FastClone", "server", "--password", "pw", "--once",
+                        "--wait-connect-timeout", "0",
+                    },
+                    "must be > 0");
+
+    // WCT-CLI-4 (AC-04): a bad suffix is rejected by the shared duration parser.
+    ExpectThrowWith({
+                        "FastClone", "server", "--password", "pw", "--once",
+                        "--wait-connect-timeout", "10x",
+                    },
+                    "expected suffix [s|m|h]");
+
+    // WCT-CLI-5 (AC-05): --wait-connect-timeout requires --once / --once-multi (resident server).
+    ExpectThrowWith({
+                        "FastClone", "server", "--password", "pw",
+                        "--wait-connect-timeout", "30s",
+                    },
+                    "requires --once or --once-multi");
+
+    // WCT-CLI-6 (AC-06): --wait-connect-timeout is rejected for clients (neither once flag set).
+    ExpectThrowWith({
+                        "FastClone", "client",
+                        "--server", "127.0.0.1:27842",
+                        "--target", ".",
+                        "--password", "pw",
+                        "--wait-connect-timeout", "30s",
+                    },
+                    "requires --once or --once-multi");
 }

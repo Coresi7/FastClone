@@ -2128,6 +2128,15 @@ void FireOnceTerminal(bool success) {
 // it deliberately does NOT touch g_onceTarget / g_onceMu (those stay --once-only, §8).
 std::atomic<bool> g_omAnyFailure{false};
 
+// --- --wait-connect-timeout in-flight handshake guard (design §3.7 / NFR-04 / FR-07) ---
+// Counts connections that have been accepted and dispatched to a handshake thread but whose
+// outcome (createdTotal++ on Auth success, or close on probe/failure) is not yet observable.
+// fetch_add happens on the main thread before dispatch; fetch_sub at the handshake thread's
+// single exit. EvaluateWaitConnect refuses to declare a timeout while this is > 0, so a real
+// connection mid-handshake at the deadline boundary is never falsely killed (AC-09). Probe
+// connections close quickly, drop the count back to 0, and let the timeout fire (AC-08).
+std::atomic<uint64_t> g_inFlightHandshakes{0};
+
 // Fire the once-multi terminal verdict from the main thread once idle-grace has elapsed. Mirrors
 // FireOnceTerminal's publish order (exitCode relaxed, then shouldExit release) so the accept-loop
 // top bail returns the final code. WakeAcceptLoop is redundant here (the main thread itself fires
@@ -2171,6 +2180,54 @@ void EvaluateIdleGrace(uint64_t graceMs,
         idleSince.reset();
         std::cout << "[om] idle_grace_reset active=" << snap.activeRealSessions << std::endl;
     }
+}
+
+// Bounded extra window (past the deadline) during which an in-flight handshake may still defer the
+// wait-connect timeout (design §3.7 "defer one tick", made finite to fix B-01). A genuine handshake
+// latches createdTotal within milliseconds, so a sub-second cap never falsely kills a real
+// connection racing the boundary (AC-09 / NFR-04); but it guarantees that a TCP connection which is
+// accepted and then never sends any handshake bytes — leaving its handshake thread blocked in recv
+// with g_inFlightHandshakes stuck at >0 — can no longer suppress the timeout indefinitely
+// (FR-07 / FR-08 / AC-08).
+constexpr int kWaitConnectInFlightGraceMs = 1000;
+
+// Main-thread first-connect-wait evaluator (design §3.3). waitConnectDeadline / firstConnSeen
+// live on the RunServer stack and are touched ONLY here, so the same "main-thread single-writer"
+// discipline as idle-grace applies (no races, D-01). Returns true iff the wait window has elapsed
+// with no valid connection, i.e. the caller must exit with kExitWaitConnectTimeout (FR-08).
+//   - firstConnSeen latches true the first time createdTotal>0 (Auth handshake succeeded) and is
+//     never reset, so once a valid connection arrives the timer is permanently disabled (FR-09).
+//   - Probe connections never increment createdTotal, so they do not stop the timer (FR-07); an
+//     in-flight handshake (g_inFlightHandshakes>0) defers the timeout, but only within the BOUNDED
+//     grace window [deadline, deadline+kWaitConnectInFlightGraceMs). This avoids killing a real
+//     connection at the deadline boundary (NFR-04 / §3.7) while ensuring an accepted-but-silent
+//     connection whose handshake thread is parked in recv cannot block the timeout forever (B-01).
+bool EvaluateWaitConnect(uint64_t timeoutMs, bool& firstConnSeen,
+                         const std::chrono::steady_clock::time_point& deadline) {
+    if (firstConnSeen) {
+        return false;  // permanently disabled after the first valid connection (FR-09)
+    }
+    const SessionRegistry::IdleSnapshot snap = GetSessionRegistry().SnapshotIdle();
+    if (snap.createdTotal > 0) {
+        firstConnSeen = true;  // first valid connection observed (FR-06/FR-09)
+        std::cout << "[wc] first_valid_connection (wait-connect disabled)" << std::endl;
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < deadline) {
+        return false;  // wait window not elapsed yet
+    }
+    // Deadline reached with no valid connection. Defer to an in-flight handshake only while it is
+    // still plausibly mid-handshake (within the bounded grace past the deadline). Past that, a
+    // never-completing handshake (B-01: accepted TCP connection that sends nothing) must not stop
+    // the timeout from firing.
+    if (g_inFlightHandshakes.load(std::memory_order_acquire) > 0 &&
+        now < deadline + std::chrono::milliseconds(kWaitConnectInFlightGraceMs)) {
+        return false;  // genuine handshake may still latch createdTotal (NFR-04 / §3.7)
+    }
+    std::cout << "[wc] wait_connect_timeout threshold_ms=" << timeoutMs
+              << " no_valid_connection=1" << std::endl;  // FR-13 / AC-13
+    return true;
 }
 
 }  // namespace
@@ -2232,6 +2289,21 @@ int RunServer(const CliOptions& options) {
     constexpr int kOnceMultiTickMs = 200;
     // --once-multi idle timer: main-thread-only, so arm/cancel can never race (design §6.4/§7).
     std::optional<std::chrono::steady_clock::time_point> idleSince;
+    // --wait-connect-timeout (design §3.3): arm a first-connect deadline for --once / --once-multi.
+    // Both timer state slots are main-thread-only (same discipline as idleSince). firstConnSeen
+    // latches the moment the first valid connection appears and permanently disables the timer
+    // (FR-09); under --once it also reverts the accept loop from per-tick polling back to the
+    // original blocking accept so the post-first-connection path is byte-for-byte unchanged (§3.6).
+    constexpr int kWaitConnectTickMs = 200;
+    const bool waitConnectActive = options.exitAfterSync || options.onceMulti;
+    std::optional<std::chrono::steady_clock::time_point> waitConnectDeadline;
+    bool firstConnSeen = false;
+    if (waitConnectActive) {
+        waitConnectDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(options.waitConnectTimeoutMs);
+        std::cout << "[wc] wait_connect_armed timeout_ms=" << options.waitConnectTimeoutMs
+                  << std::endl;
+    }
     while (true) {
         // --once: a terminal verdict may have fired while we were dispatching; bail before
         // blocking again so we never serve a second session (FR-10) and return cleanly (FR-09).
@@ -2260,9 +2332,45 @@ int RunServer(const CliOptions& options) {
                 throw;
             }
             if (!maybe) {
+                // Timeout tick: evaluate first-connect-wait BEFORE idle-grace (design §3.8). Before
+                // the first valid connection idle-grace is a no-op (served==false), so the ordering
+                // is side-effect free; after it, wait-connect is permanently disabled.
+                // onceMulti implies waitConnectActive (waitConnectActive = exitAfterSync || onceMulti),
+                // so waitConnectDeadline is guaranteed to have_value here; the deref is safe.
+                if (!firstConnSeen &&
+                    EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
+                                        *waitConnectDeadline)) {
+                    listener.Release();
+                    return kExitWaitConnectTimeout;  // FR-08
+                }
                 // Timeout tick: evaluate idle-grace ONLY when nothing was accepted this tick,
                 // so a just-accepted connection is never immediately judged idle (design §6.2/R-02).
                 EvaluateIdleGrace(options.onceIdleGraceMs, idleSince);
+                continue;
+            }
+            client = std::move(*maybe);
+        } else if (waitConnectActive && !firstConnSeen) {
+            // --once first-connect wait (design §3.6): poll with a short tick instead of blocking
+            // accept so wait-connect can fire when only probes (or nothing) arrive (AC-07/AC-08).
+            // Once firstConnSeen latches, the branch below resumes the original blocking accept.
+            std::optional<SocketHandle> maybe;
+            try {
+                maybe = AcceptClientTimeout(listener, kWaitConnectTickMs);
+            } catch (const std::exception&) {
+                // --once: the terminal thread closed the listener to wake us. Tolerate this one
+                // accept failure and return the recorded exit code (never exit() mid-flight, FR-09).
+                if (options.exitAfterSync && g_onceShouldExit.load(std::memory_order_acquire)) {
+                    listener.Release();
+                    return g_onceExitCode.load(std::memory_order_relaxed);
+                }
+                throw;
+            }
+            if (!maybe) {
+                if (EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
+                                        *waitConnectDeadline)) {
+                    listener.Release();
+                    return kExitWaitConnectTimeout;  // FR-08
+                }
                 continue;
             }
             client = std::move(*maybe);
@@ -2283,6 +2391,9 @@ int RunServer(const CliOptions& options) {
         }
         const uint64_t connSeq = connIdCounter.fetch_add(1) + 1;
         activeSessions.fetch_add(1);
+        // wait-connect in-flight guard (§3.7): mark this connection's handshake as pending before
+        // dispatch; the thread's single exit drops it. Inert when wait-connect is not armed.
+        g_inFlightHandshakes.fetch_add(1, std::memory_order_acq_rel);
         std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
                      client = std::move(client)]() mutable {
             std::shared_ptr<ServerSession> session;
@@ -2362,6 +2473,9 @@ int RunServer(const CliOptions& options) {
                 }
             }
             activeSessions.fetch_sub(1);
+            // wait-connect in-flight guard (§3.7): single exit for every dispatched connection,
+            // covering the clean, error, and pre-handshake-close paths (R-03: no leak -> no stall).
+            g_inFlightHandshakes.fetch_sub(1, std::memory_order_acq_rel);
         }).detach();
     }
     return 0;

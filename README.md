@@ -24,7 +24,7 @@ Supported platforms:
 ### Server
 
 ```bash
-FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once | --once-multi [--once-idle-grace <duration>]] --password <pwd>
+FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once | --once-multi [--once-idle-grace <duration>]] [--wait-connect-timeout <duration>] --password <pwd>
 ```
 
 - `--dir`: server root directory (default: current directory)
@@ -34,6 +34,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 - `--once`: OneShot server mode — serve exactly one real session then exit (server-only; mutually exclusive with `--enable-hash-memcache` and `--once-multi`)
 - `--once-multi`: multi-client OneShot mode — serve any number of sessions, then exit once all sessions have drained and no new connection arrives within the idle-grace window (server-only; mutually exclusive with `--once`; **compatible** with `--enable-hash-memcache`, which is useful across clients)
 - `--once-idle-grace`: idle-grace window for `--once-multi` (default `5s`, suffixes `s`/`m`/`h`); valid only together with `--once-multi`
+- `--wait-connect-timeout`: first-connect wait window for `--once` / `--once-multi` (default `300s`, suffixes `s`/`m`/`h`, must be `> 0`); if no valid client connection is established before it elapses, the server exits with code `6`. Once the first valid connection arrives the timer is permanently disabled. Valid only together with `--once` or `--once-multi`
 - `--password`: pre-shared password (required)
 
 ### Client
@@ -82,10 +83,21 @@ This mode is **server-only**; passing `--once` on the client side produces a CLI
 - Sessions are served concurrently/sequentially. A session may span multiple multipath connections (lanes); the **session**, not the connection, is the unit of accounting.
 - Once at least one real session has been served, the server exits when the active-session count reaches `0` **and** no new (handshake-completed) connection arrives within the idle-grace window (`--once-idle-grace`, default `5s`). A new session arriving during the window cancels/resets the timer.
 - Pre-handshake probes do not count as sessions and do not reset the grace window.
-- If no client ever connects, the server does not self-exit (CI timeouts are expected to bound it, same as `--once`).
+- If no client ever connects, the server self-exits with code `6` once `--wait-connect-timeout` (default `300s`) elapses; see [First-Connect Wait Timeout](#first-connect-wait-timeout---wait-connect-timeout).
 - Exit code aggregates across all served sessions: `0` if every session completed cleanly, `5` if any session failed or was aborted.
 - Unlike `--once`, `--once-multi` is **compatible with `--enable-hash-memcache`** — a shared hash cache benefits later clients in the same run.
 - Mutually exclusive with `--once`.
+
+## First-Connect Wait Timeout (`--wait-connect-timeout`)
+
+For `--once` and `--once-multi`, the server arms a **first-connect wait timer** at startup (default `300s`, override with `--wait-connect-timeout <duration>`, must be `> 0`). It bounds CI/CD resource usage when a one-shot server is started but no client ever connects.
+
+**Behavior:**
+
+- The timer covers only the interval from entering the listen state up to the **first valid connection** (an application-layer handshake completing / a valid client request). A bare TCP probe that never handshakes does not count.
+- If the window elapses with no valid connection, the server logs the threshold and exits with code `6`.
+- Once the first valid connection arrives, the timer is **permanently disabled** for the life of the process; subsequent exit is governed solely by the existing `--once` (single-session terminal) or `--once-multi` (`--once-idle-grace`) rules.
+- Valid only together with `--once` or `--once-multi`; passing it in resident-server or client mode is a CLI error (exit `1`).
 
 ## Progress Counters
 
@@ -155,8 +167,9 @@ If the connection drops before the manifest is fully received, the client automa
 
 **Server `--once` / `--once-multi`:**
 - `0`: the served session(s) completed cleanly (`--once`: the single session; `--once-multi`: every session)
-- `1`: argument/usage error (e.g. `--once` with `--enable-hash-memcache`, `--once` together with `--once-multi`, `--once-idle-grace` without `--once-multi`, or any of these on the client)
+- `1`: argument/usage error (e.g. `--once` with `--enable-hash-memcache`, `--once` together with `--once-multi`, `--once-idle-grace` without `--once-multi`, `--wait-connect-timeout` without `--once`/`--once-multi`, or any of these on the client)
 - `5`: a served session failed or was aborted (any lane error; `--once-multi` aggregates: `5` if any session failed) — distinct from the client's `2` so every exit code has one unambiguous meaning
+- `6`: no valid client connection was established before `--wait-connect-timeout` elapsed (server first-connect wait timeout); see [First-Connect Wait Timeout](#first-connect-wait-timeout---wait-connect-timeout)
 
 ## Cross-Platform Build (Linux/macOS)
 
