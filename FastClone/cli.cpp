@@ -50,6 +50,7 @@ void PrintUsage() {
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
+        << "      [--delta-min-size <size>]\n"
         << "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
         << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
@@ -59,6 +60,8 @@ void PrintUsage() {
         << "      values pull proportionally more transfers onto aux links.\n"
         << "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
         << "      --aux-weight >= 2.0, else primary); default auto.\n"
+        << "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
+        << "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
         << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
         << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
         << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
@@ -284,6 +287,17 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --large-file-threshold (range: 1M..1T)");
             }
             options.largeFileThresholdBytes = sizeBytes;
+        } else if (arg == "--delta-min-size") {
+            // Binary delta opt-in threshold (binary-delta FR-01~FR-03). 0 = disabled
+            // (default, zero regression); a positive value must fall in [1M, 1T]. Reuses the
+            // same strict size parser as --large-file-threshold but stays fully orthogonal.
+            const uint64_t v = ParseSizeBytesStrict(ArgAt(args, ++i), "--delta-min-size");
+            constexpr uint64_t kMin = 1ULL * 1024ULL * 1024ULL;              // 1M lower bound
+            constexpr uint64_t kMax = 1024ULL * 1024ULL * 1024ULL * 1024ULL;  // 1T upper bound
+            if (v != 0 && (v < kMin || v > kMax)) {
+                throw std::runtime_error("Invalid --delta-min-size (range: 0 or 1M..1T)");
+            }
+            options.deltaMinSizeBytes = v;
         } else if (arg == "--aux-weight") {
             // Uniform aux-lane weight for weighted shortest-queue selection (FR-09~FR-11).
             const double w = ParseDoubleStrict(ArgAt(args, ++i), "--aux-weight");

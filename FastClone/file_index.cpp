@@ -292,6 +292,16 @@ Hash256 ComputeFileHash(const fs::path& path) {
     return output;
 }
 
+Hash256 ComputeBufferHash(const uint8_t* data, size_t len) {
+    // XXH3_128bits one-shot is bit-identical to the streaming path in ComputeFileHash for the
+    // same bytes; the raw memcpy of XXH128_hash_t reproduces the exact same Hash256 layout, so
+    // a value produced here verifies equal against ComputeFileHash on the reconstructed file.
+    const XXH128_hash_t digest = XXH3_128bits(data, len);
+    Hash256 output{};
+    std::memcpy(output.data(), &digest, output.size());
+    return output;
+}
+
 bool HashEquals(const Hash256& a, const Hash256& b) {
     return std::equal(a.begin(), a.end(), b.begin(), b.end());
 }

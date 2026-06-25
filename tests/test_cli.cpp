@@ -374,4 +374,45 @@ void RunCliTests() {
     }
     ExpectThrowWith(clientArgs({"--large-file-lane", "foo"}), "--large-file-lane");
     ExpectThrowWith(clientArgs({"--large-file-lane", ""}), "--large-file-lane");
+
+    // ---- binary delta V-13 (AC-13/FR-01~FR-03): --delta-min-size parsing -----------------------
+    // Default 0 (delta disabled, zero regression).
+    {
+        const fc::CliOptions opt = Parse(clientArgs({}));
+        Require(opt.deltaMinSizeBytes == 0, "Expected default --delta-min-size 0");
+    }
+    // Explicit 0 stays disabled.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "0"}));
+        Require(opt.deltaMinSizeBytes == 0, "Expected --delta-min-size 0 accepted");
+    }
+    // Legal value + K/M/G suffix handling.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "16M"}));
+        Require(opt.deltaMinSizeBytes == 16ULL * 1024 * 1024, "Expected 16M parsed");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "1M"}));
+        Require(opt.deltaMinSizeBytes == 1ULL * 1024 * 1024, "Expected 1M (lower bound) parsed");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "1G"}));
+        Require(opt.deltaMinSizeBytes == 1ULL * 1024 * 1024 * 1024, "Expected 1G parsed");
+    }
+    {
+        // 1T upper bound is expressed via the G suffix (ParseSizeBytesStrict supports K|M|G).
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "1024G"}));
+        Require(opt.deltaMinSizeBytes == 1024ULL * 1024 * 1024 * 1024, "Expected 1024G (=1T upper bound) parsed");
+    }
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--delta-min-size", "2048K"}));
+        Require(opt.deltaMinSizeBytes == 2048ULL * 1024, "Expected 2048K parsed");
+    }
+    // Out-of-range: positive but below 1M, and above 1T.
+    ExpectThrowWith(clientArgs({"--delta-min-size", "512K"}), "--delta-min-size");
+    ExpectThrowWith(clientArgs({"--delta-min-size", "2048G"}), "--delta-min-size");
+    // Malformed / empty / bad suffix.
+    ExpectThrowWith(clientArgs({"--delta-min-size", "abc"}), "--delta-min-size");
+    ExpectThrowWith(clientArgs({"--delta-min-size", ""}), "--delta-min-size");
+    ExpectThrowWith(clientArgs({"--delta-min-size", "5X"}), "--delta-min-size");
 }

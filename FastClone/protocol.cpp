@@ -139,6 +139,12 @@ const char* MsgTypeName(uint8_t typeByte) {
         case MsgType::ManifestProgress: return "ManifestProgress";
         case MsgType::HashRequest: return "HashRequest";
         case MsgType::HashResponse: return "HashResponse";
+        case MsgType::BlockSigRequest: return "BlockSigRequest";
+        case MsgType::BlockSigResponse: return "BlockSigResponse";
+        case MsgType::DeltaRangeOpen: return "DeltaRangeOpen";
+        case MsgType::DeltaRangeChunk: return "DeltaRangeChunk";
+        case MsgType::DeltaRangeEnd: return "DeltaRangeEnd";
+        case MsgType::DeltaError: return "DeltaError";
         case MsgType::FileOpen: return "FileOpen";
         case MsgType::FileChunk: return "FileChunk";
         case MsgType::FileEnd: return "FileEnd";
@@ -165,6 +171,12 @@ bool IsKnownMsgType(uint8_t typeByte) {
         case MsgType::ManifestProgress:
         case MsgType::HashRequest:
         case MsgType::HashResponse:
+        case MsgType::BlockSigRequest:
+        case MsgType::BlockSigResponse:
+        case MsgType::DeltaRangeOpen:
+        case MsgType::DeltaRangeChunk:
+        case MsgType::DeltaRangeEnd:
+        case MsgType::DeltaError:
         case MsgType::FileOpen:
         case MsgType::FileChunk:
         case MsgType::FileEnd:

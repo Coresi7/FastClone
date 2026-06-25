@@ -22,6 +22,14 @@ enum class MsgType : uint8_t {
     ManifestProgress = 13,
     HashRequest = 20,
     HashResponse = 21,
+    // Binary delta (FC7, binary-delta §8.2). Independent message types (not reusing
+    // FileChunk) so the delta state machine stays isolated from the regular download path.
+    BlockSigRequest = 22,   // C->S: relPath
+    BlockSigResponse = 23,  // S->C: relPath + signature set
+    DeltaRangeOpen = 24,    // C->S: relPath + offset + length (stream id in frame header)
+    DeltaRangeChunk = 25,   // S->C: raw range bytes (appended in send order to the stream)
+    DeltaRangeEnd = 26,     // S->C: empty (range complete)
+    DeltaError = 27,        // S->C: relPath (signature/range failure -> client full fallback)
     FileOpen = 30,
     FileChunk = 31,
     FileEnd = 32,

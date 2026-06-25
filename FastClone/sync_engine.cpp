@@ -1,6 +1,7 @@
 #include "sync_engine.h"
 
 #include "client_handshake.h"
+#include "delta.h"
 #include "file_index.h"
 #include "hash_memcache.h"
 #include "link_scheduler.h"
@@ -20,6 +21,10 @@
 #include <unistd.h>
 #elif defined(__linux__)
 #include <sys/socket.h>
+#include <unistd.h>
+#endif
+#ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -147,6 +152,16 @@ inline void JoinDiag(std::thread& t, const char* site) {
 struct ServerStream {
     std::ifstream input;
     std::string relativePath;
+};
+
+// Binary delta (FC7) server-side byte-range stream. Opened lazily on DeltaRangeOpen, seeked
+// to `offset`, then `remaining` bytes are streamed back as DeltaRangeChunk frames followed
+// by a single DeltaRangeEnd. Owned exclusively by the send loop (no I/O under any lock).
+struct ServerRangeStream {
+    std::ifstream input;
+    std::string relativePath;
+    uint64_t remaining = 0;
+    bool errored = false;  // open/read failure -> emit DeltaError instead of DeltaRangeEnd
 };
 
 struct ServerBatchStream {
@@ -355,6 +370,9 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         info.role = AuthOkRole::NewSession;
         info.sessionId = session->sessionId;
         info.serverAddrs = serverAddrs;
+        // FC7 always advertises delta capability: the server can generate block signatures
+        // and serve byte ranges regardless of CLI (delta is a client-driven, opt-in flow).
+        info.capabilities |= kCapDelta;
         try {
             SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
         } catch (...) {
@@ -377,6 +395,7 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         AuthOkInfo info;
         info.role = AuthOkRole::JoinAck;
         info.sessionId = session->sessionId;
+        info.capabilities |= kCapDelta;
         try {
             SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
         } catch (...) {
@@ -1122,6 +1141,66 @@ ServerHashMemCache& GetServerHashMemCache() {
     return cache;
 }
 
+// Block-signature cache for binary delta (binary-delta D-05). Shares the
+// --enable-hash-memcache switch with the full-file hash cache but stores signatures in an
+// independent map (zero regression on the full-file hash hot path).
+BlockSigMemCache& GetBlockSigMemCache() {
+    static BlockSigMemCache cache;
+    return cache;
+}
+
+// Read an entire regular file into memory (binary delta server-side signature generation /
+// design §6.3 "sequentially read the whole file"). Returns false on any open/read failure.
+bool ReadWholeFile(const fs::path& abs, std::vector<uint8_t>& out) {
+    std::error_code ec;
+    const uint64_t size = static_cast<uint64_t>(fs::file_size(abs, ec));
+    if (ec) {
+        return false;
+    }
+    std::ifstream input(abs, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+    out.resize(static_cast<size_t>(size));
+    if (size > 0) {
+        input.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
+        if (static_cast<uint64_t>(input.gcount()) != size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// OS-level durability flush (FR-22 / NFR-05). ofstream::flush only empties the C++ stream
+// buffer; FlushFileBuffers / fsync ensures reconstructed bytes reach stable storage before
+// the mandatory XXH3 verify and atomic rename.
+bool SyncFileToDisk(const fs::path& path) {
+#ifdef _WIN32
+    // FlushFileBuffers requires a handle opened with GENERIC_WRITE (MSDN); read-only open fails.
+    HANDLE handle = CreateFileW(path.wstring().c_str(), GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const BOOL ok = FlushFileBuffers(handle);
+    CloseHandle(handle);
+    return ok != 0;
+#else
+    // fsync must be on a writable fd: macOS (and some Linux filesystems) reject fsync on an
+    // O_RDONLY descriptor (EBADF/EINVAL), which would falsely fail the delta durability flush
+    // and force an unnecessary full-transfer fallback. We own this freshly-written temp file,
+    // so O_RDWR always succeeds; mirrors the Windows GENERIC_WRITE requirement above.
+    const int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = (fsync(fd) == 0);
+    close(fd);
+    return ok;
+#endif
+}
+
 // Per-connection session server. The FC6 handshake + session merge has already been
 // performed by the caller (HandshakeAndResolveSession); this body is unchanged from the
 // single-connection model and runs independently per connection (D-02).
@@ -1129,6 +1208,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
     const bool hashMemcacheEnabled = GetServerHashMemCache().Enabled();
+    const bool blockSigMemcacheEnabled = GetBlockSigMemCache().Enabled();
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t streamLimit = tuned.streamLimit;
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
@@ -1153,6 +1233,10 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
     // the main loop adopts them into its private containers, then does I/O lock-free.
     std::vector<std::pair<uint32_t, ServerStream>> pendingNewStreams;
     std::vector<std::pair<uint32_t, ServerBatchStream>> pendingNewBatchStreams;
+    // Binary delta (FC7): byte-range streams handed off from the receiver, same lock-free
+    // discipline as pendingNewStreams (adopted into activeRangeStreams, I/O outside mu).
+    std::unordered_map<uint32_t, ServerRangeStream> activeRangeStreams;  // main-loop private
+    std::vector<std::pair<uint32_t, ServerRangeStream>> pendingNewRangeStreams;
     // Sized so all enumeration workers can each have a full flush chunk in flight without
     // serialising on backpressure (workers * kFrameFlushThreshold, rounded up). RAM is
     // cheap relative to the throughput win; the sender drains this continuously.
@@ -1365,6 +1449,116 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         pendingNewBatchStreams.emplace_back(frame.streamId, std::move(batch));
                     }
                     outboundCv.notify_one();
+                } else if (frame.type == MsgType::BlockSigRequest) {
+                    // Binary delta (FC7, design §6.3). Generate (or memcache-hit) the block
+                    // signature set + full-file XXH3-128 and reply BlockSigResponse; any
+                    // failure replies DeltaError so the client falls back to full download.
+                    const std::string rel = DecodeBlockSigRequest(frame.payload);
+                    const fs::path abs = JoinRel(options.rootDir, rel);
+                    HashFingerprint fingerprint;
+                    const bool fingerprintValid = TryReadHashFingerprint(abs, fingerprint);
+                    if (blockSigMemcacheEnabled && fingerprintValid) {
+                        Hash256 cachedHash{};
+                        delta::SignatureSet cachedSig;
+                        if (GetBlockSigMemCache().TryGet(rel, fingerprint, cachedHash, cachedSig)) {
+                            enqueueHigh(Frame{MsgType::BlockSigResponse, 0,
+                                              EncodeBlockSigResponse(rel, cachedHash, cachedSig)});
+                            continue;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(sessionHashMu);
+                        ++sessionPendingHashJobs;
+                    }
+                    try {
+                        GetServerHashPool().Enqueue([&, rel, abs, fingerprint, fingerprintValid]() {
+                            bool ok = true;
+                            Hash256 fileHash{};
+                            delta::SignatureSet sig;
+                            std::vector<uint8_t> buf;
+                            if (!ReadWholeFile(abs, buf)) {
+                                ok = false;
+                            } else {
+                                try {
+                                    sig = delta::GenerateSignatures(buf.data(), buf.size());
+                                    // Full-file verification hash in the SAME raw layout as
+                                    // ComputeFileHash (HashResponse), so the client's FR-23
+                                    // check compares like-for-like. Hash the in-memory buffer
+                                    // we already read instead of re-reading the file from disk
+                                    // (server stays light; avoids a second AV scan pass).
+                                    fileHash = ComputeBufferHash(buf.data(), buf.size());
+                                } catch (...) {
+                                    ok = false;
+                                }
+                            }
+                            if (ok && blockSigMemcacheEnabled) {
+                                try {
+                                    HashFingerprint afterFingerprint;
+                                    if (TryReadHashFingerprint(abs, afterFingerprint) &&
+                                        (!fingerprintValid ||
+                                         (afterFingerprint.fileSize == fingerprint.fileSize &&
+                                          afterFingerprint.mtimeNs == fingerprint.mtimeNs))) {
+                                        GetBlockSigMemCache().Upsert(rel, afterFingerprint, fileHash, sig);
+                                    }
+                                } catch (...) {
+                                    // Best-effort cache write; correctness unaffected.
+                                }
+                            }
+                            if (!done.load()) {
+                                try {
+                                    if (ok) {
+                                        enqueueHigh(Frame{MsgType::BlockSigResponse, 0,
+                                                          EncodeBlockSigResponse(rel, fileHash, sig)});
+                                    } else {
+                                        enqueueHigh(Frame{MsgType::DeltaError, 0, EncodeDeltaError(rel)});
+                                    }
+                                } catch (...) {
+                                    failed.store(true);
+                                    done.store(true);
+                                    outboundCv.notify_all();
+                                }
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(sessionHashMu);
+                                if (sessionPendingHashJobs > 0) {
+                                    --sessionPendingHashJobs;
+                                }
+                                sessionHashCv.notify_all();
+                            }
+                        });
+                    } catch (...) {
+                        {
+                            std::lock_guard<std::mutex> lock(sessionHashMu);
+                            if (sessionPendingHashJobs > 0) {
+                                --sessionPendingHashJobs;
+                            }
+                            sessionHashCv.notify_all();
+                        }
+                        throw;
+                    }
+                } else if (frame.type == MsgType::DeltaRangeOpen) {
+                    // Binary delta (FC7, design §6.3): cheap pread equivalent. Open + seek
+                    // here; the send loop streams the bytes lock-free. Failure -> DeltaError.
+                    const DeltaRangeRequest req = DecodeDeltaRangeOpen(frame.payload);
+                    const fs::path abs = JoinRel(options.rootDir, req.relPath);
+                    ServerRangeStream rs;
+                    rs.relativePath = req.relPath;
+                    rs.remaining = req.length;
+                    rs.input.open(abs, std::ios::binary);
+                    if (!rs.input) {
+                        enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
+                        continue;
+                    }
+                    rs.input.seekg(static_cast<std::streamoff>(req.offset), std::ios::beg);
+                    if (!rs.input) {
+                        enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        pendingNewRangeStreams.emplace_back(frame.streamId, std::move(rs));
+                    }
+                    outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
                     done.store(true);
                     sessionHashCv.notify_all();
@@ -1452,6 +1646,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     didWork = true;
                 }
                 pendingNewBatchStreams.clear();
+                for (auto& kv : pendingNewRangeStreams) {
+                    activeRangeStreams.emplace(kv.first, std::move(kv.second));
+                    didWork = true;
+                }
+                pendingNewRangeStreams.clear();
                 if (debugEnabled) {
                     muWaitUs.push_back(std::chrono::duration_cast<std::chrono::microseconds>(muAcquired - muWaitStart).count());
                     const auto muReleased = std::chrono::steady_clock::now();
@@ -1570,6 +1769,48 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         }
                     }
                     if (!streamClosed) {
+                        ++it;
+                    }
+                }
+
+                // Binary delta (FC7): serve byte ranges. Each range streams remaining bytes
+                // as DeltaRangeChunk frames (bounded burst per round) then DeltaRangeEnd; an
+                // I/O error mid-range emits DeltaError so the client falls back to full.
+                for (auto it = activeRangeStreams.begin(); it != activeRangeStreams.end();) {
+                    ServerRangeStream& rs = it->second;
+                    size_t burstBytes = 0;
+                    bool finished = false;
+                    while (rs.remaining > 0 && burstBytes < perStreamBurstBytes) {
+                        const uint64_t toRead =
+                            std::min<uint64_t>(rs.remaining, static_cast<uint64_t>(effectiveChunkSize));
+                        std::vector<uint8_t> chunk(static_cast<size_t>(toRead));
+                        rs.input.read(reinterpret_cast<char*>(chunk.data()),
+                                      static_cast<std::streamsize>(chunk.size()));
+                        const std::streamsize got = rs.input.gcount();
+                        if (got <= 0) {
+                            rs.errored = true;
+                            break;
+                        }
+                        chunk.resize(static_cast<size_t>(got));
+                        burstBytes += static_cast<size_t>(got);
+                        rs.remaining -= static_cast<uint64_t>(got);
+                        sendFrames.push_back(Frame{MsgType::DeltaRangeChunk, it->first, std::move(chunk)});
+                        didWork = true;
+                    }
+                    if (rs.errored) {
+                        sendFrames.push_back(Frame{MsgType::DeltaError, it->first,
+                                                   EncodeDeltaError(rs.relativePath)});
+                        it = activeRangeStreams.erase(it);
+                        didWork = true;
+                        continue;
+                    }
+                    if (rs.remaining == 0) {
+                        sendFrames.push_back(Frame{MsgType::DeltaRangeEnd, it->first, {}});
+                        it = activeRangeStreams.erase(it);
+                        finished = true;
+                        didWork = true;
+                    }
+                    if (!finished) {
                         ++it;
                     }
                 }
@@ -2238,6 +2479,7 @@ int RunServer(const CliOptions& options) {
     const uint32_t hashWorkerCount = ResolveServerHashWorkerCount(options);
     GetServerHashPool().Configure(hashWorkerCount);
     GetServerHashMemCache().Configure(options.enableHashMemcache);
+    GetBlockSigMemCache().Configure(options.enableHashMemcache);
     std::cout << "FastClone server root=" << options.rootDir.string() << " port=" << options.port << std::endl;
     std::cout << "[hash-pool] workers=" << hashWorkerCount
               << (options.serverHashWorkers == 0 ? " (auto)" : " (manual)")
@@ -2537,6 +2779,9 @@ int RunClient(const CliOptions& options) {
     // RESET every session (declared inside while, after ConnectTo succeeds):
     //   socket, remoteFiles/remoteDirs, all transfer/hash/compare queues & maps,
     //   activeDownloads/BatchDownloads, worker threads, recv thread, progress counters,
+    //   binary-delta state (deltaStates/deltaAbandoned/pendingDeltaSigRequests/
+    //   deltaSigRequested/pendingDeltaRanges/activeDeltaRanges) -- all declared INSIDE the
+    //   while below so each session re-evaluates delta from scratch (FR-25 per-session),
     //   manifestDone, recvError/recvClosed -- each session is a fresh FC5 handshake +
     //   ManifestRequest. Already-synced local files persist on DISK only; the next session
     //   re-enumerates and skips them via size+mtime compare (no in-memory carry-over).
@@ -2549,6 +2794,10 @@ int RunClient(const CliOptions& options) {
     // Multipath connection pool (design §4.2). pool[0] is the primary link.
     std::vector<std::unique_ptr<ClientConnection>> pool;
     std::string sessionId;
+    // Binary delta (FC7): enabled this session only when the client opted in
+    // (--delta-min-size > 0) AND the server advertised the delta capability bit in AuthOk
+    // (binary-delta §8.1 / AC-17). Set right after the primary handshake below.
+    bool deltaEnabled = false;
     try {
         // Primary lane + new-session handshake. Explicit mode: linkPins[0] is the primary
         // (FR-002). Otherwise servers[0] with the OS-default source route.
@@ -2565,6 +2814,8 @@ int RunClient(const CliOptions& options) {
         SocketHandle primarySocket = ConnectTo(primaryHost, primaryPort, primaryBinding);
         const AuthOkInfo authInfo = HandshakeClientNew(primarySocket, options.password);
         sessionId = authInfo.sessionId;
+        deltaEnabled = (options.deltaMinSizeBytes > 0) &&
+                       ((authInfo.capabilities & kCapDelta) != 0);
 
         auto primaryConn = std::make_unique<ClientConnection>();
         primaryConn->connId = 0;
@@ -2682,6 +2933,36 @@ int RunClient(const CliOptions& options) {
     std::deque<std::string> pendingRetryBatchTransfers;
     std::unordered_set<std::string> scheduledTransfers;
     std::unordered_map<std::string, uint8_t> transferRetryCounts;
+
+    // --- Binary delta (FC7) per-session state (reset every session, binary-delta §6.4) ---
+    // Each in-progress delta file: verification hash from BlockSigResponse, temp reconstruct
+    // file + writer, and the count of outstanding (possibly sliced) miss ranges.
+    struct DeltaFileState {
+        Hash256 verifyHash{};        // full-file XXH3-128 for the FR-23 reconstruction check
+        uint64_t newFileBytes = 0;
+        std::filesystem::path tempPath;
+        std::ofstream tempOut;       // random-access reconstruction writer
+        uint32_t pendingRanges = 0;  // outstanding miss-range tasks (DeltaRangeEnd decrements)
+        bool sigReceived = false;    // guards duplicate BlockSigResponse (failover re-request)
+    };
+    std::unordered_map<std::string, DeltaFileState> deltaStates;
+    std::unordered_set<std::string> deltaAbandoned;        // never retry delta this session (FR-25)
+    std::deque<std::string> pendingDeltaSigRequests;       // rel awaiting BlockSigRequest send
+    std::unordered_set<std::string> deltaSigRequested;     // rel: BlockSigRequest in flight/sent
+    struct DeltaRangeTask {
+        std::string rel;
+        uint64_t offset = 0;
+        uint32_t length = 0;
+    };
+    std::deque<DeltaRangeTask> pendingDeltaRanges;         // miss ranges awaiting a lane
+    struct ActiveDeltaRange {
+        std::string rel;
+        uint64_t destOffset = 0;
+        uint32_t length = 0;
+        uint32_t received = 0;
+    };
+    std::unordered_map<uint64_t, ActiveDeltaRange> activeDeltaRanges;  // (connId,streamId) -> range
+    uint64_t deltaReconstructed = 0;  // diagnostics: files completed via delta this session
 
     std::unordered_map<std::string, Hash256> remoteHashes;
     std::unordered_map<std::string, Hash256> localHashes;
@@ -2956,6 +3237,10 @@ int RunClient(const CliOptions& options) {
                         case MsgType::FileBatchOpen:
                         case MsgType::FileBatchChunk:
                         case MsgType::FileBatchEnd:
+                        case MsgType::BlockSigResponse:
+                        case MsgType::DeltaRangeChunk:
+                        case MsgType::DeltaRangeEnd:
+                        case MsgType::DeltaError:
                             break;  // legitimately server -> client
                         default: {
                             std::ostringstream os;
@@ -3033,6 +3318,58 @@ int RunClient(const CliOptions& options) {
             return;
         }
         enqueueTransfer(rel, false);
+    };
+
+    // Binary delta (FC7): structured observability for every delta fallback (NFR-04).
+    auto deltaFallback = [&](const std::string& rel, const char* reason,
+                             uint64_t downloadBytes, uint64_t newFileBytes) {
+        if (debugEnabled || diagnostics) {
+            std::cerr << "[delta] fallback rel=" << rel << " reason=" << reason
+                      << " downloadBytes=" << downloadBytes
+                      << " newFileBytes=" << newFileBytes << std::endl;
+        }
+    };
+
+    // Binary delta gate (binary-delta §6.2, FR-05~FR-08). Returns true only when the file
+    // is admitted into the delta flow (a BlockSigRequest is queued); the caller falls back to
+    // scheduleTransfer() on false, with zero side effects (FR-06). Conditions, all required:
+    //   G2 deltaEnabled (--delta-min-size>0 and server advertised the capability)
+    //   FR-25 not already abandoned this session; not already an in-flight delta
+    //   G3 remote fileSize >= deltaMinSizeBytes
+    //   G4 local old file exists, is readable, and size > 0 (else new/unreadable -> full path)
+    auto tryEnterDelta = [&](const std::string& rel) -> bool {
+        if (!deltaEnabled) {
+            return false;  // G2 (also the deltaMinSize==0 zero-regression bypass)
+        }
+        if (deltaAbandoned.contains(rel) || deltaStates.contains(rel) ||
+            deltaSigRequested.contains(rel)) {
+            return false;
+        }
+        const auto it = remoteFiles.find(rel);
+        if (it == remoteFiles.end() || it->second.fileSize < options.deltaMinSizeBytes) {
+            return false;  // G3
+        }
+        const fs::path abs = JoinRel(options.rootDir, rel);
+        std::error_code ec;
+        if (!fs::exists(abs, ec) || ec) {
+            return false;  // G4: brand-new file -> existing full path (FR-07), no reason log
+        }
+        const uint64_t localSize = static_cast<uint64_t>(fs::file_size(abs, ec));
+        if (ec || localSize == 0) {
+            return false;  // empty/new -> full path (FR-07)
+        }
+        {
+            std::ifstream probe(abs, std::ios::binary);
+            if (!probe) {
+                deltaFallback(rel, "old_unreadable", 0, it->second.fileSize);  // FR-08 / AC-12
+                return false;
+            }
+        }
+        DeltaFileState st;
+        st.newFileBytes = it->second.fileSize;
+        deltaStates.emplace(rel, std::move(st));
+        pendingDeltaSigRequests.push_back(rel);
+        return true;
     };
 
     auto markTransferFailed = [&](const std::string& rel) {
@@ -3379,7 +3716,11 @@ int RunClient(const CliOptions& options) {
     auto handleCompareResult = [&](const CompareResult& r) {
         const CompareAction action = r.action;
         if (action == CompareAction::TransferNow) {
-            scheduleTransfer(r.relPath);
+            // Size-different changed file (e.g. append/insert). delta gate G4 admits it only
+            // when a readable local old version exists; brand-new files fall through to full.
+            if (!tryEnterDelta(r.relPath)) {
+                scheduleTransfer(r.relPath);
+            }
         } else if (action == CompareAction::Skip) {
             ++compared;
             ++unchanged;
@@ -3754,7 +4095,10 @@ int RunClient(const CliOptions& options) {
                 continue;
             }
             if (localFailed || !localHashReady || !HashEquals(localHash, remoteHash)) {
-                scheduleTransfer(rel);
+                // Same size, content differs: try block-level delta before full download.
+                if (!tryEnterDelta(rel)) {
+                    scheduleTransfer(rel);
+                }
             } else {
                 const FileEntry& meta = remoteFiles.at(rel);
                 SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
@@ -3848,6 +4192,262 @@ int RunClient(const CliOptions& options) {
         }
         compareTaskCv.notify_all();
         compareDispatchBuffer.clear();
+    };
+
+    // --- Binary delta (FC7) client orchestration (design §6.1/§6.7) ---
+    auto makeDeltaTempPath = [&](const fs::path& target) -> fs::path {
+        static std::atomic<uint64_t> ctr{0};
+        const uint64_t n = ctr.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+        const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+        const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+        fs::path p = target;
+        p += ".fcdelta." + std::to_string(pid) + "." + std::to_string(n) + ".tmp";
+        return p;
+    };
+
+    // Reconstruction complete: verify the temp file against the manifest XXH3-128 (FR-23) and
+    // either atomic-rename it into place (NFR-05) or discard + abandon delta + full fallback.
+    auto finalizeDelta = [&](const std::string& rel) {
+        auto it = deltaStates.find(rel);
+        if (it == deltaStates.end()) {
+            return;
+        }
+        DeltaFileState& st = it->second;
+        if (st.tempOut.is_open()) {
+            st.tempOut.flush();
+            st.tempOut.close();
+        }
+        if (!st.tempPath.empty() && !SyncFileToDisk(st.tempPath)) {
+            std::error_code rec;
+            fs::remove(st.tempPath, rec);
+            deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(it);
+            scheduleTransfer(rel);
+            return;
+        }
+        const fs::path target = JoinRel(options.rootDir, rel);
+        bool verifyOk = false;
+        try {
+            const Hash256 got = ComputeFileHash(st.tempPath);
+            verifyOk = HashEquals(got, st.verifyHash);
+        } catch (...) {
+            verifyOk = false;
+        }
+        std::error_code rec;
+        if (verifyOk) {
+            bool renamed = false;
+#ifdef _WIN32
+            renamed = (MoveFileExW(st.tempPath.wstring().c_str(), target.wstring().c_str(),
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0);
+#else
+            fs::rename(st.tempPath, target, rec);
+            renamed = !rec;
+#endif
+            if (!renamed) {
+                fs::remove(st.tempPath, rec);
+                deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
+                deltaAbandoned.insert(rel);
+                deltaStates.erase(it);
+                scheduleTransfer(rel);
+                return;
+            }
+            const auto metaIt = remoteFiles.find(rel);
+            if (metaIt != remoteFiles.end()) {
+                SetFileModifyTime(target, metaIt->second.mtimeNs);
+            }
+            ++compared;
+            ++transferred;
+            ++deltaReconstructed;
+            transferRetryCounts.erase(rel);
+            // Capture before erase(): `st` is a reference into deltaStates and is dangling
+            // after the erase, so the log line must not read it post-erase.
+            const uint64_t reconstructedBytes = st.newFileBytes;
+            deltaStates.erase(it);
+            if (debugEnabled) {
+                std::cout << "[delta] reconstructed rel=" << rel << " sessionId=" << sessionId
+                          << " bytes=" << reconstructedBytes << std::endl;
+            }
+        } else {
+            fs::remove(st.tempPath, rec);
+            deltaFallback(rel, "verify_fail", st.newFileBytes, st.newFileBytes);  // FR-24 / AC-08
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(it);
+            scheduleTransfer(rel);
+        }
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
+                            lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+    };
+
+    // Drive a BlockSigResponse: build the reconstruction plan over the local old file, apply
+    // the benefit gate (FR-17), pre-write all copy ops to a temp file, and enqueue miss ranges
+    // (sliced for multi-lane parallelism, §6.6). 100%-match files finalize immediately.
+    auto beginDeltaReconstruct = [&](const std::string& rel, const Hash256& fileHash,
+                                     const delta::SignatureSet& sig) {
+        auto itState = deltaStates.find(rel);
+        if (itState == deltaStates.end()) {
+            return;  // abandoned before the response arrived
+        }
+        DeltaFileState& st = itState->second;
+        if (st.sigReceived) {
+            return;  // duplicate response (failover re-request); ignore
+        }
+        st.sigReceived = true;
+        st.verifyHash = fileHash;
+        st.newFileBytes = sig.fileSize;
+
+        const fs::path abs = JoinRel(options.rootDir, rel);
+        std::vector<uint8_t> oldData;
+        if (!ReadWholeFile(abs, oldData)) {
+            deltaFallback(rel, "old_unreadable", 0, sig.fileSize);
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(itState);
+            scheduleTransfer(rel);
+            return;
+        }
+        const delta::DeltaPlan plan = delta::BuildPlan(sig, oldData.data(), oldData.size());
+        if (delta::BenefitRejected(plan.downloadBytes, plan.newFileBytes)) {
+            deltaFallback(rel, "benefit", plan.downloadBytes, plan.newFileBytes);  // FR-19 / AC-07
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(itState);
+            scheduleTransfer(rel);
+            return;
+        }
+        EnsureParentDir(abs);
+        const fs::path tmp = makeDeltaTempPath(abs);
+        std::ofstream out(tmp, std::ios::binary | std::ios::out | std::ios::trunc);
+        bool ioOk = static_cast<bool>(out);
+        if (ioOk && plan.newFileBytes > 0) {
+            // Preallocate to the final size so out-of-order range writes land correctly.
+            out.seekp(static_cast<std::streamoff>(plan.newFileBytes - 1), std::ios::beg);
+            out.put('\0');
+            ioOk = static_cast<bool>(out);
+        }
+        for (const delta::CopyOp& c : plan.copies) {
+            if (!ioOk) {
+                break;
+            }
+            out.seekp(static_cast<std::streamoff>(c.destOffsetNew), std::ios::beg);
+            out.write(reinterpret_cast<const char*>(oldData.data() + c.srcOffsetOld),
+                      static_cast<std::streamsize>(c.len));
+            ioOk = static_cast<bool>(out);
+        }
+        if (!ioOk) {
+            if (out.is_open()) {
+                out.close();
+            }
+            std::error_code rec;
+            fs::remove(tmp, rec);
+            deltaFallback(rel, "reconstruct_io", plan.downloadBytes, plan.newFileBytes);
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(itState);
+            scheduleTransfer(rel);
+            return;
+        }
+        st.tempPath = tmp;
+        st.tempOut = std::move(out);
+
+        // Slice large misses so multiple lanes can fetch one file's regions in parallel.
+        const uint64_t sliceLen = std::min<uint64_t>(
+            static_cast<uint64_t>(effectiveChunkSize) * 8, 0xFFFFFFFFull);
+        uint32_t rangeCount = 0;
+        for (const delta::MissOp& m : plan.misses) {
+            uint64_t off = m.destOffsetNew;
+            uint64_t remaining = m.len;
+            while (remaining > 0) {
+                const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(remaining, sliceLen));
+                pendingDeltaRanges.push_back(DeltaRangeTask{rel, off, take});
+                off += take;
+                remaining -= take;
+                ++rangeCount;
+            }
+        }
+        st.pendingRanges = rangeCount;
+        if (debugEnabled) {
+            std::cout << "[delta] plan rel=" << rel << " sessionId=" << sessionId
+                      << " newBytes=" << plan.newFileBytes << " downloadBytes=" << plan.downloadBytes
+                      << " copies=" << plan.copies.size() << " ranges=" << rangeCount << std::endl;
+        }
+        if (rangeCount == 0) {
+            finalizeDelta(rel);  // 100% match: copies already cover the whole file (AC-03)
+        }
+    };
+
+    // Send queued BlockSigRequests on the control lane (binary-delta §6.1). On send failure
+    // the lane is marked down and the requests are requeued for a healthy control lane.
+    auto pumpDeltaSignatures = [&]() {
+        if (pendingDeltaSigRequests.empty()) {
+            return;
+        }
+        ClientConnection* ctrl = controlConn();
+        std::vector<Frame> frames;
+        std::vector<std::string> batch;
+        while (!pendingDeltaSigRequests.empty()) {
+            std::string rel = pendingDeltaSigRequests.front();
+            pendingDeltaSigRequests.pop_front();
+            if (!deltaStates.contains(rel)) {
+                continue;
+            }
+            frames.push_back(Frame{MsgType::BlockSigRequest, 0, EncodeBlockSigRequest(rel)});
+            batch.push_back(std::move(rel));
+        }
+        if (frames.empty()) {
+            return;
+        }
+        try {
+            SendFrameBatch(ctrl->socket, frames);
+            for (const std::string& r : batch) {
+                deltaSigRequested.insert(r);
+            }
+        } catch (const std::exception& ex) {
+            markConnDown(ctrl, ex.what());
+            for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit) {
+                pendingDeltaSigRequests.push_front(*rit);
+            }
+        }
+    };
+
+    // Assign queued miss ranges to healthy lanes (reuses pickConnection weighting; AC-15). The
+    // per-lane streamLimit bounds fan-out (pickConnection returns null when all are saturated).
+    auto tryStartDeltaRanges = [&]() {
+        while (!pendingDeltaRanges.empty()) {
+            const DeltaRangeTask& peek = pendingDeltaRanges.front();
+            if (!deltaStates.contains(peek.rel)) {
+                pendingDeltaRanges.pop_front();  // file abandoned by a sibling range
+                continue;
+            }
+            ClientConnection* conn = pickConnection(false);
+            if (conn == nullptr) {
+                break;  // all lanes saturated; retry next pass
+            }
+            DeltaRangeTask task = pendingDeltaRanges.front();
+            pendingDeltaRanges.pop_front();
+            const uint32_t sid = conn->nextStreamId++;
+            const uint64_t k = streamKey(conn->connId, sid);
+            DeltaRangeRequest req;
+            req.relPath = task.rel;
+            req.offset = task.offset;
+            req.length = task.length;
+            try {
+                SendFrame(conn->socket, Frame{MsgType::DeltaRangeOpen, sid, EncodeDeltaRangeOpen(req)});
+            } catch (const std::exception& ex) {
+                markConnDown(conn, ex.what());
+                pendingDeltaRanges.push_front(task);  // re-route to a healthy lane
+                break;
+            }
+            activeDeltaRanges.emplace(k, ActiveDeltaRange{task.rel, task.offset, task.length, 0});
+            ++conn->inFlight;
+            if (debugEnabled) {
+                std::cout << "[mp] alloc kind=delta_range connId=" << conn->connId
+                          << " sessionId=" << sessionId << " stream=" << sid
+                          << " path=" << task.rel << " offset=" << task.offset
+                          << " len=" << task.length
+                          << " primary=" << (conn->isPrimary ? 1 : 0) << std::endl;
+            }
+        }
     };
 
     auto processIncomingFrame = [&](uint32_t connId, Frame& frame) {
@@ -4082,6 +4682,69 @@ int RunClient(const CliOptions& options) {
                 }
             }
             PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+        } else if (frame.type == MsgType::BlockSigResponse) {
+            BlockSigResponseInfo info = DecodeBlockSigResponse(frame.payload);
+            beginDeltaReconstruct(info.relPath, info.fileHash, info.sig);
+        } else if (frame.type == MsgType::DeltaRangeChunk) {
+            auto itR = activeDeltaRanges.find(key);
+            if (itR == activeDeltaRanges.end()) {
+                if (staleFromDeadLane()) { return; }
+                throw std::runtime_error("Received delta range chunk for unknown stream");
+            }
+            ActiveDeltaRange& r = itR->second;
+            auto itS = deltaStates.find(r.rel);
+            if (itS != deltaStates.end() && itS->second.tempOut.is_open() && !frame.payload.empty()) {
+                itS->second.tempOut.seekp(static_cast<std::streamoff>(r.destOffset + r.received), std::ios::beg);
+                itS->second.tempOut.write(reinterpret_cast<const char*>(frame.payload.data()),
+                                          static_cast<std::streamsize>(frame.payload.size()));
+            }
+            r.received += static_cast<uint32_t>(frame.payload.size());
+        } else if (frame.type == MsgType::DeltaRangeEnd) {
+            auto itR = activeDeltaRanges.find(key);
+            if (itR == activeDeltaRanges.end()) {
+                if (staleFromDeadLane()) { return; }
+                throw std::runtime_error("Received delta range end for unknown stream");
+            }
+            const std::string rel = itR->second.rel;
+            activeDeltaRanges.erase(itR);
+            releaseSlot();
+            auto itS = deltaStates.find(rel);
+            if (itS != deltaStates.end()) {
+                if (itS->second.pendingRanges > 0) {
+                    --itS->second.pendingRanges;
+                }
+                if (itS->second.pendingRanges == 0) {
+                    finalizeDelta(rel);
+                }
+            }
+        } else if (frame.type == MsgType::DeltaError) {
+            // Signature generation or range read failed server-side -> abandon delta and fall
+            // back to a single full download (FR-25). The frame may be range-tagged (streamId)
+            // or sig-level (streamId 0); resolve rel from either source.
+            std::string rel = DecodeDeltaError(frame.payload);
+            auto itR = activeDeltaRanges.find(key);
+            if (itR != activeDeltaRanges.end()) {
+                rel = itR->second.rel;
+                activeDeltaRanges.erase(itR);
+                releaseSlot();
+            }
+            auto itS = deltaStates.find(rel);
+            const bool wasManaged = (itS != deltaStates.end()) || deltaSigRequested.contains(rel);
+            if (itS != deltaStates.end()) {
+                if (itS->second.tempOut.is_open()) {
+                    itS->second.tempOut.close();
+                }
+                std::error_code rec;
+                if (!itS->second.tempPath.empty()) {
+                    fs::remove(itS->second.tempPath, rec);
+                }
+                deltaStates.erase(itS);
+            }
+            if (wasManaged && !deltaAbandoned.contains(rel)) {
+                deltaAbandoned.insert(rel);
+                deltaFallback(rel, "sig_error", 0, 0);
+                scheduleTransfer(rel);
+            }
         } else {
             {
                 std::ostringstream os;
@@ -4225,12 +4888,14 @@ int RunClient(const CliOptions& options) {
     // retry budget (FR-019). Only when EVERY lane is down do we set recvClosed to trigger
     // the session-level reconnect path (FR-016 / AC-012).
     auto failoverScan = [&]() {
+        bool newlyDown = false;
         for (auto& cptr : pool) {
             ClientConnection* c = cptr.get();
             if (c->healthy.load() || c->drained) {
                 continue;
             }
             const uint32_t connId = c->connId;
+            newlyDown = true;
             size_t requeued = 0;
             // Regular downloads on this lane.
             std::vector<uint64_t> regularKeys;
@@ -4277,12 +4942,45 @@ int RunClient(const CliOptions& options) {
                     streamToPath.erase(k);
                 }
             }
+            // Binary delta (FC7): requeue this lane's in-flight ranges. Each range carries its
+            // own offset/length and writes at a fixed dest offset, so re-downloading on a
+            // healthy lane is idempotent (pendingRanges is only decremented on DeltaRangeEnd,
+            // so the deltaState's outstanding count stays correct across the re-route).
+            std::vector<uint64_t> rangeKeys;
+            for (auto& kv : activeDeltaRanges) {
+                if (static_cast<uint32_t>(kv.first >> 32) == connId) {
+                    rangeKeys.push_back(kv.first);
+                }
+            }
+            for (uint64_t k : rangeKeys) {
+                auto it = activeDeltaRanges.find(k);
+                if (it != activeDeltaRanges.end()) {
+                    if (deltaStates.contains(it->second.rel)) {
+                        pendingDeltaRanges.push_back(
+                            DeltaRangeTask{it->second.rel, it->second.destOffset, it->second.length});
+                        ++requeued;
+                    }
+                    activeDeltaRanges.erase(it);
+                }
+            }
             c->inFlight = 0;
             c->drained = true;
             ShutdownBoth(c->socket);
             if (debugEnabled) {
                 std::cout << "[mp] conn_down connId=" << connId << " reason=\"" << c->downReason
                           << "\" requeued_files=" << requeued << std::endl;
+            }
+        }
+        // Binary delta (FC7): a BlockSigResponse is lost when its control lane dies. If a lane
+        // just went down and a healthy lane remains, re-queue the still-unanswered signature
+        // requests; beginDeltaReconstruct ignores duplicate responses (sigReceived guard), so
+        // re-requesting is safe and prevents a stuck deltaState from hanging the sync.
+        if (newlyDown && healthyConnCount() > 0) {
+            for (auto& kv : deltaStates) {
+                if (!kv.second.sigReceived && deltaSigRequested.contains(kv.first)) {
+                    deltaSigRequested.erase(kv.first);
+                    pendingDeltaSigRequests.push_back(kv.first);
+                }
             }
         }
         if (healthyConnCount() == 0 && !recvClosed.load()) {
@@ -4310,6 +5008,8 @@ int RunClient(const CliOptions& options) {
             refreshSmallBatchTuning();
             rebalanceTransfersTowardBatch();
             tryStartTransfers();
+            pumpDeltaSignatures();
+            tryStartDeltaRanges();
             {
                 std::deque<CompareResult> ready;
                 {
@@ -4425,15 +5125,17 @@ int RunClient(const CliOptions& options) {
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
+            const bool deltaIdle = deltaStates.empty() && pendingDeltaSigRequests.empty() &&
+                                   pendingDeltaRanges.empty() && activeDeltaRanges.empty();
             if (manifestDone && allCompareDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone &&
-                ioOutstanding == 0) {
+                ioOutstanding == 0 && deltaIdle) {
                 break;
             }
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
-                                          (hashResponsesReceived < hashRequestsSent);
+                                          (hashResponsesReceived < hashRequestsSent) || !deltaIdle;
             sweepUnresolvedFallbackIfQuiescent();
             // recvClosed means EVERY lane is down (failoverScan). When a send-side failure
             // requeued the last lane's work, there may be no in-flight network state left, so

@@ -21,6 +21,7 @@ HARNESS_VERSION
 build/
 build_tests/
 build_tests_cli/
+build_delta/
 Release/
 Win32/
 *.iobj

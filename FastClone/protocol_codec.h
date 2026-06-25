@@ -1,5 +1,6 @@
 #pragma once
 
+#include "delta.h"
 #include "file_index.h"
 #include "protocol.h"
 
@@ -44,6 +45,10 @@ struct AuthOkInfo {
     AuthOkRole role = AuthOkRole::NewSession;
     std::string sessionId;
     std::vector<AdvertisedEndpoint> serverAddrs;  // advertised endpoints + NIC group
+    // FC7 connection-level capability bits (binary-delta §8.1). Appended at the END of the
+    // AuthOk payload; DecodeAuthOk reads it only when bytes remain (default 0), so older
+    // fixtures / probe code without the field decode as "no capabilities".
+    uint8_t capabilities = 0;
 };
 
 std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info);
@@ -75,5 +80,38 @@ std::vector<std::string> DecodeFileBatchRequest(const std::vector<uint8_t>& payl
 
 std::vector<uint8_t> EncodeFileBatchOpenResponse(const std::vector<BatchFileRecord>& files);
 std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8_t>& payload);
+
+// --- Binary delta (FC7, binary-delta §8.2) ---
+
+// BlockSigRequest / DeltaError / BlockSigRequest share the bare-relPath payload shape.
+std::vector<uint8_t> EncodeBlockSigRequest(const std::string& relPath);
+std::string DecodeBlockSigRequest(const std::vector<uint8_t>& payload);
+
+std::vector<uint8_t> EncodeDeltaError(const std::string& relPath);
+std::string DecodeDeltaError(const std::vector<uint8_t>& payload);
+
+// BlockSigResponse: relPath + fileHash(16, XXH3-128 raw layout matching ComputeFileHash) +
+// fileSize(u64) + blockSize(u32) + blockCount(u32) + strongLen(u8) +
+// blockCount * (weak(u32) + strong[strongLen]). The full-file hash rides along so the
+// client can run the FR-23 reconstruction check WITHOUT a separate HashRequest (which would
+// entangle the delta flow with the FallbackHash machinery). Block offsets are NOT on the
+// wire; the client derives them from index*blockSize (design §8.2).
+struct BlockSigResponseInfo {
+    std::string relPath;
+    Hash256 fileHash{};
+    delta::SignatureSet sig;
+};
+std::vector<uint8_t> EncodeBlockSigResponse(const std::string& relPath, const Hash256& fileHash, const delta::SignatureSet& sig);
+BlockSigResponseInfo DecodeBlockSigResponse(const std::vector<uint8_t>& payload);
+
+// DeltaRangeOpen: relPath + offset(u64) + length(u64). The stream id travels in the frame
+// header; DeltaRangeChunk payloads are raw bytes and DeltaRangeEnd is empty (no codec).
+struct DeltaRangeRequest {
+    std::string relPath;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+std::vector<uint8_t> EncodeDeltaRangeOpen(const DeltaRangeRequest& req);
+DeltaRangeRequest DecodeDeltaRangeOpen(const std::vector<uint8_t>& payload);
 
 }  // namespace fc

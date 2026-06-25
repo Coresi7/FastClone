@@ -74,6 +74,13 @@ struct CliOptions {
     std::vector<LinkPin> linkPins;
     // Hard cap on the connection pool size (gatekeeper default <= 8, design R-05).
     uint32_t maxConnections = 8;
+
+    // --- Binary delta (FC7) ---
+    // Client-only minimum file size to attempt block-level binary delta (binary-delta FR-01).
+    // 0 (default) disables delta entirely (zero regression). A positive value must be in
+    // [1M, 1T]. Parsed with ParseSizeBytesStrict (K|M|G suffix), fully orthogonal to
+    // --large-file-threshold (FR-04).
+    uint64_t deltaMinSizeBytes = 0;
 };
 
 #if defined(_WIN32) && defined(_MSC_VER)

@@ -155,6 +155,7 @@
 
   <ItemGroup>
     <ClInclude Include="cli.h" />
+    <ClInclude Include="delta.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="link_scheduler.h" />
@@ -168,6 +169,7 @@
     <!-- Production sources under test (mirrors CMake FastCloneTests; no sync_engine.cpp /
          main.cpp / transfer_tuning.cpp / route_probe_main.cpp / client_handshake.cpp). -->
     <ClCompile Include="cli.cpp" />
+    <ClCompile Include="delta.cpp" />
     <ClCompile Include="file_index.cpp" />
     <ClCompile Include="hash_memcache.cpp" />
     <ClCompile Include="net_topology.cpp" />
@@ -181,6 +183,7 @@
          RunCliTests() in this project as well as in the CMake build. -->
     <ClCompile Include="..\tests\test_main.cpp" />
     <ClCompile Include="..\tests\test_cli.cpp" />
+    <ClCompile Include="..\tests\test_delta.cpp" />
     <ClCompile Include="..\tests\test_file_index.cpp" />
     <ClCompile Include="..\tests\test_hash_memcache.cpp" />
     <ClCompile Include="..\tests\test_reconnect.cpp" />

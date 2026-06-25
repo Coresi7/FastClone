@@ -39,7 +39,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
@@ -51,6 +51,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--large-file-threshold`：将 `>=` 该大小的文件固定走首要链路；默认 `1G`，范围 `1M..1T`，支持 `K/M/G` 后缀（与碎文件批处理阈值、接收队列阈值相互独立）
 - `--aux-weight`：传输调度中每条辅助链路的排序权重；默认 `1.0`，范围 `(0,16]`（首要链路固定为 `1.0`）。值越大，越多文件传输按比例倾斜到辅助链路
 - `--large-file-lane`：大文件（`>= --large-file-threshold`）在各链路间的路由方式：`primary`（固定走首要链路）、`aux`（与普通文件一样按权重调度）、`auto`（`--aux-weight >= 2.0` 时倾向辅助链路，否则固定走首要链路）；默认 `auto`
+- `--delta-min-size`：对 `>=` 该大小、且发生变化的文件启用**二进制增量（delta）**传输——只下载变化的字节范围而非整文件，依据本地旧副本做匹配（rsync 式滚动校验 + XXH3-128，独立 MIT 实现）。默认 `0`（**关闭**）；设为正值（范围 `1M..1T`，支持 `K/M/G` 后缀）即开启。与 `--large-file-threshold` 相互独立。需要两端均为 FC7 协议（见下文「二进制增量传输」）
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
 - `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
@@ -138,8 +139,17 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - 一个会话由一个**连接池**组成：先建立首要链路（`--server` 的第一个端点 / `--link` 的第一条），再尽力建立辅助链路。
 - **自动选路**：客户端枚举本机网卡、对服务端下发的端点做可达性探测，按"地址族（IPv4 优先）> 同子网 > RTT"择优配对，并保证**每块物理网卡（客户端与服务端两侧）至多一条连接**（双栈网卡的 v4/v6 不会被当成两条链路）。
 - **显式指定**：用 `--link <本地IP|网卡名>=<服务端IP[:端口]>` 可绕过自动选路，列表第一条为首要链路。
-- **文件到链路的调度**：单个文件无法跨链路拆分。普通文件与碎文件批按"加权最短队列"策略分摊到各健康链路（在途流最少的链路优先；`--aux-weight` 让选择向辅助链路倾斜）。大文件（`>= --large-file-threshold`，默认 `1G`）按 `--large-file-lane` 路由：默认固定走首要链路（假定其为最佳链路），或在倾向辅助链路时与普通文件一样按权重调度。
+- **文件到链路的调度**：整文件传输不跨链路拆分。普通文件与碎文件批按"加权最短队列"策略分摊到各健康链路（在途流最少的链路优先；`--aux-weight` 让选择向辅助链路倾斜）。大文件（`>= --large-file-threshold`，默认 `1G`）按 `--large-file-lane` 路由：默认固定走首要链路（假定其为最佳链路），或在倾向辅助链路时与普通文件一样按权重调度。（二进制增量是例外——delta 文件的变化范围**会**跨链路分摊，见下文。）
 - 单网卡 / 单端点时自动退化为单连接，行为与此前一致。
+
+#### 二进制增量传输（可选开启）
+
+对本地已存在、且只发生局部变化的大文件，FastClone 可只传输**变化的字节范围**而非整文件：
+
+- 用 `--delta-min-size <size>` 开启（默认 `0` = 关闭）；变化且 `>=` 该大小的文件走 delta，其余路径不受影响。
+- 客户端用 rsync 式滚动校验 + XXH3-128 块哈希（独立实现——无 rsync 源码，MIT 干净）将服务端新文件与本地旧副本匹配，只下载缺失范围（跨多链路分摊），在本地重建。结果会用 XXH3-128 与服务端校验；哈希不符或收益过低（几乎要下载整文件）时自动回退全量传输。
+- **FC7 协议**：delta 需要协议版本 FC7。FC7 与旧版 FC6 **不互通**，客户端与服务端须同步升级。
+- 默认关闭：它以本地读盘 + CPU 换取更少的网络字节——在带宽受限 / 广域网链路上净赚，但在高带宽局域网上往往不划算。
 
 #### 如何启用 / 禁用可达性探测
 

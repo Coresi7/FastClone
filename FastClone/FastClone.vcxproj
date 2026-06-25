@@ -146,6 +146,7 @@
   <ItemGroup>
     <ClInclude Include="cli.h" />
     <ClInclude Include="client_handshake.h" />
+    <ClInclude Include="delta.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="link_scheduler.h" />
@@ -160,6 +161,7 @@
   <ItemGroup>
     <ClCompile Include="cli.cpp" />
     <ClCompile Include="client_handshake.cpp" />
+    <ClCompile Include="delta.cpp" />
     <ClCompile Include="file_index.cpp" />
     <ClCompile Include="hash_memcache.cpp" />
     <ClCompile Include="main.cpp" />

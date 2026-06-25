@@ -22,6 +22,10 @@ using Hash256 = std::array<uint8_t, 16>;
 
 std::vector<FileEntry> BuildIndex(const std::filesystem::path& root, const std::optional<std::filesystem::path>& excludeAbsPath);
 Hash256 ComputeFileHash(const std::filesystem::path& path);
+// Same XXH3-128 digest + raw byte layout as ComputeFileHash, but over an in-memory buffer.
+// Lets callers that already hold the file bytes (e.g. the delta block-signature path) avoid a
+// second full-file read while producing a value the client's ComputeFileHash verify matches.
+Hash256 ComputeBufferHash(const uint8_t* data, size_t len);
 bool HashEquals(const Hash256& a, const Hash256& b);
 std::string NormalizeRelativePath(const std::filesystem::path& relativePath);
 int64_t ToUnixNs(const std::filesystem::file_time_type& value);

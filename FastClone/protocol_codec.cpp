@@ -18,6 +18,8 @@ std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info) {
         AppendString(payload, addr.endpoint);
         AppendU16(payload, addr.nicGroup);
     }
+    // FC7 connection-level capability bits, appended last (binary-delta §8.1).
+    payload.push_back(info.capabilities);
     return payload;
 }
 
@@ -39,6 +41,11 @@ AuthOkInfo DecodeAuthOk(const std::vector<uint8_t>& payload) {
         adv.endpoint = ReadString(payload, cursor);
         adv.nicGroup = ReadU16(payload, cursor);
         info.serverAddrs.push_back(std::move(adv));
+    }
+    // FC7 capability byte trails the address list; absent => no capabilities (back-compat
+    // with fixtures / probe payloads that predate the field, binary-delta §8.1).
+    if (cursor < payload.size()) {
+        info.capabilities = payload[cursor++];
     }
     return info;
 }
@@ -175,6 +182,106 @@ std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8
         files.push_back(std::move(file));
     }
     return files;
+}
+
+std::vector<uint8_t> EncodeBlockSigRequest(const std::string& relPath) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, relPath);
+    return payload;
+}
+
+std::string DecodeBlockSigRequest(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    return ReadString(payload, cursor);
+}
+
+std::vector<uint8_t> EncodeDeltaError(const std::string& relPath) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, relPath);
+    return payload;
+}
+
+std::string DecodeDeltaError(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    return ReadString(payload, cursor);
+}
+
+std::vector<uint8_t> EncodeBlockSigResponse(const std::string& relPath, const Hash256& fileHash, const delta::SignatureSet& sig) {
+    if (sig.strongLen > 16) {
+        throw std::runtime_error("BlockSigResponse strongLen out of range");
+    }
+    if (sig.blocks.size() != sig.blockCount) {
+        throw std::runtime_error("BlockSigResponse block count mismatch");
+    }
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + relPath.size() + fileHash.size() + 17 +
+                    static_cast<size_t>(sig.blockCount) * (4 + sig.strongLen));
+    AppendString(payload, relPath);
+    payload.insert(payload.end(), fileHash.begin(), fileHash.end());
+    AppendU64(payload, sig.fileSize);
+    AppendU32(payload, sig.blockSize);
+    AppendU32(payload, sig.blockCount);
+    payload.push_back(sig.strongLen);
+    for (const delta::BlockSig& bs : sig.blocks) {
+        AppendU32(payload, bs.weak);
+        payload.insert(payload.end(), bs.strong.begin(), bs.strong.begin() + sig.strongLen);
+    }
+    return payload;
+}
+
+BlockSigResponseInfo DecodeBlockSigResponse(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    BlockSigResponseInfo info;
+    info.relPath = ReadString(payload, cursor);
+    if (cursor + info.fileHash.size() > payload.size()) {
+        throw std::runtime_error("BlockSigResponse file hash truncated");
+    }
+    std::copy(payload.begin() + static_cast<std::ptrdiff_t>(cursor),
+              payload.begin() + static_cast<std::ptrdiff_t>(cursor + info.fileHash.size()),
+              info.fileHash.begin());
+    cursor += info.fileHash.size();
+    delta::SignatureSet& sig = info.sig;
+    sig.fileSize = ReadU64(payload, cursor);
+    sig.blockSize = ReadU32(payload, cursor);
+    sig.blockCount = ReadU32(payload, cursor);
+    if (cursor >= payload.size()) {
+        throw std::runtime_error("BlockSigResponse payload truncated");
+    }
+    sig.strongLen = payload[cursor++];
+    if (sig.strongLen > 16) {
+        throw std::runtime_error("BlockSigResponse strongLen out of range");
+    }
+    sig.blocks.reserve(sig.blockCount);
+    for (uint32_t i = 0; i < sig.blockCount; ++i) {
+        delta::BlockSig bs;
+        bs.weak = ReadU32(payload, cursor);
+        if (cursor + sig.strongLen > payload.size()) {
+            throw std::runtime_error("BlockSigResponse strong checksum truncated");
+        }
+        std::copy(payload.begin() + static_cast<std::ptrdiff_t>(cursor),
+                  payload.begin() + static_cast<std::ptrdiff_t>(cursor + sig.strongLen),
+                  bs.strong.begin());
+        cursor += sig.strongLen;
+        sig.blocks.push_back(bs);
+    }
+    return info;
+}
+
+std::vector<uint8_t> EncodeDeltaRangeOpen(const DeltaRangeRequest& req) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, req.relPath);
+    AppendU64(payload, req.offset);
+    AppendU64(payload, req.length);
+    return payload;
+}
+
+DeltaRangeRequest DecodeDeltaRangeOpen(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    DeltaRangeRequest req;
+    req.relPath = ReadString(payload, cursor);
+    req.offset = ReadU64(payload, cursor);
+    req.length = ReadU64(payload, cursor);
+    return req;
 }
 
 }  // namespace fc
