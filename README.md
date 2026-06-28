@@ -3,6 +3,7 @@
 `FastClone` is a high-throughput directory sync tool built for extreme-scale trees: it rapidly syncs **tens of millions of files** and **TB-scale data**, handling a mix of huge files and enormous numbers of tiny files in a single pass (e.g. Unity/Unreal project folders, game build outputs, and large asset/dataset repositories).
 
 Supported platforms:
+
 - Windows: WinAPI fast path (highest performance)
 - GNU/Linux / macOS: cross-platform implementation (fully functional; performance may be lower than Windows in some cases)
 
@@ -15,11 +16,17 @@ Supported platforms:
 - Scales to tens-of-millions-file, TB-scale trees: tiny files are batched together while many files run concurrently across multiple streams / links (a single file itself is never split across streams)
 - Strict protocol version check (version mismatch is rejected immediately)
 
+
+
 ## Expected Performance
 
 - On i9-9900K + SATA SSD, syncing a ~3 million-file Library can finish in around 20 seconds when delta changes are limited (otherwise mainly bounded by network bandwidth).
 
+
+
 ## Usage
+
+
 
 ### Server
 
@@ -37,6 +44,8 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 - `--wait-connect-timeout`: first-connect wait window for `--once` / `--once-multi` (default `300s`, suffixes `s`/`m`/`h`, must be `> 0`); if no valid client connection is established before it elapses, the server exits with code `6`. Once the first valid connection arrives the timer is permanently disabled. Valid only together with `--once` or `--once-multi`
 - `--password`: pre-shared password (required)
 
+
+
 ### Client
 
 ```bash
@@ -52,10 +61,12 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--large-file-threshold`: pins files `>=` this size to the primary link; default `1G`, range `1M..1T`, suffixes `K/M/G` (independent of the small-file batch threshold and the receive-queue target)
 - `--aux-weight`: per-link ordering weight applied to every auxiliary link in transfer scheduling; default `1.0`, range `(0,16]` (the primary link is fixed at `1.0`). Higher values pull proportionally more file transfers onto aux links
 - `--large-file-lane`: how large files (`>= --large-file-threshold`) are routed across links: `primary` (pin to the primary link), `aux` (schedule by weight like any other file), or `auto` (prefer aux when `--aux-weight >= 2.0`, otherwise pin to primary); default `auto`
-- `--delta-min-size`: enable **binary-delta** transfer for changed files `>=` this size — only the changed byte ranges are downloaded instead of the whole file, matched against the existing local copy (rsync-style rolling checksum + XXH3-128, independent MIT implementation). Default `0` (**disabled**); a positive value (range `1M..1T`, suffixes `K/M/G`) enables it. Independent of `--large-file-threshold`. Requires protocol FC7 on both ends (see Binary Delta Transfer below)
+- `--delta-min-size`: enable **binary-delta** transfer for changed files `>=` this size — only the changed byte ranges are downloaded instead of the whole file, matched against the existing local copy (Inspired by rsync. Rolling checksum + XXH3-128, independent MIT implementation). Default `0` (**disabled**); a positive value (range `1M..1T`, suffixes `K/M/G`) enables it. Independent of `--large-file-threshold`. Requires protocol FC7 on both ends (see Binary Delta Transfer below)
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
 - `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
 - `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
+
+
 
 ## OneShot Server Mode (`--once`)
 
@@ -88,8 +99,10 @@ This mode is **server-only**; passing `--once` on the client side produces a CLI
 - Pre-handshake probes do not count as sessions and do not reset the grace window.
 - If no client ever connects, the server self-exits with code `6` once `--wait-connect-timeout` (default `300s`) elapses; see [First-Connect Wait Timeout](#first-connect-wait-timeout---wait-connect-timeout).
 - Exit code aggregates across all served sessions: `0` if every session completed cleanly, `5` if any session failed or was aborted.
-- Unlike `--once`, `--once-multi` is **compatible with `--enable-hash-memcache`** — a shared hash cache benefits later clients in the same run.
+- Unlike `--once`, `--once-multi` is **compatible with** `--enable-hash-memcache` — a shared hash cache benefits later clients in the same run.
 - Mutually exclusive with `--once`.
+
+
 
 ## First-Connect Wait Timeout (`--wait-connect-timeout`)
 
@@ -101,6 +114,8 @@ For `--once` and `--once-multi`, the server arms a **first-connect wait timer** 
 - If the window elapses with no valid connection, the server logs the threshold and exits with code `6`.
 - Once the first valid connection arrives, the timer is **permanently disabled** for the life of the process; subsequent exit is governed solely by the existing `--once` (single-session terminal) or `--once-multi` (`--once-idle-grace`) rules.
 - Valid only together with `--once` or `--once-multi`; passing it in resident-server or client mode is a CLI error (exit `1`).
+
+
 
 ## Progress Counters
 
@@ -125,6 +140,8 @@ When the server and client each have multiple NICs, FastClone can use **several 
 - **File-to-link scheduling**: a full-file transfer is not split across links. Regular files and small-file batches are distributed across healthy links by a weighted shortest-queue policy (the link with the fewest outstanding streams wins; `--aux-weight` biases the choice toward aux links). Large files (`>= --large-file-threshold`, default `1G`) follow `--large-file-lane`: pinned to the primary link by default (assumed best), or scheduled by weight like other files when aux is preferred. (Binary-delta is the exception — a delta'd file's changed ranges *are* spread across links; see below.)
 - With a single NIC / endpoint it degrades to a single connection, identical to prior behavior.
 
+
+
 #### Binary Delta Transfer (opt-in)
 
 For large files that already exist locally and changed only partially, FastClone can transfer **only the changed byte ranges** instead of the whole file:
@@ -134,17 +151,21 @@ For large files that already exist locally and changed only partially, FastClone
 - **Protocol FC7**: delta requires protocol version FC7. FC7 and the older FC6 do **not** interoperate, so client and server must be upgraded together.
 - Disabled by default: it trades local disk reads + CPU for fewer network bytes — a net win on bandwidth-constrained / WAN links, but often not worth it on high-bandwidth LANs.
 
+
+
 #### How to Enable / Disable Reachability Probing
 
 **Server side** — endpoint advertisement is always on. When a client connects for the first time, the server automatically enumerates all local NIC addresses, groups them by physical interface, and sends them in the `AuthOk` frame. There is currently no CLI option to suppress advertisement; to prevent clients from probing extra endpoints, restrict reachability at the network/firewall level so that only one NIC is reachable from the client.
 
 **Client side** — reachability probing is controlled by whether `--link` is specified:
 
-| Mode | Condition | Behavior |
-|------|-----------|----------|
-| Auto (probing enabled) | No `--link` given, and server advertises > 1 endpoint **or** client has > 1 NIC candidate | Client enumerates local NICs, probes reachability to all server endpoints, then selects optimal link pairs |
-| Auto-degraded (probing skipped) | No `--link` given, but only 1 server endpoint + 1 local candidate | Probing is skipped; falls back to single-link behavior |
-| Explicit (probing bypassed) | One or more `--link` given | Client uses the pinned link(s) directly; no probing occurs |
+
+| Mode                            | Condition                                                                                 | Behavior                                                                                                   |
+| ------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Auto (probing enabled)          | No `--link` given, and server advertises > 1 endpoint **or** client has > 1 NIC candidate | Client enumerates local NICs, probes reachability to all server endpoints, then selects optimal link pairs |
+| Auto-degraded (probing skipped) | No `--link` given, but only 1 server endpoint + 1 local candidate                         | Probing is skipped; falls back to single-link behavior                                                     |
+| Explicit (probing bypassed)     | One or more `--link` given                                                                | Client uses the pinned link(s) directly; no probing occurs                                                 |
+
 
 To **disable** probing entirely, use `--link` to explicitly pin link(s). Even a single `--link` (primary only) will bypass all automatic selection and probing.
 
@@ -162,30 +183,39 @@ If the connection drops before the manifest is fully received, the client automa
 - The current wire protocol is **FC6** (multipath session: adds `SessionJoin`, and `AuthOk` carries the session id and the server endpoint list); with multiple connections, a single dropped link migrates its in-flight files to healthy links, and only a fully-down pool triggers a session-level reconnect
 - Unrecoverable errors (auth/protocol mismatch, frame desync, server Error frame) exit immediately (code `1`) and do not consume the reconnect budget
 
+
+
 ## Notes
 
 - Current transport is plain TCP + password; use only in trusted networks
 - Mirror mode removes extra files/directories on the client
 - No block-level resume; rely on auto-reconnect or rerun after interruption (unchanged files are still skipped by comparison)
 
+
+
 ## Exit Codes
 
 **Client:**
+
 - `0`: sync succeeded (no failed files)
 - `1`: argument error or runtime exception
 - `2`: sync completed with failed files (try lowering concurrency, e.g. `--streams`)
 - `3`: sync incomplete and auto-reconnect disabled (`--reconnect-retries 0`), or connection dropped without reconnect enabled
 - `4`: auto-reconnect budget exhausted with the sync still incomplete
 
-**Server `--once` / `--once-multi`:**
+**Server** `--once` **/** `--once-multi`**:**
+
 - `0`: the served session(s) completed cleanly (`--once`: the single session; `--once-multi`: every session)
 - `1`: argument/usage error (e.g. `--once` with `--enable-hash-memcache`, `--once` together with `--once-multi`, `--once-idle-grace` without `--once-multi`, `--wait-connect-timeout` without `--once`/`--once-multi`, or any of these on the client)
 - `5`: a served session failed or was aborted (any lane error; `--once-multi` aggregates: `5` if any session failed) — distinct from the client's `2` so every exit code has one unambiguous meaning
 - `6`: no valid client connection was established before `--wait-connect-timeout` elapsed (server first-connect wait timeout); see [First-Connect Wait Timeout](#first-connect-wait-timeout---wait-connect-timeout)
 
+
+
 ## Cross-Platform Build (Linux/macOS)
 
 Dependencies:
+
 - C++20 compiler
 - CMake 3.16+
 - xxhash development package
