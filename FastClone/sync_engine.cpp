@@ -3322,11 +3322,23 @@ int RunClient(const CliOptions& options) {
 
     // Binary delta (FC7): structured observability for every delta fallback (NFR-04).
     auto deltaFallback = [&](const std::string& rel, const char* reason,
-                             uint64_t downloadBytes, uint64_t newFileBytes) {
+                             uint64_t downloadBytes, uint64_t newFileBytes,
+                             const delta::DeltaStats* stats = nullptr) {
         if (debugEnabled || diagnostics) {
             std::cerr << "[delta] fallback rel=" << rel << " reason=" << reason
                       << " downloadBytes=" << downloadBytes
-                      << " newFileBytes=" << newFileBytes << std::endl;
+                      << " newFileBytes=" << newFileBytes;
+            // DeltaStats (client-local) for perf tuning: present on the BuildPlan-derived
+            // fallback (reason=benefit), showing whether the rolling scan early-stopped and
+            // how far it scanned before abandoning delta.
+            if (stats != nullptr) {
+                std::cerr << " early_stopped=" << (stats->earlyStopped ? 1 : 0)
+                          << " scanned_bytes=" << stats->scannedBytes
+                          << " matched_bytes=" << stats->matchedBytes
+                          << " strong_computes=" << stats->strongComputations
+                          << " weak_hits=" << stats->weakCandidateHits;
+            }
+            std::cerr << std::endl;
         }
     };
 
@@ -4310,7 +4322,7 @@ int RunClient(const CliOptions& options) {
         }
         const delta::DeltaPlan plan = delta::BuildPlan(sig, oldData.data(), oldData.size());
         if (delta::BenefitRejected(plan.downloadBytes, plan.newFileBytes)) {
-            deltaFallback(rel, "benefit", plan.downloadBytes, plan.newFileBytes);  // FR-19 / AC-07
+            deltaFallback(rel, "benefit", plan.downloadBytes, plan.newFileBytes, &plan.stats);  // FR-19 / AC-07
             deltaAbandoned.insert(rel);
             deltaStates.erase(itState);
             scheduleTransfer(rel);
@@ -4369,7 +4381,12 @@ int RunClient(const CliOptions& options) {
         if (debugEnabled) {
             std::cout << "[delta] plan rel=" << rel << " sessionId=" << sessionId
                       << " newBytes=" << plan.newFileBytes << " downloadBytes=" << plan.downloadBytes
-                      << " copies=" << plan.copies.size() << " ranges=" << rangeCount << std::endl;
+                      << " copies=" << plan.copies.size() << " ranges=" << rangeCount
+                      << " scanned_bytes=" << plan.stats.scannedBytes
+                      << " matched_bytes=" << plan.stats.matchedBytes
+                      << " strong_computes=" << plan.stats.strongComputations
+                      << " weak_hits=" << plan.stats.weakCandidateHits
+                      << " early_stopped=" << (plan.stats.earlyStopped ? 1 : 0) << std::endl;
         }
         if (rangeCount == 0) {
             finalizeDelta(rel);  // 100% match: copies already cover the whole file (AC-03)

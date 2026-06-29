@@ -5,7 +5,56 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace fc::delta {
+
+namespace {
+
+// Unsigned 128-bit value (hi:lo) used only for the early-stop projection comparison so the
+// 8 GB-scale triple products never overflow uint64 (NFR-07, delta-perf R-02).
+struct U128 {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+};
+
+// Full 64x64 -> 128-bit unsigned multiply. Deterministic across compilers.
+U128 Mul64(uint64_t a, uint64_t b) {
+#if defined(_MSC_VER) && defined(_M_X64)
+    U128 r;
+    r.lo = _umul128(a, b, &r.hi);
+    return r;
+#elif defined(__SIZEOF_INT128__)
+    const unsigned __int128 p = static_cast<unsigned __int128>(a) * b;
+    return U128{static_cast<uint64_t>(p >> 64), static_cast<uint64_t>(p)};
+#else
+    const uint64_t aLo = a & 0xFFFFFFFFull, aHi = a >> 32;
+    const uint64_t bLo = b & 0xFFFFFFFFull, bHi = b >> 32;
+    const uint64_t lolo = aLo * bLo;
+    const uint64_t lohi = aLo * bHi;
+    const uint64_t hilo = aHi * bLo;
+    const uint64_t hihi = aHi * bHi;
+    const uint64_t cross = (lolo >> 32) + (lohi & 0xFFFFFFFFull) + (hilo & 0xFFFFFFFFull);
+    U128 r;
+    r.lo = (lolo & 0xFFFFFFFFull) | (cross << 32);
+    r.hi = hihi + (lohi >> 32) + (hilo >> 32) + (cross >> 32);
+    return r;
+#endif
+}
+
+bool LessEqual128(const U128& x, const U128& y) {
+    return x.hi < y.hi || (x.hi == y.hi && x.lo <= y.lo);
+}
+
+// Inlined-weak hash entry for the CSR (bucket-contiguous) candidate layout (FR-09 / §5.2).
+struct Entry {
+    uint32_t weak = 0;        // inlined so candidate filtering reads 8 contiguous bytes
+    uint32_t blockIndex = 0;  // index into sig.blocks
+};
+
+}  // namespace
 
 RollingWeak WeakInit(const uint8_t* p, uint32_t L) {
     // s1 = Σ X[j], s2 = Σ (j+1)*X[j]. Accumulating in uint32_t may overflow 2^32, but the
@@ -116,7 +165,38 @@ SignatureSet GenerateSignatures(const uint8_t* data, uint64_t len) {
     return sig;
 }
 
-DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t oldLen) {
+uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize) {
+    // floor = max(kPrefixFloorBytes, blockSize * kPrefixFloorBlocks) — small-file evidence
+    // floor and at least kPrefixFloorBlocks blocks of evidence (B5/B4).
+    uint64_t floorBytes = kPrefixFloorBytes;
+    const uint64_t blockFloor = static_cast<uint64_t>(blockSize) * kPrefixFloorBlocks;
+    if (blockFloor > floorBytes) {
+        floorBytes = blockFloor;
+    }
+    const uint64_t pct = oldLen / 100 * kPrefixPercent + (oldLen % 100) * kPrefixPercent / 100;
+    uint64_t prefix = floorBytes > pct ? floorBytes : pct;
+    if (prefix > kPrefixCapBytes) {  // min(cap, ...) performance cap (§4.3)
+        prefix = kPrefixCapBytes;
+    }
+    return prefix;
+}
+
+bool ProjectedRejected(uint64_t matchedBytes, uint64_t scannedBytes,
+                       uint64_t oldLen, uint64_t newFileBytes) {
+    if (scannedBytes == 0) {
+        return false;  // no evidence yet -> never project
+    }
+    // Early stop <=> matchedBytes*oldLen*100 <= newFileBytes*35*scannedBytes (delta-perf §4.1),
+    // 35 == kBenefitPercentDen - kBenefitPercentNum. Fold the small constants into one factor
+    // each (safe for any realistic file < 2^57 bytes) and compare in 128 bits.
+    const U128 left = Mul64(matchedBytes, oldLen * kBenefitPercentDen);
+    const U128 right = Mul64(newFileBytes,
+                             scannedBytes * (kBenefitPercentDen - kBenefitPercentNum));
+    return LessEqual128(left, right);
+}
+
+DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t oldLen,
+                    const BuildOptions& opt) {
     DeltaPlan plan;
     plan.newFileBytes = sig.fileSize;
     if (sig.blockCount == 0 || sig.blockSize == 0) {
@@ -131,24 +211,51 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
         return static_cast<uint32_t>(std::min<uint64_t>(L, sig.fileSize - off));
     };
 
-    std::vector<bool> matched(blockCount, false);
+    std::vector<uint8_t> matched(blockCount, 0);  // byte-direct, not a bit-proxy (FR-10/AC-08)
     std::vector<uint64_t> matchedSrc(blockCount, 0);
 
-    // Hash table over FULL blocks only: the trailing short block (len < blockSize) cannot be
-    // located by a fixed blockSize rolling window, so it is excluded and always a miss (§5.1).
-    std::vector<int32_t> bucketHead(1u << 16, -1);
-    std::vector<int32_t> chainNext(blockCount, -1);
+    // CSR (bucket-contiguous) candidate layout over FULL blocks only: the trailing short block
+    // (len < blockSize) cannot be located by a fixed blockSize rolling window, so it is
+    // excluded and always a miss (§5.1). bucketStart is a prefix sum; entries holds the
+    // inlined-weak candidates packed per bucket so candidate scans read sequentially (§5.2).
+    constexpr uint32_t kBuckets = 1u << 16;
+    std::vector<uint32_t> bucketStart(kBuckets + 1, 0);
+    uint32_t fullBlockCount = 0;
     for (uint32_t i = 0; i < blockCount; ++i) {
         if (blockLen(i) != L) {
             continue;  // short trailing block
         }
-        const uint16_t b = BucketOf(sig.blocks[i].weak);
-        chainNext[i] = bucketHead[b];
-        bucketHead[b] = static_cast<int32_t>(i);  // head-insert
+        ++bucketStart[BucketOf(sig.blocks[i].weak) + 1];
+        ++fullBlockCount;
     }
+    for (uint32_t b = 0; b < kBuckets; ++b) {
+        bucketStart[b + 1] += bucketStart[b];
+    }
+    std::vector<Entry> entries(fullBlockCount);
+    std::vector<uint32_t> fillPos(bucketStart.begin(), bucketStart.begin() + kBuckets);
+    // Iterate block index DESCENDING so the first block written to a bucket (highest index)
+    // lands at the lowest slot: scanning a bucket [start,end) then visits blocks in descending
+    // index order, byte-for-byte replicating the legacy head-insert chain order (FR-11/§5.4).
+    for (uint32_t ii = blockCount; ii-- > 0;) {
+        if (blockLen(ii) != L) {
+            continue;
+        }
+        const uint16_t b = BucketOf(sig.blocks[ii].weak);
+        const uint32_t pos = fillPos[b]++;
+        entries[pos].weak = sig.blocks[ii].weak;
+        entries[pos].blockIndex = ii;
+    }
+
+    uint64_t scannedBytes = 0;
+    uint64_t matchedBytes = 0;
+    bool earlyStopped = false;
+    const uint64_t prefixBytes = opt.prefixBytesOverride > 0
+                                     ? opt.prefixBytesOverride
+                                     : EarlyStopPrefixBytes(oldLen, L);
 
     if (oldLen >= L) {
         uint64_t p = 0;
+        uint64_t nextEval = prefixBytes;  // first projection check once p reaches the prefix
         RollingWeak w = WeakInit(oldData, L);
         while (true) {
             const uint32_t weak32 = w.value();
@@ -156,17 +263,26 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
             bool matchedHere = false;
             std::array<uint8_t, 16> strong{};
             bool strongComputed = false;
-            for (int32_t node = bucketHead[bucket]; node != -1; node = chainNext[node]) {
-                const BlockSig& bs = sig.blocks[node];
-                if (bs.weak != weak32 || matched[node]) {
+            const uint32_t kStart = bucketStart[bucket];
+            const uint32_t kEnd = bucketStart[bucket + 1];
+            for (uint32_t k = kStart; k < kEnd; ++k) {
+                const Entry& e = entries[k];
+                if (e.weak != weak32) {
+                    continue;  // weak filter completes before any strong work (FR-09)
+                }
+                ++plan.stats.weakCandidateHits;
+                const uint32_t node = e.blockIndex;
+                if (matched[node]) {
                     continue;
                 }
-                if (!strongComputed) {
+                if (!strongComputed) {  // lazy strong: only on a live weak candidate (FR-08)
                     strong = StrongHash(oldData + p, L);
                     strongComputed = true;
+                    ++plan.stats.strongComputations;
                 }
-                if (std::equal(strong.begin(), strong.begin() + strongLen, bs.strong.begin())) {
-                    matched[node] = true;
+                if (std::equal(strong.begin(), strong.begin() + strongLen,
+                               sig.blocks[node].strong.begin())) {
+                    matched[node] = 1;
                     matchedSrc[node] = p;
                     matchedHere = true;
                     break;
@@ -174,6 +290,7 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
             }
             if (matchedHere) {
                 // Non-overlapping advance past the whole matched block.
+                matchedBytes += L;
                 p += L;
                 if (p + L > oldLen) {
                     break;
@@ -186,7 +303,30 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
                 WeakRoll(w, oldData[p], oldData[p + L], L);
                 ++p;
             }
+            // P0 early stop: once past the protective prefix, project the matched fraction and
+            // abandon delta if the projected download ratio reaches T = 0.65 (FR-02/03/04).
+            if (opt.enableEarlyStop && p >= nextEval) {
+                if (ProjectedRejected(matchedBytes, p, oldLen, plan.newFileBytes)) {
+                    earlyStopped = true;
+                    break;  // stop touching oldData immediately (B8)
+                }
+                nextEval = p + kEarlyStopEvalStride;
+            }
         }
+        scannedBytes = p;
+    }
+
+    plan.stats.scannedBytes = scannedBytes;
+    plan.stats.matchedBytes = matchedBytes;
+    plan.stats.earlyStopped = earlyStopped;
+
+    if (earlyStopped) {
+        // Never emit a partial delta plan: signal a full benefit rejection so the caller's
+        // existing fallback runs (downloadBytes == newFileBytes => BenefitRejected, FR-05/06).
+        plan.copies.clear();
+        plan.misses.clear();
+        plan.downloadBytes = plan.newFileBytes;
+        return plan;
     }
 
     // Emit copies for matched blocks (all full-length) and coalesce consecutive missing

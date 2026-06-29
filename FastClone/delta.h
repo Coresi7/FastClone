@@ -29,6 +29,18 @@ constexpr uint32_t kBlockAlign = 1024;   // sqrt(fileSize) rounded up to 1 KiB
 constexpr uint64_t kBenefitPercentNum = 65;
 constexpr uint64_t kBenefitPercentDen = 100;
 
+// --- P0 early-stop tuning (delta-perf design §4.2/§4.3). All compile-time; adjust without
+// touching the public interface (R-04). The evaluation prefix is
+//   min(kPrefixCapBytes, max(max(kPrefixFloorBytes, blockSize*kPrefixFloorBlocks),
+//                            oldLen*kPrefixPercent/100)).
+// After the prefix is reached the projected download ratio is re-checked every
+// kEarlyStopEvalStride bytes (avoids a 128-bit multiply per scanned byte). ---
+constexpr uint64_t kPrefixPercent       = 5;             // oldLen * 5% (mid-file evidence)
+constexpr uint64_t kPrefixCapBytes      = 256ull << 20;  // 256 MiB hard performance cap
+constexpr uint64_t kPrefixFloorBytes    = 1ull << 20;    // 1 MiB small-file evidence floor
+constexpr uint32_t kPrefixFloorBlocks   = 256;           // scan >= 256 blocks before stopping
+constexpr uint64_t kEarlyStopEvalStride = 4ull << 20;    // re-evaluate every 4 MiB past prefix
+
 // Per-block signature: 32-bit weak checksum (s2<<16 | s1) + XXH3-128 strong checksum.
 // Only the first SignatureSet::strongLen bytes of `strong` are significant on the wire and
 // in comparisons (adaptive truncation, design §5.3).
@@ -94,17 +106,49 @@ struct MissOp {
     uint64_t destOffsetNew = 0;
     uint32_t len = 0;  // coalesced run of consecutive missing blocks (<= blockSize * run)
 };
+// Per-BuildPlan runtime statistics. All fields are client-local (never on the wire, HC-02);
+// they back the early-stop heuristic and the P1 observability asserts (delta-perf §3.1).
+struct DeltaStats {
+    uint64_t scannedBytes = 0;        // final rolling pointer p (FR-01, monotonic)
+    uint64_t matchedBytes = 0;        // matched full blocks * blockSize (FR-01, monotonic)
+    uint64_t strongComputations = 0;  // StrongHash invocations (FR-12 / AC-06)
+    uint64_t weakCandidateHits = 0;   // candidates whose inlined weak == window weak (FR-12)
+    bool earlyStopped = false;        // projected download ratio triggered early stop (FR-03)
+};
+
 struct DeltaPlan {
     std::vector<CopyOp> copies;
     std::vector<MissOp> misses;
     uint64_t downloadBytes = 0;  // = sum of misses[].len
     uint64_t newFileBytes = 0;   // = sig.fileSize
+    DeltaStats stats;            // delta-perf: runtime stats + early-stop signal (local-only)
 };
+
+// BuildPlan controls. Defaults preserve the legacy 3-argument contract exactly (early stop on,
+// default prefix formula) so existing callers (sync_engine.cpp) need no change (HC-02/NFR-04).
+struct BuildOptions {
+    bool     enableEarlyStop     = true;  // AC-09 equivalence comparisons set this false
+    uint64_t prefixBytesOverride = 0;     // 0 = default formula; >0 = test seed (delta-perf §8)
+};
+
+// Projected-rejection predicate (FR-02/FR-03): extrapolate the matched fraction observed over
+// scannedBytes to the whole old file and compare the projected download ratio to T = 0.65,
+// sharing kBenefitPercentNum/Den. Returns true when delta should be abandoned early. Uses a
+// 128-bit comparison internally so 8 GB-scale products never overflow (NFR-07). Pure function.
+bool ProjectedRejected(uint64_t matchedBytes, uint64_t scannedBytes,
+                       uint64_t oldLen, uint64_t newFileBytes);
+
+// Early-stop evaluation prefix in bytes (FR-04 / OQ-01). The rolling scan must reach this many
+// bytes before any projected-rejection check is allowed, protecting unaligned heads (B4).
+uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize);
 
 // Client side: roll the weak checksum across the local old file, run the three-stage match
 // funnel (bucket -> 32-bit weak -> truncated XXH3-128) and emit the reconstruction plan
 // (FR-13/14/15/16). The short trailing block is never matched and is always a MissOp.
-DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t oldLen);
+// The optional opt enables early stop (default) and test overrides; the 3-argument form keeps
+// the legacy behavior contract (delta-perf §3.1).
+DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t oldLen,
+                    const BuildOptions& opt = {});
 
 // Benefit rejection (FR-17, design §5.6): reject delta when downloadBytes/newFileBytes >= T.
 bool BenefitRejected(uint64_t downloadBytes, uint64_t newFileBytes);
