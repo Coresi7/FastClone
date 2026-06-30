@@ -2084,7 +2084,8 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
                                                            const std::string& primaryLocal,
                                                            const std::string& primaryActualLocal,
                                                            const AuthOkInfo& authInfo,
-                                                           bool debugEnabled) {
+                                                           bool debugEnabled,
+                                                           long* outProbeMinRttMs = nullptr) {
     std::vector<EstablishedLink> links;
     const size_t maxAux = (options.maxConnections > 0) ? (options.maxConnections - 1) : 0;
     if (maxAux == 0) {
@@ -2147,6 +2148,24 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
         // (degenerate == FC5 behavior, FR-020-adjacent).
         if (serverEndpoints.size() > 1 || localCands.size() > 1) {
             const ReachabilityMatrix matrix = ProbeReachability(localCands, serverEndpoints);
+            // Secondary RTT source (design §3.1 / D-01): the minimum reachable connect RTT in
+            // the probe matrix is a single-round-trip estimate that refines the primary lane's
+            // connect timing. Single-NIC single-server WAN never probes, so this stays unset
+            // and the connect-measured RTT is the sole source.
+            if (outProbeMinRttMs != nullptr) {
+                long probeMin = -1;
+                for (const auto& row : matrix.cells) {
+                    for (const ReachabilityCell& cell : row) {
+                        if (cell.reachable && cell.rttMs >= 0 &&
+                            (probeMin < 0 || cell.rttMs < probeMin)) {
+                            probeMin = cell.rttMs;
+                        }
+                    }
+                }
+                if (probeMin >= 0) {
+                    *outProbeMinRttMs = probeMin;
+                }
+            }
             // Seed the heuristic with the primary's REAL source IP (resolved via
             // getsockname when it used the OS default route), mapped to its physical NIC,
             // plus its server endpoint, so the primary participates in same-NIC + same-side
@@ -2798,6 +2817,12 @@ int RunClient(const CliOptions& options) {
     // (--delta-min-size > 0) AND the server advertised the delta capability bit in AuthOk
     // (binary-delta §8.1 / AC-17). Set right after the primary handshake below.
     bool deltaEnabled = false;
+    // Measured session RTT (design §3.1, FR-01). Primary source: the primary lane's TCP
+    // connect timing (one round trip). Secondary: the probe matrix minimum (when multipath
+    // probing runs). 0 == unknown -> treated as LAN so a missing RTT never enables WAN
+    // behavior nor aborts the sync (AC-15 / B7).
+    long sessionRttMs = 0;
+    long probeMinRttMs = -1;
     try {
         // Primary lane + new-session handshake. Explicit mode: linkPins[0] is the primary
         // (FR-002). Otherwise servers[0] with the OS-default source route.
@@ -2811,7 +2836,12 @@ int RunClient(const CliOptions& options) {
             primaryHost = options.linkPins.front().server;
             primaryPort = options.linkPins.front().port;
         }
+        const auto rttConnectStart = std::chrono::steady_clock::now();
         SocketHandle primarySocket = ConnectTo(primaryHost, primaryPort, primaryBinding);
+        // TCP connect returns after the SYN/SYN-ACK exchange ~= one round trip, so this is a
+        // close application-independent RTT estimate for the primary lane (design D-01).
+        sessionRttMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - rttConnectStart).count());
         const AuthOkInfo authInfo = HandshakeClientNew(primarySocket, options.password);
         sessionId = authInfo.sessionId;
         deltaEnabled = (options.deltaMinSizeBytes > 0) &&
@@ -2852,7 +2882,7 @@ int RunClient(const CliOptions& options) {
         // Auxiliary lanes (best-effort; a failed lane is skipped, FR-016 / NFR-002).
         std::vector<EstablishedLink> auxLinks = EstablishAuxiliaryConnections(
             options, sessionId, pool[0]->serverAddr, primaryLocal, primaryActualLocal,
-            authInfo, debugEnabled);
+            authInfo, debugEnabled, &probeMinRttMs);
         for (auto& link : auxLinks) {
             auto conn = std::make_unique<ClientConnection>();
             conn->connId = static_cast<uint32_t>(pool.size());
@@ -2878,9 +2908,41 @@ int RunClient(const CliOptions& options) {
     if (debugEnabled) {
         std::cout << "[mp] pool_size=" << pool.size() << " sessionId=" << sessionId << std::endl;
     }
+
+    // --- WAN small-file second-pass tuning (design §3.1/§3.2/§3.3, FR-01/02/12/13) ---
+    // Refine the connect-measured RTT with the probe matrix minimum when available; either
+    // source missing degrades to LAN behavior (AC-15 / B7). RTT now drives the stream count,
+    // hash in-flight depth and delta-signal depth -- not just route selection (FR-01).
+    if (probeMinRttMs >= 0) {
+        sessionRttMs = (sessionRttMs > 0) ? std::min<long>(sessionRttMs, probeMinRttMs) : probeMinRttMs;
+    }
+    const uint32_t wanHwConcurrency = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+    const WanTuning wanTune = ResolveWanTuning(tuned, options, sessionRttMs, wanHwConcurrency);
+    const bool wanMode = wanTune.wanMode;
+    // activeStreamLimit is the live fan-out cap used by lane selection + the global slot cap.
+    // It starts at the WAN-resolved count and can be halved by the failure-rate backoff
+    // (FR-13). streamLimit (const, base) still drives chunk sizing / batch tuning, so LAN is
+    // byte-for-byte unchanged (HC-04).
+    uint32_t activeStreamLimit = wanTune.streamLimit;
+    const size_t maxInFlightDeltaSig = wanTune.maxInFlightDeltaSig;
+    // Soft-reserve pool[0] as the control lane when WAN + >=2 healthy lanes: large/bulk data
+    // is biased onto aux lanes so hash/BlockSig traffic is not head-of-line blocked behind a
+    // big file on the same TCP (design §3.5, FR-09/10/11). Single-lane WAN relies on the
+    // main-loop control-first ordering alone.
+    const bool wanControlReserve = wanMode && (pool.size() >= 2);
+    // Failure-rate backoff bookkeeping (FR-13 / NFR-04): sampled windows of completions vs
+    // failures; on a weak SSD spike the effective stream count is halved (floor 4) so the
+    // session self-heals without the user manually降级 (NFR-06 / B8).
+    size_t lastBackoffFailed = 0;
+    size_t lastBackoffCompleted = 0;
+    auto lastBackoffCheck = std::chrono::steady_clock::now();
+
     if (options.streamAutoTune || options.chunkAutoTune) {
-        std::cout << "[auto-tune] streams=" << streamLimit
+        std::cout << "[auto-tune] streams=" << activeStreamLimit
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
+                  << " session_rtt_ms=" << sessionRttMs
+                  << " wan_mode=" << (wanMode ? 1 : 0)
+                  << " hash_inflight_cap=" << wanTune.maxInFlightHashRequests
                   << std::endl;
     }
     if (!options.streamAutoTune && streamLimit > 8) {
@@ -2964,11 +3026,48 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<uint64_t, ActiveDeltaRange> activeDeltaRanges;  // (connId,streamId) -> range
     uint64_t deltaReconstructed = 0;  // diagnostics: files completed via delta this session
 
+    // --- BuildPlan offload (design §3.4, FR-07/FR-10) ---
+    // The heavy delta reconstruct (old-file read + delta::BuildPlan + temp pre-write) used to
+    // run synchronously on the main loop inside BlockSigResponse handling, periodically
+    // freezing the control plane on massive small-file sets. It is offloaded to a worker pool
+    // (same task-queue + result-deque pattern as the hash workers); the main loop only applies
+    // results (state mutation + range enqueue) so the wire protocol, plan inputs/outputs and
+    // 落盘 XXH3-128 verification are unchanged (FR-08 / NFR-05).
+    struct DeltaPlanTask {
+        std::string rel;
+        Hash256 fileHash{};
+        delta::SignatureSet sig;
+    };
+    struct DeltaPlanResult {
+        std::string rel;
+        bool ok = false;             // false => fall back to a full download
+        std::string fallbackReason;  // meaningful when !ok
+        bool benefitRejected = false;
+        uint64_t downloadBytes = 0;
+        uint64_t newFileBytes = 0;
+        Hash256 verifyHash{};
+        std::filesystem::path tempPath;
+        std::ofstream tempOut;
+        std::vector<DeltaRangeTask> ranges;
+        delta::DeltaStats stats{};
+    };
+    std::deque<DeltaPlanTask> deltaPlanTaskQueue;
+    std::mutex deltaPlanTaskMu;
+    std::condition_variable deltaPlanTaskCv;
+    std::atomic<bool> deltaPlanStop{false};
+    std::deque<DeltaPlanResult> deltaPlanResults;
+    std::mutex deltaPlanResultMu;
+    std::atomic<size_t> deltaPlanInFlight{0};  // dispatched but result not yet applied
+
     std::unordered_map<std::string, Hash256> remoteHashes;
     std::unordered_map<std::string, Hash256> localHashes;
     std::unordered_set<std::string> hashResolved;
     std::unordered_set<std::string> hashRequested;
     std::deque<std::string> pendingHashRequests;
+    // Parallel enqueue timestamps for the control-plane latency P95 (AC-07 / §3.5): pushed
+    // alongside pendingHashRequests (single push site) and popped at send (single pop site),
+    // so it stays index-aligned with pendingHashRequests.
+    std::deque<std::chrono::steady_clock::time_point> pendingHashRequestsAt;
     std::unordered_set<std::string> localHashFailed;
     std::mutex fallbackReadyMu;
     std::deque<std::string> fallbackReadyQueue;
@@ -3090,8 +3189,54 @@ int RunClient(const CliOptions& options) {
     size_t fallbackResolved = 0;
     size_t hashRequestsSent = 0;
     size_t hashResponsesReceived = 0;
-    const size_t maxInFlightHashRequests = std::clamp<size_t>(
-        std::max<size_t>(1024, static_cast<size_t>(streamLimit) * 256), 1024, 8192);
+    // hash in-flight cap: RTT-adaptive on WAN (breaks the legacy 8192 ceiling, FR-02/AC-02),
+    // byte-for-byte the legacy clamp on LAN/同城 (HC-04). See ComputeHashInflightDepth.
+    const size_t maxInFlightHashRequests = wanTune.maxInFlightHashRequests;
+    size_t hashInflightPeak = 0;        // observability (NFR-07 / AC-12 / AC-02)
+    size_t deltaSigInFlight = 0;        // BlockSigRequests sent but not yet answered (WAN gate)
+    size_t deltaSigInflightPeak = 0;    // observability (NFR-07 / AC-12)
+    // --- AC-12 / NFR-07 acceptance observability (reviewer B-02 / B-03) ---
+    uint64_t manifestTotalBytes = 0;             // sum of remote file sizes (AC-12 总字节数)
+    std::array<uint64_t, 6> smallFileSizeHist{}; // <4K /4-16K /16-64K /64-256K /256K-1M />=1M
+    uint64_t blockSigWaitTotalUs = 0;            // sum of per-file BlockSig wait (AC-04)
+    size_t blockSigWaitCount = 0;                // files that completed a BlockSig round trip
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> deltaSigSentAt;
+    std::array<uint64_t, 32> ctrlLatencyHistUs{};  // ctrl-msg enqueue->send latency hist (AC-07)
+    double maxCtrlGapSec = 0.0;                  // longest stall with no ctrl event (AC-08)
+    auto lastCtrlEventAt = std::chrono::steady_clock::now();
+    // Log2 histogram bucketing (bucket i covers [2^i, 2^(i+1)) microseconds, clamped to 31).
+    auto histAddUs = [](std::array<uint64_t, 32>& hist, uint64_t us) {
+        unsigned b = 0;
+        while (b < 31 && (us >> (b + 1)) != 0) {
+            ++b;
+        }
+        ++hist[b];
+    };
+    // Conservative P95 estimate from a log2 histogram: upper edge of the bucket where the
+    // cumulative count first reaches 95%.
+    auto histP95Us = [](const std::array<uint64_t, 32>& hist) -> uint64_t {
+        uint64_t total = 0;
+        for (uint64_t c : hist) {
+            total += c;
+        }
+        if (total == 0) {
+            return 0;
+        }
+        const uint64_t target = (total * 95 + 99) / 100;  // ceil(0.95 * total)
+        uint64_t cum = 0;
+        for (unsigned b = 0; b < hist.size(); ++b) {
+            cum += hist[b];
+            if (cum >= target) {
+                return (b >= 31) ? (uint64_t{1} << 31) : (uint64_t{1} << (b + 1));
+            }
+        }
+        return uint64_t{1} << 31;
+    };
+    // Mark a control-plane completion event (hash/BlockSig response, manifest entry): refresh
+    // the watchdog (AC-08). The 5s judgement itself is left to the acceptance driver.
+    auto noteCtrlEvent = [&]() {
+        lastCtrlEventAt = std::chrono::steady_clock::now();
+    };
     constexpr uint8_t kMaxTransferRetries = 3;
     size_t lastEnum = 0;
     size_t lastCompared = 0;
@@ -3741,6 +3886,7 @@ int RunClient(const CliOptions& options) {
                 hashRequested.insert(r.relPath);
                 ++fallbackCount;
                 pendingHashRequests.push_back(r.relPath);
+                pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());
             }
         }
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
@@ -3796,6 +3942,13 @@ int RunClient(const CliOptions& options) {
         while (!pendingHashRequests.empty() && (hashRequestsSent - hashResponsesReceived) < maxInFlightHashRequests) {
             const std::string rel = pendingHashRequests.front();
             pendingHashRequests.pop_front();
+            // Control-plane enqueue->send latency sample (AC-07 / §3.5).
+            if (!pendingHashRequestsAt.empty()) {
+                const auto waited = std::chrono::steady_clock::now() - pendingHashRequestsAt.front();
+                pendingHashRequestsAt.pop_front();
+                histAddUs(ctrlLatencyHistUs, static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(waited).count()));
+            }
             ++hashRequestsSent;
             outboundFrames.push_back(Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
             {
@@ -3834,10 +3987,19 @@ int RunClient(const CliOptions& options) {
             // Manifest bias (aux-weight FR-07/FR-08): while the manifest is still downloading,
             // nudge the primary down by +1 so a little file work can flow to aux first; once
             // manifestDone the bias is gone and ordering returns to pure weighted load.
-            ld.bias = (!manifestDone && cptr->isPrimary) ? 1u : 0u;
+            uint32_t laneBias = (!manifestDone && cptr->isPrimary) ? 1u : 0u;
+            // WAN control-lane soft reservation (design §3.5, FR-09/10/11): bias the primary up
+            // by a full stream count so bulk data prefers aux lanes, leaving pool[0]'s send
+            // window for hash/BlockSig control traffic. Bias only reorders -- it never relaxes
+            // the streamLimit cap -- so the primary is still used once aux lanes saturate and no
+            // bandwidth is wasted. Gated on WAN + >=2 lanes, so LAN ordering is unchanged.
+            if (wanControlReserve && cptr->isPrimary) {
+                laneBias = std::max<uint32_t>(laneBias, activeStreamLimit);
+            }
+            ld.bias = laneBias;
             lanes.push_back(ld);
         }
-        const int idx = SelectLeastLoadedLane(lanes, streamLimit, forcePrimary);
+        const int idx = SelectLeastLoadedLane(lanes, activeStreamLimit, forcePrimary);
         return (idx >= 0) ? pool[static_cast<size_t>(idx)].get() : nullptr;
     };
     auto healthyConnCount = [&]() -> size_t {
@@ -3860,7 +4022,7 @@ int RunClient(const CliOptions& options) {
         // Global in-flight bound = streamLimit per healthy lane (design §8.3); with the
         // <=8 pool cap this is the R-05 safeguard against fan-out exploding server fds.
         const size_t healthy = std::max<size_t>(1, healthyConnCount());
-        const size_t globalSlotCap = static_cast<size_t>(streamLimit) * healthy;
+        const size_t globalSlotCap = static_cast<size_t>(activeStreamLimit) * healthy;
         while (totalActiveSlots() < globalSlotCap) {
             if (ioInFlightBytes.load(std::memory_order_relaxed) > ioInFlightLimitBytes) {
                 break;
@@ -4294,39 +4456,33 @@ int RunClient(const CliOptions& options) {
                             lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
     };
 
-    // Drive a BlockSigResponse: build the reconstruction plan over the local old file, apply
-    // the benefit gate (FR-17), pre-write all copy ops to a temp file, and enqueue miss ranges
-    // (sliced for multi-lane parallelism, §6.6). 100%-match files finalize immediately.
-    auto beginDeltaReconstruct = [&](const std::string& rel, const Hash256& fileHash,
-                                     const delta::SignatureSet& sig) {
-        auto itState = deltaStates.find(rel);
-        if (itState == deltaStates.end()) {
-            return;  // abandoned before the response arrived
-        }
-        DeltaFileState& st = itState->second;
-        if (st.sigReceived) {
-            return;  // duplicate response (failover re-request); ignore
-        }
-        st.sigReceived = true;
-        st.verifyHash = fileHash;
-        st.newFileBytes = sig.fileSize;
-
-        const fs::path abs = JoinRel(options.rootDir, rel);
+    // Worker-side heavy reconstruct for one BlockSigResponse (runs OFF the main loop, design
+    // §3.4): read the local old file, build the plan, apply the benefit gate (FR-17), pre-write
+    // all copy ops to a temp file, and slice the miss ranges. Touches NO shared state -- it
+    // only fills a DeltaPlanResult the main loop later applies. Pure plan inputs/outputs are
+    // identical to the former synchronous path (FR-08 / NFR-05).
+    auto buildDeltaPlanOffloaded = [&](DeltaPlanTask&& task) -> DeltaPlanResult {
+        DeltaPlanResult res;
+        res.rel = task.rel;
+        res.verifyHash = task.fileHash;
+        res.newFileBytes = task.sig.fileSize;
+        const fs::path abs = JoinRel(options.rootDir, task.rel);
         std::vector<uint8_t> oldData;
         if (!ReadWholeFile(abs, oldData)) {
-            deltaFallback(rel, "old_unreadable", 0, sig.fileSize);
-            deltaAbandoned.insert(rel);
-            deltaStates.erase(itState);
-            scheduleTransfer(rel);
-            return;
+            res.ok = false;
+            res.fallbackReason = "old_unreadable";
+            res.downloadBytes = 0;
+            return res;
         }
-        const delta::DeltaPlan plan = delta::BuildPlan(sig, oldData.data(), oldData.size());
+        const delta::DeltaPlan plan = delta::BuildPlan(task.sig, oldData.data(), oldData.size());
+        res.stats = plan.stats;
+        res.downloadBytes = plan.downloadBytes;
+        res.newFileBytes = plan.newFileBytes;
         if (delta::BenefitRejected(plan.downloadBytes, plan.newFileBytes)) {
-            deltaFallback(rel, "benefit", plan.downloadBytes, plan.newFileBytes, &plan.stats);  // FR-19 / AC-07
-            deltaAbandoned.insert(rel);
-            deltaStates.erase(itState);
-            scheduleTransfer(rel);
-            return;
+            res.ok = false;
+            res.fallbackReason = "benefit";  // FR-19 / AC-07
+            res.benefitRejected = true;
+            return res;
         }
         EnsureParentDir(abs);
         const fs::path tmp = makeDeltaTempPath(abs);
@@ -4353,48 +4509,85 @@ int RunClient(const CliOptions& options) {
             }
             std::error_code rec;
             fs::remove(tmp, rec);
-            deltaFallback(rel, "reconstruct_io", plan.downloadBytes, plan.newFileBytes);
-            deltaAbandoned.insert(rel);
-            deltaStates.erase(itState);
-            scheduleTransfer(rel);
-            return;
+            res.ok = false;
+            res.fallbackReason = "reconstruct_io";
+            return res;
         }
-        st.tempPath = tmp;
-        st.tempOut = std::move(out);
-
         // Slice large misses so multiple lanes can fetch one file's regions in parallel.
         const uint64_t sliceLen = std::min<uint64_t>(
             static_cast<uint64_t>(effectiveChunkSize) * 8, 0xFFFFFFFFull);
-        uint32_t rangeCount = 0;
         for (const delta::MissOp& m : plan.misses) {
             uint64_t off = m.destOffsetNew;
             uint64_t remaining = m.len;
             while (remaining > 0) {
                 const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(remaining, sliceLen));
-                pendingDeltaRanges.push_back(DeltaRangeTask{rel, off, take});
+                res.ranges.push_back(DeltaRangeTask{task.rel, off, take});
                 off += take;
                 remaining -= take;
-                ++rangeCount;
             }
+        }
+        res.tempPath = tmp;
+        res.tempOut = std::move(out);
+        res.ok = true;
+        return res;
+    };
+
+    // Main-thread application of one finished plan (design §3.4): mutate deltaStates, hand the
+    // pre-written temp + ranges to the transfer machinery, or fall back. Mirrors the former
+    // synchronous tail of beginDeltaReconstruct exactly.
+    auto applyDeltaPlanResult = [&](DeltaPlanResult& res) {
+        auto itState = deltaStates.find(res.rel);
+        if (itState == deltaStates.end()) {
+            // File abandoned (e.g. DeltaError) while the plan was building: discard the temp.
+            if (res.tempOut.is_open()) {
+                res.tempOut.close();
+            }
+            if (!res.tempPath.empty()) {
+                std::error_code rec;
+                fs::remove(res.tempPath, rec);
+            }
+            return;
+        }
+        if (!res.ok) {
+            deltaFallback(res.rel, res.fallbackReason.c_str(), res.downloadBytes, res.newFileBytes,
+                          res.benefitRejected ? &res.stats : nullptr);
+            deltaAbandoned.insert(res.rel);
+            deltaStates.erase(itState);
+            scheduleTransfer(res.rel);
+            return;
+        }
+        DeltaFileState& st = itState->second;
+        st.verifyHash = res.verifyHash;
+        st.newFileBytes = res.newFileBytes;
+        st.tempPath = res.tempPath;
+        st.tempOut = std::move(res.tempOut);
+        const uint32_t rangeCount = static_cast<uint32_t>(res.ranges.size());
+        for (DeltaRangeTask& r : res.ranges) {
+            pendingDeltaRanges.push_back(std::move(r));
         }
         st.pendingRanges = rangeCount;
         if (debugEnabled) {
-            std::cout << "[delta] plan rel=" << rel << " sessionId=" << sessionId
-                      << " newBytes=" << plan.newFileBytes << " downloadBytes=" << plan.downloadBytes
-                      << " copies=" << plan.copies.size() << " ranges=" << rangeCount
-                      << " scanned_bytes=" << plan.stats.scannedBytes
-                      << " matched_bytes=" << plan.stats.matchedBytes
-                      << " strong_computes=" << plan.stats.strongComputations
-                      << " weak_hits=" << plan.stats.weakCandidateHits
-                      << " early_stopped=" << (plan.stats.earlyStopped ? 1 : 0) << std::endl;
+            std::cout << "[delta] plan rel=" << res.rel << " sessionId=" << sessionId
+                      << " newBytes=" << res.newFileBytes << " downloadBytes=" << res.downloadBytes
+                      << " ranges=" << rangeCount
+                      << " scanned_bytes=" << res.stats.scannedBytes
+                      << " matched_bytes=" << res.stats.matchedBytes
+                      << " strong_computes=" << res.stats.strongComputations
+                      << " weak_hits=" << res.stats.weakCandidateHits
+                      << " early_stopped=" << (res.stats.earlyStopped ? 1 : 0) << std::endl;
         }
         if (rangeCount == 0) {
-            finalizeDelta(rel);  // 100% match: copies already cover the whole file (AC-03)
+            finalizeDelta(res.rel);  // 100% match: copies already cover the whole file (AC-03)
         }
     };
 
     // Send queued BlockSigRequests on the control lane (binary-delta §6.1). On send failure
     // the lane is marked down and the requests are requeued for a healthy control lane.
+    // WAN (design §3.4, FR-05/06): cap the in-flight BlockSig pipeline at maxInFlightDeltaSig
+    // so a single file's RTT is amortized across a deep batch of concurrent files rather than
+    // being a per-file fixed wait. maxInFlightDeltaSig == 0 (LAN) keeps the legacy "send the
+    // whole queue every pass" behavior, so 同城/LAN is unchanged (HC-04). Requests that do not
+    // fit this pass stay queued (no correctness loss, FR-08).
     auto pumpDeltaSignatures = [&]() {
         if (pendingDeltaSigRequests.empty()) {
             return;
@@ -4403,6 +4596,10 @@ int RunClient(const CliOptions& options) {
         std::vector<Frame> frames;
         std::vector<std::string> batch;
         while (!pendingDeltaSigRequests.empty()) {
+            if (maxInFlightDeltaSig != 0 &&
+                (deltaSigInFlight + batch.size()) >= maxInFlightDeltaSig) {
+                break;  // pipeline full this pass
+            }
             std::string rel = pendingDeltaSigRequests.front();
             pendingDeltaSigRequests.pop_front();
             if (!deltaStates.contains(rel)) {
@@ -4416,9 +4613,13 @@ int RunClient(const CliOptions& options) {
         }
         try {
             SendFrameBatch(ctrl->socket, frames);
+            const auto sigSentAt = std::chrono::steady_clock::now();
             for (const std::string& r : batch) {
                 deltaSigRequested.insert(r);
+                deltaSigSentAt[r] = sigSentAt;  // per-file BlockSig wait start (AC-04)
             }
+            deltaSigInFlight += batch.size();
+            deltaSigInflightPeak = std::max<size_t>(deltaSigInflightPeak, deltaSigInFlight);
         } catch (const std::exception& ex) {
             markConnDown(ctrl, ex.what());
             for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit) {
@@ -4500,6 +4701,21 @@ int RunClient(const CliOptions& options) {
             }
             remoteFiles[e.relativePath] = e;
             ++enumerated;
+            // AC-12 acceptance metrics: total bytes + small-file size distribution.
+            manifestTotalBytes += e.fileSize;
+            {
+                const uint64_t sz = e.fileSize;
+                size_t bucket;
+                if (sz < 4ull * 1024) bucket = 0;
+                else if (sz < 16ull * 1024) bucket = 1;
+                else if (sz < 64ull * 1024) bucket = 2;
+                else if (sz < 256ull * 1024) bucket = 3;
+                else if (sz < 1024ull * 1024) bucket = 4;
+                else bucket = 5;
+                ++smallFileSizeHist[bucket];
+            }
+            // Manifest streaming is a control-plane completion event (AC-08 watchdog).
+            noteCtrlEvent();
             if ((enumerated % 2048) == 0) {
                 ensureEntryReserve(enumerated + 2048);
             }
@@ -4530,6 +4746,7 @@ int RunClient(const CliOptions& options) {
                 fallbackReadyQueue.push_back(value.first);
             }
             ++hashResponsesReceived;
+            noteCtrlEvent();  // HashResponse is a control-plane completion event (AC-08)
         } else if (frame.type == MsgType::FileBatchOpen) {
             auto itBatch = activeBatchDownloads.find(key);
             if (itBatch == activeBatchDownloads.end()) {
@@ -4701,7 +4918,36 @@ int RunClient(const CliOptions& options) {
             PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::BlockSigResponse) {
             BlockSigResponseInfo info = DecodeBlockSigResponse(frame.payload);
-            beginDeltaReconstruct(info.relPath, info.fileHash, info.sig);
+            // Account the control-plane round trip (WAN pipeline depth + observability).
+            if (deltaSigInFlight > 0) {
+                --deltaSigInFlight;
+            }
+            noteCtrlEvent();  // BlockSigResponse is a control-plane completion event (AC-08)
+            // Per-file BlockSig wait accumulation (AC-04 blocksig_wait_us).
+            {
+                auto itSent = deltaSigSentAt.find(info.relPath);
+                if (itSent != deltaSigSentAt.end()) {
+                    const auto waited = std::chrono::steady_clock::now() - itSent->second;
+                    blockSigWaitTotalUs += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(waited).count());
+                    ++blockSigWaitCount;
+                    deltaSigSentAt.erase(itSent);
+                }
+            }
+            // Offload the heavy reconstruct to the worker pool (design §3.4). Set sigReceived
+            // on the main thread so a duplicate response (failover re-request) is ignored and
+            // the failover re-request scan never re-queues a file already being planned.
+            auto itSt = deltaStates.find(info.relPath);
+            if (itSt != deltaStates.end() && !itSt->second.sigReceived) {
+                itSt->second.sigReceived = true;
+                {
+                    std::lock_guard<std::mutex> lock(deltaPlanTaskMu);
+                    deltaPlanTaskQueue.push_back(
+                        DeltaPlanTask{info.relPath, info.fileHash, std::move(info.sig)});
+                }
+                deltaPlanInFlight.fetch_add(1, std::memory_order_relaxed);
+                deltaPlanTaskCv.notify_one();
+            }
         } else if (frame.type == MsgType::DeltaRangeChunk) {
             auto itR = activeDeltaRanges.find(key);
             if (itR == activeDeltaRanges.end()) {
@@ -4740,13 +4986,32 @@ int RunClient(const CliOptions& options) {
             // or sig-level (streamId 0); resolve rel from either source.
             std::string rel = DecodeDeltaError(frame.payload);
             auto itR = activeDeltaRanges.find(key);
-            if (itR != activeDeltaRanges.end()) {
+            const bool rangeTagged = (itR != activeDeltaRanges.end());
+            if (rangeTagged) {
                 rel = itR->second.rel;
                 activeDeltaRanges.erase(itR);
                 releaseSlot();
             }
+            noteCtrlEvent();  // any DeltaError is a control-plane completion event (AC-08, S-11)
             auto itS = deltaStates.find(rel);
             const bool wasManaged = (itS != deltaStates.end()) || deltaSigRequested.contains(rel);
+            // B-01: a sig-level DeltaError (no matching active range) is the server's terminal
+            // answer to a BlockSigRequest that will NEVER yield a BlockSigResponse, so release
+            // its WAN pipeline slot + per-file wait marker exactly like BlockSigResponse would.
+            // Without this, deltaSigInFlight leaks once per sig failure; on WAN it climbs to
+            // maxInFlightDeltaSig, pumpDeltaSignatures then breaks every pass and the sync wedges
+            // (deltaStates never drains -> main loop never exits). Range-tagged errors arrive
+            // AFTER the response already settled the count, so only the sig-level path adjusts
+            // it; the !sigReceived + erase() guards make a failover-requeued or already-answered
+            // signature safe from a double release.
+            const bool sigReceived = (itS != deltaStates.end()) && itS->second.sigReceived;
+            if (DeltaErrorReleasesSigSlot(rangeTagged, itS != deltaStates.end(), sigReceived) &&
+                deltaSigRequested.erase(rel) > 0) {
+                if (deltaSigInFlight > 0) {
+                    --deltaSigInFlight;
+                }
+                deltaSigSentAt.erase(rel);
+            }
             if (itS != deltaStates.end()) {
                 if (itS->second.tempOut.is_open()) {
                     itS->second.tempOut.close();
@@ -4990,13 +5255,20 @@ int RunClient(const CliOptions& options) {
         }
         // Binary delta (FC7): a BlockSigResponse is lost when its control lane dies. If a lane
         // just went down and a healthy lane remains, re-queue the still-unanswered signature
-        // requests; beginDeltaReconstruct ignores duplicate responses (sigReceived guard), so
-        // re-requesting is safe and prevents a stuck deltaState from hanging the sync.
+        // requests; the BlockSigResponse handler ignores duplicate responses (sigReceived
+        // guard), so re-requesting is safe and prevents a stuck deltaState from hanging the sync.
         if (newlyDown && healthyConnCount() > 0) {
             for (auto& kv : deltaStates) {
                 if (!kv.second.sigReceived && deltaSigRequested.contains(kv.first)) {
                     deltaSigRequested.erase(kv.first);
+                    deltaSigSentAt.erase(kv.first);  // re-measure wait on the re-send (AC-04)
                     pendingDeltaSigRequests.push_back(kv.first);
+                    // These were counted in flight; they will be re-sent (re-counted) by
+                    // pumpDeltaSignatures, so release the count here to keep the WAN pipeline
+                    // gate balanced.
+                    if (deltaSigInFlight > 0) {
+                        --deltaSigInFlight;
+                    }
                 }
             }
         }
@@ -5015,6 +5287,34 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    // BuildPlan offload pool (design §3.4). Spawned here, after every reconstruct helper is in
+    // scope; same task-queue + result-deque pattern as the hash workers above.
+    std::vector<std::thread> deltaPlanWorkers;
+    deltaPlanWorkers.reserve(workerCount);
+    for (uint32_t i = 0; i < workerCount; ++i) {
+        deltaPlanWorkers.emplace_back([&]() {
+            while (true) {
+                DeltaPlanTask task;
+                {
+                    std::unique_lock<std::mutex> lock(deltaPlanTaskMu);
+                    deltaPlanTaskCv.wait(lock, [&]() {
+                        return deltaPlanStop.load() || !deltaPlanTaskQueue.empty();
+                    });
+                    if (deltaPlanStop.load() && deltaPlanTaskQueue.empty()) {
+                        return;
+                    }
+                    task = std::move(deltaPlanTaskQueue.front());
+                    deltaPlanTaskQueue.pop_front();
+                }
+                DeltaPlanResult res = buildDeltaPlanOffloaded(std::move(task));
+                {
+                    std::lock_guard<std::mutex> lock(deltaPlanResultMu);
+                    deltaPlanResults.push_back(std::move(res));
+                }
+            }
+        });
+    }
+
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
         while (true) {
@@ -5026,6 +5326,22 @@ int RunClient(const CliOptions& options) {
             rebalanceTransfersTowardBatch();
             tryStartTransfers();
             pumpDeltaSignatures();
+            {
+                // Apply finished BuildPlan offload results (design §3.4): enqueue their miss
+                // ranges before tryStartDeltaRanges so data starts the same iteration.
+                std::deque<DeltaPlanResult> plansReady;
+                {
+                    std::lock_guard<std::mutex> lock(deltaPlanResultMu);
+                    plansReady.swap(deltaPlanResults);
+                }
+                for (DeltaPlanResult& pr : plansReady) {
+                    applyDeltaPlanResult(pr);
+                    deltaPlanInFlight.fetch_sub(1, std::memory_order_relaxed);
+                }
+                if (!plansReady.empty()) {
+                    loopHadForwardProgress = true;
+                }
+            }
             tryStartDeltaRanges();
             {
                 std::deque<CompareResult> ready;
@@ -5073,6 +5389,65 @@ int RunClient(const CliOptions& options) {
             }
             flushCompareDispatch();
             dispatchHashRequests();
+
+            // Track the hash in-flight peak (NFR-07 / AC-02 / AC-12): the WAN cap lets this
+            // climb past the legacy 8192 on massive small-file sets.
+            {
+                const size_t hin = hashRequestsSent - hashResponsesReceived;
+                if (hin > hashInflightPeak) {
+                    hashInflightPeak = hin;
+                }
+            }
+
+            // AC-08 watchdog: the longest stall with control-plane work outstanding but no
+            // control-plane completion event (hash/BlockSig response, manifest entry). While
+            // no control work is pending the gap is not meaningful, so the clock is refreshed.
+            {
+                const bool deltaBusy =
+                    !deltaStates.empty() || !pendingDeltaSigRequests.empty() ||
+                    !pendingDeltaRanges.empty() || !activeDeltaRanges.empty() ||
+                    deltaPlanInFlight.load(std::memory_order_relaxed) != 0;
+                const bool ctrlWorkOutstanding =
+                    !manifestDone || (hashRequestsSent != hashResponsesReceived) ||
+                    !pendingHashRequests.empty() || deltaBusy;
+                if (ctrlWorkOutstanding) {
+                    const double gap = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - lastCtrlEventAt).count();
+                    if (gap > maxCtrlGapSec) {
+                        maxCtrlGapSec = gap;
+                    }
+                } else {
+                    lastCtrlEventAt = std::chrono::steady_clock::now();
+                }
+            }
+
+            // WAN parallelism failure-rate backoff (design §3.3, FR-13 / NFR-04 / B8): on a
+            // weak SSD/controller failure spike, halve the effective stream count (floor 4) so
+            // the session self-heals without the user manually降级 (NFR-06). No-op on LAN and
+            // unless the WAN auto-tune actually raised the count above 4.
+            if (wanMode && options.streamAutoTune && activeStreamLimit > 4) {
+                const auto nowBk = std::chrono::steady_clock::now();
+                if ((nowBk - lastBackoffCheck) >= std::chrono::seconds(2)) {
+                    const size_t windowDone = (failed + transferred) - lastBackoffCompleted;
+                    const size_t windowFailed = failed - lastBackoffFailed;
+                    if (windowDone >= 200) {  // enough samples to judge the rate
+                        const double rate =
+                            static_cast<double>(windowFailed) / static_cast<double>(windowDone);
+                        if (rate > kStreamBackoffErrRate) {
+                            activeStreamLimit = std::max<uint32_t>(4, activeStreamLimit / 2);
+                            if (debugEnabled || diagnostics) {
+                                std::cerr << "[wan] stream_backoff rate=" << rate
+                                          << " streams=" << activeStreamLimit << std::endl;
+                            }
+                        }
+                        lastBackoffFailed = failed;
+                        lastBackoffCompleted = failed + transferred;
+                        lastBackoffCheck = nowBk;
+                    } else {
+                        lastBackoffCheck = nowBk;
+                    }
+                }
+            }
 
             if (debugEnabled) {
                 const auto now = std::chrono::steady_clock::now();
@@ -5135,6 +5510,19 @@ int RunClient(const CliOptions& options) {
                               << " batch_max_files=" << smallBatchMaxFiles
                               << " batch_max_kb=" << (smallBatchMaxBytes / 1024)
                               << " fallback_open=" << (fallbackCount - fallbackResolved)
+                              << " session_rtt_ms=" << sessionRttMs
+                              << " wan_mode=" << (wanMode ? 1 : 0)
+                              << " active_streams=" << activeStreamLimit
+                              << " hash_inflight_cap=" << maxInFlightHashRequests
+                              << " hash_inflight_peak=" << hashInflightPeak
+                              << " delta_sig_inflight=" << deltaSigInFlight
+                              << " delta_sig_inflight_peak=" << deltaSigInflightPeak
+                              << " blocksig_wait_us=" << blockSigWaitTotalUs
+                              << " blocksig_files=" << blockSigWaitCount
+                              << " ctrl_p95_us=" << histP95Us(ctrlLatencyHistUs)
+                              << " seconds_since_ctrl_event="
+                              << std::chrono::duration<double>(now - lastCtrlEventAt).count()
+                              << " max_ctrl_gap_sec=" << maxCtrlGapSec
                               << std::endl;
                     lastDebugPrint = now;
                 }
@@ -5143,7 +5531,8 @@ int RunClient(const CliOptions& options) {
             const bool allHashDone = (fallbackResolved == fallbackCount);
             const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
             const bool deltaIdle = deltaStates.empty() && pendingDeltaSigRequests.empty() &&
-                                   pendingDeltaRanges.empty() && activeDeltaRanges.empty();
+                                   pendingDeltaRanges.empty() && activeDeltaRanges.empty() &&
+                                   deltaPlanInFlight.load(std::memory_order_relaxed) == 0;
             if (manifestDone && allCompareDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
@@ -5292,6 +5681,8 @@ int RunClient(const CliOptions& options) {
         compareTaskCv.notify_all();
         hashStop.store(true);
         hashTaskCv.notify_all();
+        deltaPlanStop.store(true);
+        deltaPlanTaskCv.notify_all();
         dirStop.store(true);
         dirTaskCv.notify_all();
         ioStop.store(true);
@@ -5304,6 +5695,9 @@ int RunClient(const CliOptions& options) {
         }
         for (auto& w : hashWorkers) {
             JoinDiag(w, "client-catch-hash");
+        }
+        for (auto& w : deltaPlanWorkers) {
+            JoinDiag(w, "client-catch-delta-plan");
         }
         for (auto& w : dirWorkers) {
             JoinDiag(w, "client-catch-dir");
@@ -5318,6 +5712,8 @@ int RunClient(const CliOptions& options) {
     compareTaskCv.notify_all();
     hashStop.store(true);
     hashTaskCv.notify_all();
+    deltaPlanStop.store(true);
+    deltaPlanTaskCv.notify_all();
     ioStop.store(true);
     ioTaskCv.notify_all();
     for (auto& w : compareWorkers) {
@@ -5325,6 +5721,9 @@ int RunClient(const CliOptions& options) {
     }
     for (auto& w : hashWorkers) {
         JoinDiag(w, "client-hash");
+    }
+    for (auto& w : deltaPlanWorkers) {
+        JoinDiag(w, "client-delta-plan");
     }
     for (auto& w : ioWorkers) {
         JoinDiag(w, "client-io");
@@ -5367,6 +5766,36 @@ int RunClient(const CliOptions& options) {
                   << " fallback_resolved=" << fallbackResolved
                   << " hash_req_sent=" << hashRequestsSent
                   << " hash_resp_recv=" << hashResponsesReceived
+                  << std::endl;
+
+        // --- AC-12 / NFR-07 acceptance report fields (reviewer B-02 / B-03) ---
+        const double elapsedSec = std::max<double>(1e-9,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - syncStartTime).count());
+        const double throughputMbps =
+            (static_cast<double>(manifestTotalBytes) * 8.0) / elapsedSec / 1.0e6;
+        const uint64_t blocksigWaitMeanUs =
+            (blockSigWaitCount > 0) ? (blockSigWaitTotalUs / blockSigWaitCount) : 0;
+        std::cout << "[diag][wan] session_rtt_ms=" << sessionRttMs
+                  << " wan_mode=" << (wanMode ? 1 : 0)
+                  << " active_streams=" << activeStreamLimit
+                  << " hash_inflight_cap=" << maxInFlightHashRequests
+                  << " hash_inflight_peak=" << hashInflightPeak
+                  << " delta_sig_inflight_peak=" << deltaSigInflightPeak
+                  << " blocksig_wait_us=" << blockSigWaitTotalUs
+                  << " blocksig_files=" << blockSigWaitCount
+                  << " blocksig_wait_mean_us=" << blocksigWaitMeanUs
+                  << " ctrl_p95_us=" << histP95Us(ctrlLatencyHistUs)
+                  << " max_ctrl_gap_sec=" << maxCtrlGapSec
+                  << " file_count=" << enumerated
+                  << " total_bytes=" << manifestTotalBytes
+                  << " elapsed_sec=" << elapsedSec
+                  << " throughput_mbps=" << throughputMbps
+                  << " size_dist_lt4k=" << smallFileSizeHist[0]
+                  << " size_dist_4k_16k=" << smallFileSizeHist[1]
+                  << " size_dist_16k_64k=" << smallFileSizeHist[2]
+                  << " size_dist_64k_256k=" << smallFileSizeHist[3]
+                  << " size_dist_256k_1m=" << smallFileSizeHist[4]
+                  << " size_dist_ge1m=" << smallFileSizeHist[5]
                   << std::endl;
     }
 

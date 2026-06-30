@@ -163,6 +163,7 @@
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
     <ClInclude Include="sync_util.h" />
+    <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
   </ItemGroup>
   <ItemGroup>
@@ -176,6 +177,7 @@
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="protocol_codec.cpp" />
     <ClCompile Include="sync_util.cpp" />
+    <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
     <!-- Test sources. test_cli.cpp builds under MSVC too: it widens its ASCII argv to
          wchar_t** to match ParseCli's wmain signature, so the former C2664 no longer applies.
@@ -189,6 +191,7 @@
     <ClCompile Include="..\tests\test_reconnect.cpp" />
     <ClCompile Include="..\tests\test_route_selection.cpp" />
     <ClCompile Include="..\tests\test_link_scheduler.cpp" />
+    <ClCompile Include="..\tests\test_wan_tuning.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

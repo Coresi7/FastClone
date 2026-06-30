@@ -67,6 +67,7 @@ add_executable(FastCloneTests
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
     FastClone/sync_util.cpp
+    FastClone/transfer_tuning.cpp
     FastClone/win_socket.cpp
     tests/test_main.cpp
     tests/test_cli.cpp
@@ -76,6 +77,7 @@ add_executable(FastCloneTests
     tests/test_reconnect.cpp
     tests/test_route_selection.cpp
     tests/test_link_scheduler.cpp
+    tests/test_wan_tuning.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)

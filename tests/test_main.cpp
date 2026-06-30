@@ -10,6 +10,7 @@ void RunFileIndexTests();
 void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
+void RunWanTuningTests();
 
 int main() {
     try {
@@ -22,6 +23,7 @@ int main() {
         RunFileIndexTests();
         RunRouteSelectionTests();
         RunLinkSchedulerTests();
+        RunWanTuningTests();
         std::cout << "All FastClone tests passed." << std::endl;
         return 0;
     } catch (const std::exception& ex) {
