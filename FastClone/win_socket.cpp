@@ -1,3 +1,11 @@
+// glibc hides `struct tcp_info` / `TCP_INFO` behind __USE_MISC in <netinet/tcp.h>; a strict
+// -std=c++20 build (CMAKE_CXX_EXTENSIONS OFF) leaves _DEFAULT_SOURCE off, so request the GNU
+// feature set on Linux BEFORE any system header is pulled in (QueryTcpDiag needs the full
+// struct). Must precede the win_socket.h include, which transitively includes <sys/types.h>.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include "win_socket.h"
 
 #include <algorithm>
@@ -111,17 +119,33 @@ TcpDiag QueryTcpDiag(SocketNative s) {
         d.bytesInFlight = info.BytesInFlight;
         d.mss = info.Mss;
     }
-#else
+#elif defined(__linux__)
     struct tcp_info ti{};
     socklen_t len = static_cast<socklen_t>(sizeof(ti));
     if (getsockopt(s, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0) {
         d.valid = true;
         d.mss = ti.tcpi_snd_mss;
-        d.cwndBytes = static_cast<uint64_t>(ti.tcpi_snd_cwnd) * ti.tcpi_snd_mss;
-        d.rttUs = ti.tcpi_rtt;
-        d.retrans = ti.tcpi_total_retrans;
+        d.cwndBytes = static_cast<uint64_t>(ti.tcpi_snd_cwnd) * ti.tcpi_snd_mss;  // cwnd is in segments
+        d.rttUs = ti.tcpi_rtt;                                                    // microseconds
+        d.retrans = ti.tcpi_total_retrans;                                        // segments
         d.bytesInFlight = static_cast<uint64_t>(ti.tcpi_unacked) * ti.tcpi_snd_mss;
     }
+#elif defined(__APPLE__)
+    // macOS/BSD exposes TCP_CONNECTION_INFO + struct tcp_connection_info instead of Linux's
+    // TCP_INFO/tcp_info. cwnd is already in bytes here; srtt is in milliseconds; retrans is a
+    // packet count (matches the "seg" unit label). In-flight bytes are not exposed -> left 0.
+    struct tcp_connection_info ti{};
+    socklen_t len = static_cast<socklen_t>(sizeof(ti));
+    if (getsockopt(s, IPPROTO_TCP, TCP_CONNECTION_INFO, &ti, &len) == 0) {
+        d.valid = true;
+        d.mss = ti.tcpi_maxseg;
+        d.cwndBytes = ti.tcpi_snd_cwnd;                            // already bytes on macOS
+        d.rttUs = ti.tcpi_srtt * 1000u;                            // srtt is in milliseconds
+        d.retrans = ti.tcpi_txretransmitpackets;                   // retransmitted packets
+        d.bytesInFlight = 0;                                       // not exposed by this struct
+    }
+#else
+    (void)s;  // other platforms: kernel TCP diagnostics unavailable -> valid stays false
 #endif
     return d;
 }
