@@ -49,19 +49,20 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### Client
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted); accepts a comma-separated list and/or may be repeated to supply multiple multipath endpoints
 - `--target`: local target directory
 - `--password`: password (must match server)
-- `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`, and explicit values above `8` print a reliability warning)
+- `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`; on high-RTT links the auto value is lifted along an RTT ladder — `4` on LAN/同城, then `8`/`12`/`16` as RTT grows, capped by CPU concurrency — to fight RTT-bound throughput on massive small-file sets; explicit values above `8` print a reliability warning)
 - `--chunk-kb`: chunk size in KB; auto-tuned when omitted, valid range `1..65536`
 - `--queued-file-size`: soft receive-queue memory target for adaptive throttling (default: `5G`, range: `256M..64G`, supports suffixes `K/M/G`)
 - `--large-file-threshold`: pins files `>=` this size to the primary link; default `1G`, range `1M..1T`, suffixes `K/M/G` (independent of the small-file batch threshold and the receive-queue target)
 - `--aux-weight`: per-link ordering weight applied to every auxiliary link in transfer scheduling; default `1.0`, range `(0,16]` (the primary link is fixed at `1.0`). Higher values pull proportionally more file transfers onto aux links
 - `--large-file-lane`: how large files (`>= --large-file-threshold`) are routed across links: `primary` (pin to the primary link), `aux` (schedule by weight like any other file), or `auto` (prefer aux when `--aux-weight >= 2.0`, otherwise pin to primary); default `auto`
 - `--delta-min-size`: enable **binary-delta** transfer for changed files `>=` this size — only the changed byte ranges are downloaded instead of the whole file, matched against the existing local copy (Inspired by rsync. Rolling checksum + XXH3-128, independent MIT implementation). Default `0` (**disabled**); a positive value (range `1M..1T`, suffixes `K/M/G`) enables it. Independent of `--large-file-threshold`. Requires protocol FC7 on both ends (see Binary Delta Transfer below)
+- `--tcp-send-buffer` / `--tcp-recv-buffer`: pin `SO_SNDBUF` / `SO_RCVBUF` in bytes (range `64K..1G`, suffixes `K/M/G`); default `0` = let the kernel autotune the window. Leaving these at `0` is recommended on high-RTT links: the kernel's receive-window auto-tuning (Linux `tcp_moderate_rcvbuf`, Windows Receive Window Auto-Tuning) scales the window to the bandwidth-delay product so a single connection can fill a high-BDP link. Pinning a value **disables** auto-tuning for that direction and fixes the window. **Windows caveat:** if receive-window auto-tuning has been disabled system-wide (some "optimizer" tools or group policy set it to `disabled`; check with `netsh interface tcp show global`), the default `0` falls back to the small Windows system default (~64KB) and will throttle high-RTT throughput. On such machines, set `--tcp-recv-buffer` explicitly (e.g. `--tcp-recv-buffer 32M`) to restore a large fixed window, or re-enable auto-tuning with `netsh int tcp set global autotuninglevel=normal`
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
 - `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
 - `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)

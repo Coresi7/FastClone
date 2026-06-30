@@ -65,6 +65,27 @@ struct ConnectBinding {
     std::string ifaceName;
 };
 
+// Explicit TCP socket-buffer overrides in bytes; 0 = leave the buffer to kernel autotuning
+// (recommended: receive-window autotuning scales the window to the BDP on high-RTT links). A
+// positive value pins the buffer (which DISABLES receive-window autotuning for that direction)
+// and is intended for experimentation via --tcp-send-buffer / --tcp-recv-buffer. Set once at
+// startup before any socket is tuned; applies to every subsequently connected/accepted socket.
+void SetSocketBufferOverrides(int sndBufBytes, int rcvBufBytes);
+
+// Snapshot of kernel TCP state for one connection (diagnostics only, design wan-single-tcp §3.2).
+// retrans unit differs by platform (Linux: retransmitted segments; Windows: retransmitted bytes);
+// the trend, not the absolute unit, is what diagnoses loss-driven cwnd sawtooth. valid=false when
+// the OS cannot supply it (unsupported, not a TCP socket, or the query failed).
+struct TcpDiag {
+    bool valid = false;
+    uint64_t cwndBytes = 0;      // congestion window in bytes
+    uint32_t rttUs = 0;          // smoothed RTT in microseconds
+    uint64_t retrans = 0;        // cumulative retransmits (segments on Linux, bytes on Windows)
+    uint64_t bytesInFlight = 0;  // unacknowledged bytes currently in flight
+    uint32_t mss = 0;            // sender MSS
+};
+TcpDiag QueryTcpDiag(SocketNative s);
+
 SocketHandle ConnectTo(const std::string& host, uint16_t port);
 SocketHandle ConnectTo(const std::string& host, uint16_t port, const ConnectBinding& binding);
 // Return the actual source IP the OS bound a connected socket to (getsockname), as a

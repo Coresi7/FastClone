@@ -1,6 +1,7 @@
 #include "win_socket.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #ifdef _WIN32
+#include <mstcpip.h>  // SIO_TCP_INFO / TCP_INFO_v0 (Win10 1703+)
 #pragma comment(lib, "Ws2_32.lib")
 #else
 #include <arpa/inet.h>
@@ -25,6 +27,11 @@
 namespace fc {
 
 namespace {
+
+// TCP socket-buffer overrides (bytes); 0 = leave to kernel autotuning. Configured once at
+// startup via SetSocketBufferOverrides and read by TuneSocketForThroughput on every socket.
+std::atomic<int> g_sndBufOverride{0};
+std::atomic<int> g_rcvBufOverride{0};
 
 std::string LastSocketError(const char* prefix) {
 #ifdef _WIN32
@@ -49,18 +56,75 @@ void TuneSocketForThroughput(SocketNative s) {
 #endif
 #endif
 
-    // A larger kernel buffer helps keep a 2.5G link fed.
-    int bufSize = 4 * 1024 * 1024;
+    // Socket window policy (design wan-single-tcp §3.1). The old code unconditionally pinned
+    // SO_SNDBUF=SO_RCVBUF=4MB. Pinning SO_RCVBUF is what DISABLED the kernel's receive-window
+    // autotuning (Linux tcp_moderate_rcvbuf / Windows Receive Window Auto-Tuning), capping the
+    // receive window at 4MB and the single-connection throughput at ~4MB/RTT on high-RTT links.
+    //
+    // New default: leave SO_RCVBUF UNSET so autotuning scales the window to the BDP. Send side
+    // differs by platform: Linux autotunes SO_SNDBUF too (leave unset), but Windows does NOT
+    // autotune the send buffer and defaults to ~64KB -- which would throttle a blocking sender
+    // to 64KB in flight -- so Windows keeps an explicit, generous send buffer. Either direction
+    // can still be pinned via SetSocketBufferOverrides (--tcp-send-buffer / --tcp-recv-buffer).
+    const int sndOverride = g_sndBufOverride.load(std::memory_order_relaxed);
+    const int rcvOverride = g_rcvBufOverride.load(std::memory_order_relaxed);
+
 #ifdef _WIN32
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+    constexpr int kWinDefaultSndBuf = 16 * 1024 * 1024;
+    const int sndBuf = (sndOverride > 0) ? sndOverride : kWinDefaultSndBuf;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndBuf), sizeof(sndBuf));
+    if (rcvOverride > 0) {
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvOverride), sizeof(rcvOverride));
+    }
 #else
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bufSize, static_cast<socklen_t>(sizeof(bufSize)));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &bufSize, static_cast<socklen_t>(sizeof(bufSize)));
+    if (sndOverride > 0) {
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndOverride, static_cast<socklen_t>(sizeof(sndOverride)));
+    }
+    if (rcvOverride > 0) {
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvOverride, static_cast<socklen_t>(sizeof(rcvOverride)));
+    }
 #endif
 }
 
 }  // namespace
+
+void SetSocketBufferOverrides(int sndBufBytes, int rcvBufBytes) {
+    g_sndBufOverride.store(sndBufBytes > 0 ? sndBufBytes : 0, std::memory_order_relaxed);
+    g_rcvBufOverride.store(rcvBufBytes > 0 ? rcvBufBytes : 0, std::memory_order_relaxed);
+}
+
+TcpDiag QueryTcpDiag(SocketNative s) {
+    TcpDiag d;
+    if (s == kInvalidSocket) {
+        return d;
+    }
+#ifdef _WIN32
+    TCP_INFO_v0 info{};
+    DWORD infoVersion = 0;
+    DWORD bytesReturned = 0;
+    if (WSAIoctl(s, SIO_TCP_INFO, &infoVersion, sizeof(infoVersion), &info, sizeof(info),
+                 &bytesReturned, nullptr, nullptr) == 0) {
+        d.valid = true;
+        d.cwndBytes = info.Cwnd;
+        d.rttUs = info.RttUs;
+        d.retrans = info.BytesRetrans;
+        d.bytesInFlight = info.BytesInFlight;
+        d.mss = info.Mss;
+    }
+#else
+    struct tcp_info ti{};
+    socklen_t len = static_cast<socklen_t>(sizeof(ti));
+    if (getsockopt(s, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0) {
+        d.valid = true;
+        d.mss = ti.tcpi_snd_mss;
+        d.cwndBytes = static_cast<uint64_t>(ti.tcpi_snd_cwnd) * ti.tcpi_snd_mss;
+        d.rttUs = ti.tcpi_rtt;
+        d.retrans = ti.tcpi_total_retrans;
+        d.bytesInFlight = static_cast<uint64_t>(ti.tcpi_unacked) * ti.tcpi_snd_mss;
+    }
+#endif
+    return d;
+}
 
 WsaContext::WsaContext() {
 #ifdef _WIN32

@@ -51,6 +51,7 @@ void PrintUsage() {
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
         << "      [--delta-min-size <size>]\n"
+        << "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         << "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
         << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
         << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
@@ -62,6 +63,12 @@ void PrintUsage() {
         << "      --aux-weight >= 2.0, else primary); default auto.\n"
         << "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
         << "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
+        << "  --tcp-send-buffer / --tcp-recv-buffer pin SO_SNDBUF/SO_RCVBUF (suffix K|M|G, range\n"
+        << "      64K..1G); default 0 = kernel autotuning (recommended on high-RTT links: the\n"
+        << "      window scales to the BDP). Pinning a value disables autotuning for that\n"
+        << "      direction. Windows caveat: if receive-window autotuning is disabled system-wide\n"
+        << "      (check 'netsh interface tcp show global'), default 0 falls back to ~64KB and\n"
+        << "      throttles high-RTT throughput -- set --tcp-recv-buffer (e.g. 32M) explicitly.\n"
         << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
         << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
         << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
@@ -298,6 +305,21 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --delta-min-size (range: 0 or 1M..1T)");
             }
             options.deltaMinSizeBytes = v;
+        } else if (arg == "--tcp-send-buffer" || arg == "--tcp-recv-buffer") {
+            // WAN single-TCP window override. 0 = kernel autotuning (recommended); a positive
+            // value pins SO_SNDBUF/SO_RCVBUF (pinning recv disables receive-window autotuning).
+            const char* name = (arg == "--tcp-send-buffer") ? "--tcp-send-buffer" : "--tcp-recv-buffer";
+            const uint64_t v = ParseSizeBytesStrict(ArgAt(args, ++i), name);
+            constexpr uint64_t kMin = 64ULL * 1024ULL;                        // 64K lower bound
+            constexpr uint64_t kMax = 1024ULL * 1024ULL * 1024ULL;            // 1G upper bound
+            if (v != 0 && (v < kMin || v > kMax)) {
+                throw std::runtime_error(std::string("Invalid ") + name + " (range: 0 or 64K..1G)");
+            }
+            if (arg == "--tcp-send-buffer") {
+                options.tcpSendBufferBytes = v;
+            } else {
+                options.tcpRecvBufferBytes = v;
+            }
         } else if (arg == "--aux-weight") {
             // Uniform aux-lane weight for weighted shortest-queue selection (FR-09~FR-11).
             const double w = ParseDoubleStrict(ArgAt(args, ++i), "--aux-weight");

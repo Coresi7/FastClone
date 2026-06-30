@@ -5524,6 +5524,31 @@ int RunClient(const CliOptions& options) {
                               << std::chrono::duration<double>(now - lastCtrlEventAt).count()
                               << " max_ctrl_gap_sec=" << maxCtrlGapSec
                               << std::endl;
+                    // Per-lane kernel TCP state (design wan-single-tcp §3.2): cwnd sawtooth +
+                    // rising retrans is the smoking gun for loss-driven AIMD on a single TCP.
+                    // retrans unit differs by platform (Linux: segments, Windows: bytes), so it
+                    // is labelled explicitly to avoid cross-platform misreads (reviewer S-02).
+#ifdef _WIN32
+                    const char* kRetransUnit = "bytes";
+#else
+                    const char* kRetransUnit = "seg";
+#endif
+                    for (auto& cptr : pool) {
+                        const TcpDiag td = QueryTcpDiag(cptr->socket.Get());
+                        if (!td.valid) {
+                            continue;
+                        }
+                        std::cerr << "[debug][tcp] lane=" << cptr->connId
+                                  << " primary=" << (cptr->isPrimary ? 1 : 0)
+                                  << " healthy=" << (cptr->healthy.load() ? 1 : 0)
+                                  << " cwnd_kb=" << (td.cwndBytes / 1024)
+                                  << " inflight_kb=" << (td.bytesInFlight / 1024)
+                                  << " rtt_ms=" << (td.rttUs / 1000.0)
+                                  << " retrans=" << td.retrans
+                                  << " retrans_unit=" << kRetransUnit
+                                  << " mss=" << td.mss
+                                  << std::endl;
+                    }
                     lastDebugPrint = now;
                 }
             }

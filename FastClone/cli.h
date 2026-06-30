@@ -75,6 +75,14 @@ struct CliOptions {
     // Hard cap on the connection pool size (gatekeeper default <= 8, design R-05).
     uint32_t maxConnections = 8;
 
+    // --- TCP socket-buffer overrides (WAN single-TCP tuning) ---
+    // 0 (default) = let the kernel autotune the window (recommended; receive-window autotuning
+    // scales to the BDP on high-RTT links). A positive value pins the buffer (disabling
+    // receive-window autotuning for that direction); range [64K, 1G]. Experimentation knobs
+    // for high-BDP single-TCP links, applied to every connected/accepted socket.
+    uint64_t tcpSendBufferBytes = 0;
+    uint64_t tcpRecvBufferBytes = 0;
+
     // --- Binary delta (FC7) ---
     // Client-only minimum file size to attempt block-level binary delta (binary-delta FR-01).
     // 0 (default) disables delta entirely (zero regression). A positive value must be in

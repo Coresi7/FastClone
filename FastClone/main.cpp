@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "sync_engine.h"
+#include "win_socket.h"
 
 #include <exception>
 #include <iostream>
@@ -13,6 +14,10 @@ int main(int argc, char** argv) {
 #endif
     try {
         const fc::CliOptions options = fc::ParseCli(argc, argv);
+        // Apply TCP socket-buffer overrides before any socket is connected/accepted; 0 leaves
+        // the buffer to kernel autotuning (recommended for high-RTT links).
+        fc::SetSocketBufferOverrides(static_cast<int>(options.tcpSendBufferBytes),
+                                     static_cast<int>(options.tcpRecvBufferBytes));
         if (options.mode == fc::Mode::Server) {
             return fc::RunServer(options);
         }
