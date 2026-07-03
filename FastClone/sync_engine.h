@@ -14,6 +14,7 @@ inline constexpr int kExitIncompleteNoReconnect = 3;  // client: session dropped
 inline constexpr int kExitReconnectExhausted    = 4;  // client: auto-reconnect budget exhausted, sync still incomplete
 inline constexpr int kExitOnceSessionFailed     = 5;  // server --once: the served session failed/aborted (distinct from client's 2)
 inline constexpr int kExitWaitConnectTimeout    = 6;  // server --once/--once-multi: no valid connection before --wait-connect-timeout
+inline constexpr int kExitListenFailed          = 7;  // server: could not bind/listen on the requested port (e.g., port already in use)
 
 int RunServer(const CliOptions& options);
 int RunClient(const CliOptions& options);

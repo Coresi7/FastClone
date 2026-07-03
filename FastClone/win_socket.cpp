@@ -334,10 +334,18 @@ SocketHandle CreateServer(uint16_t port) {
     setsockopt(listener.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &no, static_cast<socklen_t>(sizeof(no)));
 #endif
 
-    int reuse = 1;
 #ifdef _WIN32
-    setsockopt(listener.Get(), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    // SO_EXCLUSIVEADDRUSE: bind fails with WSAEADDRINUSE if another socket already holds
+    // the port. The previous SO_REUSEADDR let a second fastclone server silently bind over
+    // an in-use port, making it appear to listen while actually conflicting with the holder
+    // (two listeners on one port). Exclusive use makes port-in-use a hard, visible error.
+    int exclusive = 1;
+    setsockopt(listener.Get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
 #else
+    // POSIX SO_REUSEADDR only allows reusing a port in TIME_WAIT; bind still fails with
+    // EADDRINUSE against a live listener, so it is safe and standard for server restart.
+    int reuse = 1;
     setsockopt(listener.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse, static_cast<socklen_t>(sizeof(reuse)));
 #endif
 
