@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -163,6 +164,132 @@ SignatureSet GenerateSignatures(const uint8_t* data, uint64_t len) {
         sig.blocks.push_back(bs);
     }
     return sig;
+}
+
+// --- Single-pass streaming signer (delta-streaming-fix). Two XXH3 states are kept for the
+// whole file: `fileState` (full-file hash, raw layout like ComputeBufferHash) and `blockState`
+// (reset per block, canonical layout like StrongHash). The weak checksum is accumulated per
+// block with the exact WeakInit arithmetic so cross-chunk continuation is bit-identical. ---
+struct StreamingSignerState {
+    uint64_t fileSize = 0;
+    uint32_t blockSize = 0;
+    uint32_t blockCount = 0;
+    uint8_t  strongLen = 0;
+    uint64_t consumed = 0;
+    uint32_t curBlockIndex = 0;
+    uint32_t curBlockFilled = 0;  // bytes fed into the current block so far
+    uint32_t curBlockLen = 0;     // expected length of the current block = min(blockSize, tail)
+    uint32_t weakS1 = 0;
+    uint32_t weakS2 = 0;
+    uint32_t weakJ = 0;           // 0-based position inside the block -> (j+1) weight, == WeakInit
+    XXH3_state_t* blockState = nullptr;
+    XXH3_state_t* fileState = nullptr;
+    SignatureSet sig;
+};
+
+StreamingSigner::StreamingSigner(uint64_t fileSize) : st_(std::make_unique<StreamingSignerState>()) {
+    st_->fileSize = fileSize;
+    st_->sig.fileSize = fileSize;
+    st_->fileState = XXH3_createState();
+    if (st_->fileState == nullptr || XXH3_128bits_reset(st_->fileState) == XXH_ERROR) {
+        throw std::runtime_error("StreamingSigner: XXH3 file state init failed");
+    }
+    if (fileSize == 0) {
+        return;  // empty file: no blocks, blockState created lazily (never needed)
+    }
+    st_->blockSize = ChooseBlockSize(fileSize);
+    st_->blockCount = static_cast<uint32_t>((fileSize + st_->blockSize - 1) / st_->blockSize);
+    st_->strongLen = ChooseStrongLen(st_->blockCount);
+    st_->sig.blockSize = st_->blockSize;
+    st_->sig.blockCount = st_->blockCount;
+    st_->sig.strongLen = st_->strongLen;
+    st_->sig.blocks.reserve(st_->blockCount);
+    st_->curBlockLen = static_cast<uint32_t>(std::min<uint64_t>(st_->blockSize, fileSize));
+    st_->blockState = XXH3_createState();
+    if (st_->blockState == nullptr || XXH3_128bits_reset(st_->blockState) == XXH_ERROR) {
+        throw std::runtime_error("StreamingSigner: XXH3 block state init failed");
+    }
+}
+
+StreamingSigner::~StreamingSigner() {
+    if (st_) {
+        if (st_->blockState != nullptr) {
+            XXH3_freeState(st_->blockState);
+        }
+        if (st_->fileState != nullptr) {
+            XXH3_freeState(st_->fileState);
+        }
+    }
+}
+
+void StreamingSigner::Update(const uint8_t* data, size_t len) {
+    StreamingSignerState& s = *st_;
+    if (len > 0) {
+        // Whole segment feeds the full-file hash in one shot (order-preserving, R-02).
+        if (XXH3_128bits_update(s.fileState, data, len) == XXH_ERROR) {
+            throw std::runtime_error("StreamingSigner: XXH3 file update failed");
+        }
+    }
+    s.consumed += len;
+
+    size_t pos = 0;
+    while (pos < len && s.curBlockIndex < s.blockCount) {
+        const uint32_t remainingInBlock = s.curBlockLen - s.curBlockFilled;
+        const size_t avail = len - pos;
+        const uint32_t span = static_cast<uint32_t>(
+            std::min<uint64_t>(remainingInBlock, static_cast<uint64_t>(avail)));
+
+        // weak: uint32 accumulate, mask to 16 bits only at block end (bit-identical to WeakInit).
+        for (uint32_t k = 0; k < span; ++k) {
+            const uint32_t x = data[pos + k];
+            s.weakS1 += x;
+            s.weakS2 += (s.weakJ + 1u) * x;
+            ++s.weakJ;
+        }
+        // strong: batch-feed the arrived bytes into this block's XXH3 state (R-01: never splices
+        // separately-computed fragments; the full block byte sequence is hashed in arrival order).
+        if (span > 0 && XXH3_128bits_update(s.blockState, data + pos, span) == XXH_ERROR) {
+            throw std::runtime_error("StreamingSigner: XXH3 block update failed");
+        }
+        s.curBlockFilled += span;
+        pos += span;
+
+        if (s.curBlockFilled == s.curBlockLen) {
+            BlockSig bs;
+            bs.weak = ((s.weakS2 & 0xFFFFu) << 16) | (s.weakS1 & 0xFFFFu);
+            const XXH128_hash_t d = XXH3_128bits_digest(s.blockState);
+            XXH128_canonical_t canonical;
+            XXH128_canonicalFromHash(&canonical, d);
+            std::memcpy(bs.strong.data(), canonical.digest, bs.strong.size());
+            s.sig.blocks.push_back(bs);
+
+            s.weakS1 = 0;
+            s.weakS2 = 0;
+            s.weakJ = 0;
+            s.curBlockFilled = 0;
+            ++s.curBlockIndex;
+            if (s.curBlockIndex < s.blockCount) {
+                const uint64_t off = static_cast<uint64_t>(s.curBlockIndex) * s.blockSize;
+                s.curBlockLen =
+                    static_cast<uint32_t>(std::min<uint64_t>(s.blockSize, s.fileSize - off));
+                XXH3_128bits_reset(s.blockState);
+            }
+        }
+    }
+}
+
+StreamingResult StreamingSigner::Finish() {
+    StreamingSignerState& s = *st_;
+    if (s.consumed != s.fileSize) {
+        throw std::runtime_error("StreamingSigner: fed byte count does not match fileSize");
+    }
+    StreamingResult result;
+    const XXH128_hash_t fd = XXH3_128bits_digest(s.fileState);
+    // Raw memcpy (NOT canonical) so fileHash matches ComputeBufferHash/ComputeFileHash exactly
+    // (EQ-03/R-02). This is deliberately different from the per-block canonical strong layout.
+    std::memcpy(result.fileHash.data(), &fd, result.fileHash.size());
+    result.sig = std::move(s.sig);
+    return result;
 }
 
 uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize) {

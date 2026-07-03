@@ -1,5 +1,7 @@
 #include "sync_engine_internal.h"
 
+#include "read_gate.h"
+
 namespace fs = std::filesystem;
 
 namespace fc {
@@ -621,6 +623,22 @@ ServerHashThreadPool& GetServerHashPool() {
     return pool;
 }
 
+// Read-concurrency limit for streaming BlockSigRequest miss tasks (delta-streaming-fix M7/FR-14,
+// in [2,4]). Orthogonal to the hash-pool worker count (FR-15/D6): it bounds how many tasks read
+// a file from disk at once, independently of how many workers exist.
+constexpr uint32_t kServerReadLimit = 3;
+
+// Streaming read chunk for the signature/hash single pass (FR-03, in [1,4] MiB). 1 MiB keeps the
+// per-task resident buffer minimal (readLimit * 1 MiB total), the "stop the IO bleed" objective.
+constexpr size_t kServerSigChunkBytes = 1u << 20;
+
+// Global read gate shared across all sessions (whole-machine disk-read concurrency, NFR-02),
+// mirroring the GetServerHashPool() singleton pattern.
+ReadGate& GetServerReadGate() {
+    static ReadGate gate(kServerReadLimit);
+    return gate;
+}
+
 bool TryReadHashFingerprint(const fs::path& absPath, HashFingerprint& out) {
     std::error_code ec;
     if (!fs::exists(absPath, ec) || ec) {
@@ -926,25 +944,87 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     }
                     try {
                         GetServerHashPool().Enqueue([&, rel, abs, fingerprint, fingerprintValid]() {
+                            // Release the session pending-jobs slot on EVERY exit path
+                            // (success / failure / exception / cancel), matching the legacy
+                            // teardown (FR-17/AC-06/AC-10).
+                            auto finalize = [&]() {
+                                std::lock_guard<std::mutex> lock(sessionHashMu);
+                                if (sessionPendingHashJobs > 0) {
+                                    --sessionPendingHashJobs;
+                                }
+                                sessionHashCv.notify_all();
+                            };
+
+                            // If the session is already tearing down, skip the heavy IO for a
+                            // response that would be dropped anyway (FR-18/AC-09).
+                            if (done.load()) {
+                                finalize();
+                                return;
+                            }
+
+                            // Bound concurrent disk reads (M7/FR-14/NFR-02). The permit is taken
+                            // OUTSIDE any session lock (R-05); RAII release covers every exit
+                            // path (R-04). A false guard means we aborted because done flipped
+                            // while waiting -> treat as cancelled (no response).
+                            ReadGateGuard guard(GetServerReadGate(), done);
+                            if (!guard) {
+                                finalize();
+                                return;
+                            }
+
                             bool ok = true;
-                            Hash256 fileHash{};
-                            delta::SignatureSet sig;
-                            std::vector<uint8_t> buf;
-                            if (!ReadWholeFile(abs, buf)) {
-                                ok = false;
-                            } else {
-                                try {
-                                    sig = delta::GenerateSignatures(buf.data(), buf.size());
-                                    // Full-file verification hash in the SAME raw layout as
-                                    // ComputeFileHash (HashResponse), so the client's FR-23
-                                    // check compares like-for-like. Hash the in-memory buffer
-                                    // we already read instead of re-reading the file from disk
-                                    // (server stays light; avoids a second AV scan pass).
-                                    fileHash = ComputeBufferHash(buf.data(), buf.size());
-                                } catch (...) {
+                            delta::StreamingResult res;
+                            {
+                                std::error_code ec;
+                                const uint64_t fileSize =
+                                    static_cast<uint64_t>(fs::file_size(abs, ec));
+                                if (ec) {
                                     ok = false;
+                                } else {
+                                    try {
+                                        std::ifstream in(abs, std::ios::binary);
+                                        if (!in) {
+                                            ok = false;
+                                        } else {
+                                            // Single sequential pass: 1 MiB chunks feed the
+                                            // StreamingSigner, producing the SignatureSet AND the
+                                            // full-file XXH3-128 without ever buffering the whole
+                                            // file and without a second scan (FR-01/FR-02/NFR-01/
+                                            // NFR-03). thread_local buffer is reused across tasks.
+                                            delta::StreamingSigner signer(fileSize);
+                                            thread_local std::vector<uint8_t> buf;
+                                            if (buf.size() != kServerSigChunkBytes) {
+                                                buf.resize(kServerSigChunkBytes);
+                                            }
+                                            while (in) {
+                                                in.read(reinterpret_cast<char*>(buf.data()),
+                                                        static_cast<std::streamsize>(buf.size()));
+                                                const std::streamsize got = in.gcount();
+                                                if (got <= 0) {
+                                                    break;
+                                                }
+                                                signer.Update(buf.data(),
+                                                              static_cast<size_t>(got));
+                                            }
+                                            if (!in.eof() && in.fail()) {
+                                                ok = false;  // genuine read error -> DeltaError
+                                            }
+                                            if (ok) {
+                                                // Byte-count / XXH3 errors throw -> caught below.
+                                                res = signer.Finish();
+                                            }
+                                        }
+                                    } catch (...) {
+                                        ok = false;
+                                    }
                                 }
                             }
+
+                            // Hand the disk-read permit back the instant IO is done, BEFORE any
+                            // outbound/session lock (R-05). The RAII destructor becomes a no-op
+                            // but still guards the early-throw paths above.
+                            guard.release();
+
                             if (ok && blockSigMemcacheEnabled) {
                                 try {
                                     HashFingerprint afterFingerprint;
@@ -952,7 +1032,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                         (!fingerprintValid ||
                                          (afterFingerprint.fileSize == fingerprint.fileSize &&
                                           afterFingerprint.mtimeNs == fingerprint.mtimeNs))) {
-                                        GetBlockSigMemCache().Upsert(rel, afterFingerprint, fileHash, sig);
+                                        GetBlockSigMemCache().Upsert(rel, afterFingerprint,
+                                                                     res.fileHash, res.sig);
                                     }
                                 } catch (...) {
                                     // Best-effort cache write; correctness unaffected.
@@ -962,7 +1043,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                 try {
                                     if (ok) {
                                         enqueueHigh(Frame{MsgType::BlockSigResponse, 0,
-                                                          EncodeBlockSigResponse(rel, fileHash, sig)});
+                                                          EncodeBlockSigResponse(rel, res.fileHash,
+                                                                                 res.sig)});
                                     } else {
                                         enqueueHigh(Frame{MsgType::DeltaError, 0, EncodeDeltaError(rel)});
                                     }
@@ -972,13 +1054,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                     outboundCv.notify_all();
                                 }
                             }
-                            {
-                                std::lock_guard<std::mutex> lock(sessionHashMu);
-                                if (sessionPendingHashJobs > 0) {
-                                    --sessionPendingHashJobs;
-                                }
-                                sessionHashCv.notify_all();
-                            }
+                            finalize();
                         });
                     } catch (...) {
                         {

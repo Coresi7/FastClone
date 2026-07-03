@@ -162,6 +162,7 @@
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
+    <ClInclude Include="read_gate.h" />
     <ClInclude Include="sync_util.h" />
     <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
@@ -186,6 +187,7 @@
     <ClCompile Include="..\tests\test_main.cpp" />
     <ClCompile Include="..\tests\test_cli.cpp" />
     <ClCompile Include="..\tests\test_delta.cpp" />
+    <ClCompile Include="..\tests\test_read_gate.cpp" />
     <ClCompile Include="..\tests\test_file_index.cpp" />
     <ClCompile Include="..\tests\test_hash_memcache.cpp" />
     <ClCompile Include="..\tests\test_reconnect.cpp" />

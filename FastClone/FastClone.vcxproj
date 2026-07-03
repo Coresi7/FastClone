@@ -153,6 +153,7 @@
     <ClInclude Include="net_topology.h" />
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
+    <ClInclude Include="read_gate.h" />
     <ClInclude Include="sync_engine.h" />
     <ClInclude Include="sync_engine_internal.h" />
     <ClInclude Include="sync_util.h" />

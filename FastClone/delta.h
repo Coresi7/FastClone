@@ -13,7 +13,9 @@
 // the pure recurrences stay independent of the xxhash include path.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace fc::delta {
@@ -94,6 +96,45 @@ std::array<uint8_t, 16> StrongHash(const uint8_t* data, uint32_t len);
 // Server side: generate a deterministic signature set for new-file contents [data, len)
 // (FR-09/FR-10). Empty input yields an all-zero SignatureSet (blockCount == 0).
 SignatureSet GenerateSignatures(const uint8_t* data, uint64_t len);
+
+// --- Single-pass streaming signer (delta-streaming-fix FR-10). Lets the server produce the
+// SignatureSet AND the full-file XXH3-128 in one sequential read pass (no whole-file buffer,
+// no second scan) while staying bit-identical to the in-memory path. GenerateSignatures above
+// is intentionally left untouched (FR-09). ---
+
+// Streaming signature output. Both fields are byte-for-byte equal to the in-memory path:
+//   sig      == GenerateSignatures(fullBytes)              (EQ-01/EQ-02)
+//   fileHash == ComputeBufferHash(fullBytes) raw layout    (EQ-03; NOT canonical, see delta.cpp)
+struct StreamingResult {
+    SignatureSet sig;
+    std::array<uint8_t, 16> fileHash{};
+};
+
+// pImpl state so delta.h keeps its no-<xxhash.h> guarantee (the XXH3_state_t lives in delta.cpp).
+struct StreamingSignerState;
+
+// Feed the new file's bytes sequentially (any chunking, including splits that fall inside a
+// signature block) and finalize once to obtain the SignatureSet + full-file hash (FR-02/FR-10).
+// fileSize must be known up front so blockSize/blockCount/strongLen match GenerateSignatures
+// exactly (EQ-01); the server takes it from fs::file_size before opening the file.
+class StreamingSigner {
+public:
+    explicit StreamingSigner(uint64_t fileSize);
+    ~StreamingSigner();
+    StreamingSigner(const StreamingSigner&) = delete;
+    StreamingSigner& operator=(const StreamingSigner&) = delete;
+
+    // Consume the next segment of bytes. len may span block and chunk boundaries (FR-08/R-01).
+    void Update(const uint8_t* data, size_t len);
+
+    // Verify the total fed byte count equals the constructed fileSize, then emit sig + fileHash.
+    // Throws std::runtime_error on a byte-count mismatch (short/changed file) so the server maps
+    // it to DeltaError (FR-12). Must be called exactly once.
+    StreamingResult Finish();
+
+private:
+    std::unique_ptr<StreamingSignerState> st_;
+};
 
 // Reconstruction plan operations. A CopyOp sources bytes from the local old file; a MissOp
 // must be downloaded from the server. Together they tile [0, newFileBytes) exactly.

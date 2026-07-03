@@ -6,7 +6,9 @@
 // a local xxhash shim; the CMake / FastCloneTests build links the real libxxhash.
 
 #include "delta.h"
+#include "file_index.h"  // ComputeBufferHash / Hash256 (streaming full-file hash equivalence)
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -600,6 +602,101 @@ void TestOptimizedEqualsReference() {
 
 }  // namespace
 
+// --- delta-streaming-fix: StreamingSigner equivalence (V-01..V-06). Feeds the same bytes to
+// StreamingSigner under many chunk sizes (including 1/2/3/7-byte splits and a prime > blockSize
+// so chunk edges deliberately fall inside signature blocks) and asserts the SignatureSet and the
+// full-file hash are bit-identical to the in-memory GenerateSignatures / ComputeBufferHash. ---
+void CheckStreamEquivalent(const std::vector<uint8_t>& data, const std::vector<size_t>& chunks) {
+    using namespace fc::delta;
+    const SignatureSet ref = GenerateSignatures(data.data(), data.size());
+    const fc::Hash256 refHash = fc::ComputeBufferHash(data.data(), data.size());
+    for (size_t chunkArg : chunks) {
+        const size_t chunk = chunkArg == 0 ? 1 : chunkArg;
+        StreamingSigner signer(static_cast<uint64_t>(data.size()));
+        size_t pos = 0;
+        while (pos < data.size()) {
+            const size_t n = std::min(chunk, data.size() - pos);
+            signer.Update(data.data() + pos, n);
+            pos += n;
+        }
+        const StreamingResult res = signer.Finish();
+        Require(res.sig.fileSize == ref.fileSize, "stream fileSize equals memory path (EQ-01)");
+        Require(res.sig.blockSize == ref.blockSize, "stream blockSize equals memory path (EQ-01)");
+        Require(res.sig.blockCount == ref.blockCount, "stream blockCount equals memory path (EQ-01)");
+        Require(res.sig.strongLen == ref.strongLen, "stream strongLen equals memory path (EQ-01)");
+        Require(res.sig.blocks.size() == ref.blocks.size(), "stream block count equals (EQ-02)");
+        for (size_t i = 0; i < ref.blocks.size(); ++i) {
+            Require(res.sig.blocks[i].weak == ref.blocks[i].weak, "stream weak equals (EQ-02)");
+            Require(res.sig.blocks[i].strong == ref.blocks[i].strong, "stream strong equals (EQ-02)");
+        }
+        Require(res.fileHash == refHash, "stream fileHash equals ComputeBufferHash raw (EQ-03)");
+    }
+}
+
+// V-06: full boundary dataset — empty, tiny, sub/at/over blockSize, multi-chunk + tail, and a
+// ~1 MiB random buffer — each under multiple chunk sizes (V-01/V-02/V-03).
+void TestStreamingEquivalenceDataset() {
+    const std::vector<size_t> tinyChunks = {1, 2, 3, 7, 2048, 100003, (1u << 20)};
+    const uint64_t sizes[] = {0, 1, 2, 2047, 2048, 2049, 4096, 5000, 100000};
+    for (uint64_t sz : sizes) {
+        CheckStreamEquivalent(RandomBytes(sz, static_cast<uint32_t>(sz) + 1), tinyChunks);
+    }
+    // ~1 MiB random: skip the 1-byte chunk for runtime but keep a prime and a big chunk so both
+    // cross-block and aligned feeds are covered.
+    CheckStreamEquivalent(RandomBytes((1u << 20) + 12345, 424242),
+                          {3, 100003, (1u << 20), (4u << 20)});
+}
+
+// V-04: a chunk boundary lands strictly inside a signature block; that block's weak & strong must
+// still match the memory path (proves cross-chunk blocks hash the full byte sequence, R-01/FR-08).
+void TestStreamingCrossChunkBlock() {
+    using namespace fc::delta;
+    // fileSize 5000 -> blockSize 2048 -> blocks {2048, 2048, 904}. chunk 3000 splits block#1
+    // (bytes 2048..4095) at offset 3000.
+    const std::vector<uint8_t> data = RandomBytes(5000, 7);
+    const SignatureSet ref = GenerateSignatures(data.data(), data.size());
+    Require(ref.blockSize == 2048, "cross-chunk test expects blockSize 2048");
+    Require(ref.blockCount == 3, "cross-chunk test expects 3 blocks");
+    StreamingSigner signer(data.size());
+    signer.Update(data.data(), 3000);
+    signer.Update(data.data() + 3000, data.size() - 3000);
+    const StreamingResult res = signer.Finish();
+    Require(res.sig.blocks[1].weak == ref.blocks[1].weak, "cross-chunk block weak matches (AC-04)");
+    Require(res.sig.blocks[1].strong == ref.blocks[1].strong, "cross-chunk block strong matches (AC-04)");
+    Require(res.fileHash == fc::ComputeBufferHash(data.data(), data.size()),
+            "cross-chunk fileHash matches (EQ-03)");
+}
+
+// V-03 guard: fileHash uses the RAW XXH3 layout (ComputeBufferHash), which must differ from the
+// canonical layout used by per-block strong checksums — catches an accidental canonical mix-up.
+void TestStreamingRawVsCanonical() {
+    using namespace fc::delta;
+    const std::vector<uint8_t> data = RandomBytes(4096, 99);
+    StreamingSigner signer(data.size());
+    signer.Update(data.data(), data.size());
+    const StreamingResult res = signer.Finish();
+    const std::array<uint8_t, 16> canonical = StrongHash(data.data(), static_cast<uint32_t>(data.size()));
+    Require(res.fileHash == fc::ComputeBufferHash(data.data(), data.size()),
+            "fileHash is raw layout (EQ-03)");
+    Require(!(res.fileHash == canonical), "raw layout differs from canonical (R-02 guard)");
+}
+
+// V-07 (unit slice): Finish() must throw when fewer bytes than fileSize are fed (short/changed
+// file), so the server maps it to DeltaError (FR-12).
+void TestStreamingShortFeedThrows() {
+    using namespace fc::delta;
+    const std::vector<uint8_t> data = RandomBytes(3000, 11);
+    StreamingSigner signer(data.size());
+    signer.Update(data.data(), 1000);  // feed fewer bytes than fileSize
+    bool threw = false;
+    try {
+        (void)signer.Finish();
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    Require(threw, "Finish throws on byte-count mismatch (FR-12)");
+}
+
 void RunDeltaTests() {
     TestRollingMatchesBruteForce();
     TestBlockSizeHeuristic();
@@ -620,4 +717,9 @@ void RunDeltaTests() {
     TestWeakFilterBeforeStrong();
     TestMatchedByteLevel();
     TestOptimizedEqualsReference();
+    // delta-streaming-fix: StreamingSigner equivalence + cross-chunk + layout guards (V-01..V-07).
+    TestStreamingEquivalenceDataset();
+    TestStreamingCrossChunkBlock();
+    TestStreamingRawVsCanonical();
+    TestStreamingShortFeedThrows();
 }
