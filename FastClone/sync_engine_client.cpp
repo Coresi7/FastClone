@@ -1,59 +1,3 @@
-#include "sync_engine.h"
-
-#include "client_handshake.h"
-#include "delta.h"
-#include "file_index.h"
-#include "hash_memcache.h"
-#include "link_scheduler.h"
-#include "net_topology.h"
-#include "path_utils.h"
-#include "protocol.h"
-#include "protocol_codec.h"
-#include "sync_util.h"
-#include "transfer_tuning.h"
-#include "win_socket.h"
-
-#ifdef _WIN32
-#include <Windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#elif defined(__linux__)
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-#ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <condition_variable>
-#include <cctype>
-#include <deque>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <queue>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <system_error>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 #include "sync_engine_internal.h"
 
 namespace fs = std::filesystem;
@@ -3655,17 +3599,9 @@ int RunClient(const CliOptions& options) {
         int64_t mtimeDeltaP50 = 0, mtimeDeltaP95 = 0, mtimeDeltaP99 = 0, mtimeDeltaMax = 0;
         if (!mtimeDeltas.empty()) {
             std::sort(mtimeDeltas.begin(), mtimeDeltas.end());
-            const size_t n = mtimeDeltas.size();
-            auto percentile = [&](double p) -> int64_t {
-                size_t idx = static_cast<size_t>(p * static_cast<double>(n - 1) + 0.5);
-                if (idx >= n) {
-                    idx = n - 1;
-                }
-                return mtimeDeltas[idx];
-            };
-            mtimeDeltaP50 = percentile(0.50);
-            mtimeDeltaP95 = percentile(0.95);
-            mtimeDeltaP99 = percentile(0.99);
+            mtimeDeltaP50 = PercentileNearestRank(mtimeDeltas, 0.50);
+            mtimeDeltaP95 = PercentileNearestRank(mtimeDeltas, 0.95);
+            mtimeDeltaP99 = PercentileNearestRank(mtimeDeltas, 0.99);
             mtimeDeltaMax = mtimeDeltas.back();
         }
         // AC-A3 requires these exact field names to be directly readable in the log.

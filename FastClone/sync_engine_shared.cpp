@@ -1,59 +1,3 @@
-#include "sync_engine.h"
-
-#include "client_handshake.h"
-#include "delta.h"
-#include "file_index.h"
-#include "hash_memcache.h"
-#include "link_scheduler.h"
-#include "net_topology.h"
-#include "path_utils.h"
-#include "protocol.h"
-#include "protocol_codec.h"
-#include "sync_util.h"
-#include "transfer_tuning.h"
-#include "win_socket.h"
-
-#ifdef _WIN32
-#include <Windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#elif defined(__linux__)
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-#ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <condition_variable>
-#include <cctype>
-#include <deque>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <queue>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <system_error>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 #include "sync_engine_internal.h"
 
 namespace fs = std::filesystem;
@@ -128,6 +72,17 @@ unsigned ResolveDirWalkWorkerCount() {
 // rel = relDir + "/" + name (or just name at the root). Single definition for every walk.
 std::string BuildRelPath(const std::string& relDir, const std::string& name) {
     return relDir.empty() ? name : (relDir + "/" + name);
+}
+
+// Nearest-rank percentile value on an already-sorted, non-empty vector. Sorting and
+// empty handling stay with the caller so the server (sort-per-call) and client (sort-once)
+// keep their existing sort cadence; only the index math is shared here.
+int64_t PercentileNearestRank(const std::vector<int64_t>& sorted, double p) {
+    size_t idx = static_cast<size_t>(p * static_cast<double>(sorted.size() - 1) + 0.5);
+    if (idx >= sorted.size()) {
+        idx = sorted.size() - 1;
+    }
+    return sorted[idx];
 }
 
 #ifdef _WIN32

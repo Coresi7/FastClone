@@ -1,21 +1,69 @@
 #pragma once
 
+// A-1: this internal header owns the single preamble previously duplicated verbatim
+// at the top of sync_engine_{shared,server,client}.cpp. Each of those TUs now includes
+// only this header. The public header is pulled in here (it merely depends on cli.h and
+// never includes this file, so there is no cycle); no new public symbols are introduced.
+#include "sync_engine.h"
+
+#include "client_handshake.h"
+#include "delta.h"
+#include "file_index.h"
+#include "hash_memcache.h"
+#include "link_scheduler.h"
+#include "net_topology.h"
+#include "path_utils.h"
+#include "protocol.h"
+#include "protocol_codec.h"
+#include "sync_util.h"
+#include "transfer_tuning.h"
+#include "win_socket.h"
+
+#ifdef _WIN32
+#include <Windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#elif defined(__linux__)
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <queue>
+#include <set>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#ifdef _WIN32
-#include <Windows.h>
-#endif
 
 namespace fc {
 namespace detail {
@@ -30,6 +78,12 @@ std::string BuildRelPath(const std::string& relDir, const std::string& name);
 HANDLE OpenDirFind(const std::wstring& absDir, WIN32_FIND_DATAW& fd);
 #endif
 bool ReadWholeFile(const std::filesystem::path& abs, std::vector<uint8_t>& out);
+
+// B-1: nearest-rank percentile value from an ALREADY-SORTED, NON-EMPTY vector.
+// idx = round(p*(n-1)), clamped to n-1. Callers own sorting and empty handling
+// (server pct: sort-per-call + empty->0; client: sort once, guarded non-empty).
+// Definition in sync_engine_shared.cpp.
+int64_t PercentileNearestRank(const std::vector<int64_t>& sorted, double p);
 
 // Parallel directory traversal. A shared work queue of directories is serviced by a
 // pool of worker threads; each pops a directory, lists it (emitting entries through

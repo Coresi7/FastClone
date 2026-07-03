@@ -1,59 +1,3 @@
-#include "sync_engine.h"
-
-#include "client_handshake.h"
-#include "delta.h"
-#include "file_index.h"
-#include "hash_memcache.h"
-#include "link_scheduler.h"
-#include "net_topology.h"
-#include "path_utils.h"
-#include "protocol.h"
-#include "protocol_codec.h"
-#include "sync_util.h"
-#include "transfer_tuning.h"
-#include "win_socket.h"
-
-#ifdef _WIN32
-#include <Windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#elif defined(__linux__)
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-#ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
-#endif
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <condition_variable>
-#include <cctype>
-#include <deque>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <queue>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <system_error>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 #include "sync_engine_internal.h"
 
 namespace fs = std::filesystem;
@@ -450,14 +394,7 @@ void EnumerateManifestEntriesFast(
 
         FindClose(hFind);
     };
-    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
-                          std::vector<Frame>& out) {
-        runListing(listOneDir, current, subdirs, out);
-    };
-
-    const unsigned numWorkers = ResolveDirWalkWorkerCount();
-    ParallelDirWalk(PendingDir{rootW, std::string()}, numWorkers, kDirPopBatch, done,
-                    "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
+    PendingDir rootPending{rootW, std::string()};
 #else
     struct PendingDir {
         fs::path absDir;
@@ -545,15 +482,20 @@ void EnumerateManifestEntriesFast(
             }
         }
     };
+    PendingDir rootPending{root, std::string()};
+#endif
+
+    // C-1: processDir is byte-identical on both platforms, so it (and the walk that
+    // consumes it) is defined once here after #endif; each branch above only builds its
+    // platform-typed listOneDir and the commonly named rootPending. This still runs
+    // before the common flush tail, so the manifest frame sequence is unchanged.
     auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
         runListing(listOneDir, current, subdirs, out);
     };
-
     const unsigned numWorkers = ResolveDirWalkWorkerCount();
-    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, kDirPopBatch, done,
+    ParallelDirWalk(std::move(rootPending), numWorkers, kDirPopBatch, done,
                     "server-enum-walk", std::vector<Frame>{}, processDir, finishWorker);
-#endif
 
     // Common tail (both platforms): flush the final progress + ManifestEnd, unless the
     // walk was cancelled.
@@ -1366,11 +1308,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                             return 0;
                         }
                         std::sort(v.begin(), v.end());
-                        size_t idx = static_cast<size_t>(p * static_cast<double>(v.size() - 1) + 0.5);
-                        if (idx >= v.size()) {
-                            idx = v.size() - 1;
-                        }
-                        return v[idx];
+                        return PercentileNearestRank(v, p);
                     };
                     const int64_t muWaitP50 = pct(muWaitUs, 0.50);
                     const int64_t muWaitP95 = pct(muWaitUs, 0.95);
@@ -1477,11 +1415,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                 return 0;
             }
             std::sort(v.begin(), v.end());
-            size_t idx = static_cast<size_t>(p * static_cast<double>(v.size() - 1) + 0.5);
-            if (idx >= v.size()) {
-                idx = v.size() - 1;
-            }
-            return v[idx];
+            return PercentileNearestRank(v, p);
         };
         const int64_t muWaitP50 = pct(muWaitUs, 0.50);
         const int64_t muWaitP95 = pct(muWaitUs, 0.95);
