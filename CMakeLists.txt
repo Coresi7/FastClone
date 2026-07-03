@@ -17,7 +17,9 @@ add_executable(FastClone
     FastClone/net_topology.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
-    FastClone/sync_engine.cpp
+    FastClone/sync_engine_shared.cpp
+    FastClone/sync_engine_server.cpp
+    FastClone/sync_engine_client.cpp
     FastClone/sync_util.cpp
     FastClone/transfer_tuning.cpp
     FastClone/win_socket.cpp

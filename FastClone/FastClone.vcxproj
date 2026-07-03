@@ -154,6 +154,7 @@
     <ClInclude Include="protocol.h" />
     <ClInclude Include="protocol_codec.h" />
     <ClInclude Include="sync_engine.h" />
+    <ClInclude Include="sync_engine_internal.h" />
     <ClInclude Include="sync_util.h" />
     <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
@@ -168,7 +169,9 @@
     <ClCompile Include="net_topology.cpp" />
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="protocol_codec.cpp" />
-    <ClCompile Include="sync_engine.cpp" />
+    <ClCompile Include="sync_engine_shared.cpp" />
+    <ClCompile Include="sync_engine_server.cpp" />
+    <ClCompile Include="sync_engine_client.cpp" />
     <ClCompile Include="sync_util.cpp" />
     <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
