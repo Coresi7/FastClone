@@ -6,6 +6,7 @@ void RunCliTests();
 #endif
 void RunHashMemCacheTests();
 void RunDeltaTests();
+void RunReadGateTests();
 void RunFileIndexTests();
 void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
@@ -20,6 +21,7 @@ int main() {
         RunReconnectClassifierTests();
         RunHashMemCacheTests();
         RunDeltaTests();
+        RunReadGateTests();
         RunFileIndexTests();
         RunRouteSelectionTests();
         RunLinkSchedulerTests();

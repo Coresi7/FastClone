@@ -74,6 +74,7 @@ add_executable(FastCloneTests
     tests/test_main.cpp
     tests/test_cli.cpp
     tests/test_delta.cpp
+    tests/test_read_gate.cpp
     tests/test_file_index.cpp
     tests/test_hash_memcache.cpp
     tests/test_reconnect.cpp
