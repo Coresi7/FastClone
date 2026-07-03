@@ -1665,6 +1665,25 @@ bool EvaluateWaitConnect(uint64_t timeoutMs, bool& firstConnSeen,
 
 int RunServer(const CliOptions& options) {
     WsaContext wsa;
+
+    // Bind/listen BEFORE the startup banner so a port-in-use failure is the first (and only)
+    // output, instead of printing "FastClone server ..." and then appearing to hang/crash.
+    // CreateServer uses SO_EXCLUSIVEADDRUSE on Windows / SO_REUSEADDR on POSIX, so an in-use
+    // port surfaces as a bind failure here rather than a silent overlapping listen.
+    SocketHandle listener;
+    try {
+        listener = CreateServer(options.port);
+    } catch (const std::exception& e) {
+        std::cerr << "FastClone: cannot listen on port " << options.port
+                  << " (" << e.what() << ")."
+                  << " The port may already be in use by another process."
+                  << std::endl;
+        return kExitListenFailed;
+    }
+    // Publish the listener fd so a connection-close thread can interrupt accept() on
+    // terminal (--once, FR-09). Harmless for non-once: it is only ever read via WakeAcceptLoop.
+    g_onceListenSock.store(listener.Get());
+
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t hashWorkerCount = ResolveServerHashWorkerCount(options);
     GetServerHashPool().Configure(hashWorkerCount);
@@ -1680,10 +1699,6 @@ int RunServer(const CliOptions& options) {
                   << " chunk-kb=" << (tuned.chunkSize / 1024)
                   << std::endl;
     }
-    SocketHandle listener = CreateServer(options.port);
-    // Publish the listener fd so a connection-close thread can interrupt accept() on
-    // terminal (--once, FR-09). Harmless for non-once: it is only ever read via WakeAcceptLoop.
-    g_onceListenSock.store(listener.Get());
 
     // Collect the server's advertised endpoint list once at startup (FR-005 / §6.1, r6 §6.1).
     // Sent to the first connection in AuthOk so the client can extend the connection pool.
@@ -1712,6 +1727,9 @@ int RunServer(const CliOptions& options) {
         }
     }
     std::cout << "[mp] advertised_endpoints=" << serverAddrs.size() << std::endl;
+    for (const AdvertisedEndpoint& ep : serverAddrs) {
+        std::cout << "[mp]   " << ep.endpoint << std::endl;
+    }
 
     const bool debugEnabled = IsDebugEnabled();
     std::atomic<uint64_t> connIdCounter{0};
