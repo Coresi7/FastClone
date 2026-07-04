@@ -328,6 +328,24 @@ std::vector<OpKind> DiskIoDriver::scheduleLog() const {
     return scheduleLog_;
 }
 
+std::string DiskIoDriver::backendName() const {
+    switch (backend_->kind()) {
+        case BackendKind::WinIocp:
+            return "Windows IOCP (FILE_FLAG_NO_BUFFERING)";
+        case BackendKind::LinuxUring:
+            return "Linux io_uring (O_DIRECT)";
+        case BackendKind::PosixThreadPool:
+            // On Linux the pool is the io_uring fallback (probe failed or liburing absent); on macOS
+            // it is the primary backend expressing unbuffered intent via F_NOCACHE.
+            return backend_->counters().ioUringFallback
+                       ? "POSIX pread/pwrite thread pool (io_uring fallback)"
+                       : "POSIX pread/pwrite thread pool (F_NOCACHE)";
+        case BackendKind::Mock:
+            return "Mock";
+    }
+    return "unknown";
+}
+
 // -------------------------------------------------------------------------------------------------
 // SequentialReader
 // -------------------------------------------------------------------------------------------------

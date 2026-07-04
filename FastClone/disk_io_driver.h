@@ -77,6 +77,10 @@ public:
 
     IoCounters counters() const;
 
+    // Human-readable name of the active platform backend (e.g. "Linux io_uring"), for a one-line
+    // startup diagnostic. Reflects the runtime choice, including the io_uring -> pool fallback.
+    std::string backendName() const;
+
     const IoDriverConfig& config() const { return cfg_; }
 
     // Test-only (cfg.recordSchedule): the direction of each submitted op, in submission order,

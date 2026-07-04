@@ -1900,6 +1900,7 @@ int RunServer(const CliOptions& options) {
     GetServerHashMemCache().Configure(options.enableHashMemcache);
     GetBlockSigMemCache().Configure(options.enableHashMemcache);
     std::cout << "FastClone server root=" << options.rootDir.string() << " port=" << options.port << std::endl;
+    std::cout << "[disk-io] backend=" << GetServerDiskIoDriver().backendName() << std::endl;
     std::cout << "[hash-pool] workers=" << hashWorkerCount
               << (options.serverHashWorkers == 0 ? " (auto)" : " (manual)")
               << std::endl;

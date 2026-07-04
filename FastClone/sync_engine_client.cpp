@@ -961,6 +961,7 @@ int RunClient(const CliOptions& options) {
     // so fairness + backpressure apply across the whole client (design §3.2/§5.4).
     fc::io::IoDriverConfig clientIoCfg;
     fc::io::DiskIoDriver clientDriver(clientIoCfg);
+    std::cout << "[disk-io] backend=" << clientDriver.backendName() << std::endl;
 
     // Directory creation is offloaded to a small worker pool. With deep trees the
     // manifest can carry millions of directory entries; calling fs::create_directories
