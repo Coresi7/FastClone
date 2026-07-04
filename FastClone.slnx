@@ -10,4 +10,8 @@
   <Project Path="FastClone/FastCloneTests.vcxproj" Id="F5A2C7D4-1B3E-4A8C-9D6F-0E2B4C6A8D10">
     <Build Project="false" />
   </Project>
+  <Project Path="FastCheck/FastCheck.vcxproj" Id="A4C5E6F0-1234-5678-9ABC-DEF012345678" />
+  <Project Path="FastCheck/FastCheckTests.vcxproj" Id="B5D6F7A1-2345-6789-0ABC-DEF123456789">
+    <Build Project="false" />
+  </Project>
 </Solution>

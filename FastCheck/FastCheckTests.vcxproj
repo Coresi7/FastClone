@@ -22,8 +22,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{6d4e0a99-a0c7-46f5-b71f-1e5d9bb1a13b}</ProjectGuid>
-    <RootNamespace>FastClone</RootNamespace>
+    <ProjectGuid>{B5D6F7A1-2345-6789-0ABC-DEF123456789}</ProjectGuid>
+    <RootNamespace>FastCheckTests</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -74,17 +74,25 @@
 
   <PropertyGroup Label="UserMacros" />
 
+  <!-- Dedicated IntDir so shared .cpp objs never collide with FastCheck/FastClone IntDirs.
+       Mirrors FastCheck.vcxproj; xxhash via vcpkg integrate (no machine-local paths). -->
+  <PropertyGroup>
+    <IntDir>$(Platform)\$(Configuration)\FastCheckTests\</IntDir>
+  </PropertyGroup>
+
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\FastClone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -96,13 +104,15 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\FastClone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -112,13 +122,15 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\FastClone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -130,13 +142,15 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);..\FastClone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
        <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
        <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -144,49 +158,33 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClInclude Include="cli.h" />
-    <ClInclude Include="client_handshake.h" />
-    <ClInclude Include="compare_phase.h" />
-    <ClInclude Include="delta.h" />
-    <ClInclude Include="disk_io_align.h" />
-    <ClInclude Include="disk_io_backend.h" />
-    <ClInclude Include="disk_io_backend_pool.h" />
-    <ClInclude Include="disk_io_driver.h" />
-    <ClInclude Include="file_index.h" />
-    <ClInclude Include="hash_memcache.h" />
-    <ClInclude Include="link_scheduler.h" />
-    <ClInclude Include="net_topology.h" />
-    <ClInclude Include="protocol.h" />
-    <ClInclude Include="protocol_codec.h" />
-    <ClInclude Include="read_gate.h" />
-    <ClInclude Include="sync_engine.h" />
-    <ClInclude Include="sync_engine_internal.h" />
-    <ClInclude Include="sync_util.h" />
-    <ClInclude Include="transfer_tuning.h" />
-    <ClInclude Include="win_socket.h" />
+    <ClInclude Include="check_cli.h" />
+    <ClInclude Include="check_engine.h" />
+    <ClInclude Include="check_options.h" />
+    <ClInclude Include="check_report.h" />
+    <ClInclude Include="..\FastClone\client_handshake.h" />
+    <ClInclude Include="..\FastClone\compare_phase.h" />
+    <ClInclude Include="..\FastClone\file_index.h" />
+    <ClInclude Include="..\FastClone\protocol.h" />
+    <ClInclude Include="..\FastClone\protocol_codec.h" />
+    <ClInclude Include="..\FastClone\win_socket.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="cli.cpp" />
-    <ClCompile Include="client_handshake.cpp" />
-    <ClCompile Include="compare_phase.cpp" />
-    <ClCompile Include="delta.cpp" />
-    <ClCompile Include="disk_io_align.cpp" />
-    <ClCompile Include="disk_io_driver.cpp" />
-    <ClCompile Include="disk_io_backend_win.cpp" />
-    <ClCompile Include="disk_io_backend_posix.cpp" />
-    <ClCompile Include="disk_io_backend_uring.cpp" />
-    <ClCompile Include="file_index.cpp" />
-    <ClCompile Include="hash_memcache.cpp" />
-    <ClCompile Include="main.cpp" />
-    <ClCompile Include="net_topology.cpp" />
-    <ClCompile Include="protocol.cpp" />
-    <ClCompile Include="protocol_codec.cpp" />
-    <ClCompile Include="sync_engine_shared.cpp" />
-    <ClCompile Include="sync_engine_server.cpp" />
-    <ClCompile Include="sync_engine_client.cpp" />
-    <ClCompile Include="sync_util.cpp" />
-    <ClCompile Include="transfer_tuning.cpp" />
-    <ClCompile Include="win_socket.cpp" />
+    <!-- Shared production sources under test (mirrors CMake FastCheckTests). -->
+    <ClCompile Include="check_cli.cpp" />
+    <ClCompile Include="check_engine.cpp" />
+    <ClCompile Include="check_report.cpp" />
+    <ClCompile Include="..\FastClone\compare_phase.cpp" />
+    <ClCompile Include="..\FastClone\file_index.cpp" />
+    <ClCompile Include="..\FastClone\client_handshake.cpp" />
+    <ClCompile Include="..\FastClone\protocol.cpp" />
+    <ClCompile Include="..\FastClone\protocol_codec.cpp" />
+    <ClCompile Include="..\FastClone\win_socket.cpp" />
+    <!-- Test sources (no check_main.cpp). -->
+    <ClCompile Include="tests\test_main.cpp" />
+    <ClCompile Include="tests\test_check_cli.cpp" />
+    <ClCompile Include="tests\test_check_engine.cpp" />
+    <ClCompile Include="tests\test_check_report.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
