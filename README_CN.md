@@ -46,7 +46,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
@@ -59,6 +59,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--aux-weight`：传输调度中每条辅助链路的排序权重；默认 `1.0`，范围 `(0,16]`（首要链路固定为 `1.0`）。值越大，越多文件传输按比例倾斜到辅助链路
 - `--large-file-lane`：大文件（`>= --large-file-threshold`）在各链路间的路由方式：`primary`（固定走首要链路）、`aux`（与普通文件一样按权重调度）、`auto`（`--aux-weight >= 2.0` 时倾向辅助链路，否则固定走首要链路）；默认 `auto`
 - `--delta-min-size`：对 `>=` 该大小、且发生变化的文件启用**二进制增量（delta）**传输——只下载变化的字节范围而非整文件，依据本地旧副本做匹配（灵感来自rsync。滚动校验 + XXH3-128，独立 MIT 实现）。默认 `0`（**关闭**）；设为正值（范围 `1M..1T`，支持 `K/M/G` 后缀）即开启。与 `--large-file-threshold` 相互独立。需要两端均为 FC7 协议（见下文「二进制增量传输」）
+- `--unbuffered-writes`：**仅客户端**，默认**关闭**。开启后，客户端**全部**文件内容写入——整文件 / 碎文件批量、普通单文件下载、以及 delta 复制/范围重建写——都经统一磁盘 IO 驱动以**无缓冲写意图**落盘（Windows `FILE_FLAG_NO_BUFFERING`、Linux `O_DIRECT`、macOS `F_NOCACHE`），使下载数据绕过系统页缓存、不在过滤驱动下堆积脏页。子扇区尾部与未对齐片段自动回退为缓冲写；无论开关是否开启，最终文件大小与内容都逐字节一致。与 `--queued-file-size` 配合时，接收侧受**同一预算**约束（接收队列 **加上** 待写/在飞的磁盘写），磁盘写落后不会使常驻/脏页集合增长超过阈值。默认关闭 = 现有行为不变。（服务端拒绝：`server --unbuffered-writes` 会以「仅客户端」用法错误退出。）
 - `--tcp-send-buffer` / `--tcp-recv-buffer`：以字节为单位固定（pin）`SO_SNDBUF` / `SO_RCVBUF`（范围 `64K..1G`，支持 `K/M/G` 后缀）；默认 `0` = 交给内核自动伸缩窗口。高 RTT 链路上推荐保持 `0`：内核的接收窗口自动伸缩（Linux `tcp_moderate_rcvbuf`、Windows Receive Window Auto-Tuning）会按带宽时延积（BDP）放大窗口，使单条连接也能跑满高 BDP 链路。显式指定一个值会**关闭**该方向的自动伸缩并把窗口钉死。**Windows 注意事项：** 若系统级关闭了接收窗口自动伸缩（部分「优化工具」或组策略会将其设为 `disabled`，可用 `netsh interface tcp show global` 查看），默认 `0` 会回退到 Windows 较小的系统默认值（约 64KB），从而拖慢高 RTT 吞吐。这类机器上请显式设置 `--tcp-recv-buffer`（例如 `--tcp-recv-buffer 32M`）以恢复较大的固定窗口，或用 `netsh int tcp set global autotuninglevel=normal` 重新启用自动伸缩
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用

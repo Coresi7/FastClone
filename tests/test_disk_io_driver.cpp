@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -583,6 +584,196 @@ void TestRealBackend() {
     RealBackendRoundTrip((2u << 20) + 12345, 14);  // 2 MiB + unaligned EOF tail (FR-11 tail)
 }
 
+// unbuffered-writes real-backend round-trip that exercises small-file write sizes AND unaligned
+// MIDDLE fragments (delta copy/range shape). Verifies byte-exactness and the D-02/D-03 counters.
+void RealBackendSmallSizes() {
+    namespace fs = std::filesystem;
+    // V-11 (AC-12): 1B / 4097B / (1MiB-1)B write files round-trip byte-exact at the exact size,
+    // and (D-02) a small WRITE open with unbuffered intent is NOT downgraded via smallFileFallback.
+    for (uint64_t size : {uint64_t(1), uint64_t(4097), uint64_t((1u << 20) - 1)}) {
+        const fs::path tmp = fs::temp_directory_path() /
+                             ("fc_ubw_small_" + std::to_string(size) + ".bin");
+        const std::string path = tmp.string();
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 91u);
+        IoDriverConfig cfg;
+        cfg.chunkBytes = 1u << 20;
+        DiskIoDriver drv(cfg);
+        const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/true, size);
+        Require(wf != 0, "ubw small: open write");
+        // D-02: writes are never downgraded to buffered by total file size (small-file gate is
+        // read-only now), so no write open bumps smallFileFallback.
+        Require(drv.counters().smallFileFallback == 0,
+                "ubw small: write open must not smallFileFallback (D-02)");
+        std::vector<IoRequest> batch(1);
+        batch[0].kind = OpKind::Write;
+        batch[0].fileId = wf;
+        batch[0].offset = 0;
+        batch[0].length = static_cast<uint32_t>(size);
+        batch[0].data = payload;
+        while (!batch.empty()) {
+            if (drv.submit(batch) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::vector<IoCompletion> comps;
+        Require(DrainUntil(drv, 1, comps, 15000) == 1, "ubw small: write completion");
+        Require(comps[0].status != IoStatus::Error, "ubw small: write op error");
+        drv.closeFile(wf);
+        Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == size, "ubw small: on-disk size");
+
+        DiskIoDriver rdrv(cfg);
+        const uint64_t rf = rdrv.openFile(path, OpKind::Read, /*unbuffered=*/true, size);
+        Require(rf != 0, "ubw small: open read");
+        SequentialReader reader(rdrv, rf, size, cfg.chunkBytes, 4);
+        std::vector<uint8_t> got;
+        for (;;) {
+            std::vector<uint8_t> chunk;
+            bool ok = true;
+            const uint32_t n = reader.next(chunk, ok);
+            Require(ok, "ubw small: read error");
+            if (n == 0) break;
+            got.insert(got.end(), chunk.begin(), chunk.end());
+        }
+        rdrv.closeFile(rf);
+        Require(got == payload, "ubw small: round-trip bytes mismatch (AC-12)");
+        fs::remove(tmp, ec);
+    }
+}
+
+// unbuffered-writes D-03 (R-01) / V-08: random-access temp shape with an aligned region, an
+// unaligned MIDDLE fragment, and an aligned EOF region. The unaligned middle write MUST NOT clobber
+// its neighbouring bytes (the old win bug AlignUp+zero-padded a middle op past its logical range).
+// Byte-exactness is asserted unconditionally across all three platform backends.
+void TestUnbufferedRandomWriteNoPollution() {
+    namespace fs = std::filesystem;
+    IoDriverConfig cfg;
+    cfg.chunkBytes = 1u << 20;
+    DiskIoDriver drv(cfg);
+
+    const fs::path tmp = fs::temp_directory_path() / "fc_ubw_random.bin";
+    const std::string path = tmp.string();
+    std::error_code ec;
+    fs::remove(tmp, ec);
+
+    const uint32_t g = drv.queryAlign(path).ioGranularity;
+    Require(g >= 2, "ubw random: granularity");
+    const uint64_t size = static_cast<uint64_t>(g) * 3;  // aligned EOF at 3*g
+    const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 77u);
+
+    const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/true, size);
+    Require(wf != 0, "ubw random: open write");
+
+    // Four non-overlapping ops that together cover [0,3g): op0 aligned sector 0; op1 aligned-offset
+    // but sub-sector LENGTH middle fragment; op2 unaligned-offset middle fragment completing sector
+    // 1; op3 aligned EOF sector 2. No sector is written by both the unbuffered and buffered handle.
+    struct Seg { uint64_t off; uint32_t len; };
+    const std::vector<Seg> segs = {
+        {0, g},
+        {g, g / 2},
+        {static_cast<uint64_t>(g) + g / 2, g - g / 2},
+        {static_cast<uint64_t>(g) * 2, g},
+    };
+    for (const Seg& s : segs) {
+        std::vector<IoRequest> one(1);
+        one[0].kind = OpKind::Write;
+        one[0].fileId = wf;
+        one[0].offset = s.off;
+        one[0].length = s.len;
+        one[0].data.assign(payload.begin() + static_cast<std::ptrdiff_t>(s.off),
+                           payload.begin() + static_cast<std::ptrdiff_t>(s.off + s.len));
+        while (!one.empty()) {
+            if (drv.submit(one) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::vector<IoCompletion> comps;
+    Require(DrainUntil(drv, segs.size(), comps, 15000) == segs.size(), "ubw random: completions");
+    for (const auto& c : comps) {
+        Require(c.status != IoStatus::Error, "ubw random: write op error");
+    }
+    drv.closeFile(wf);
+    Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == size, "ubw random: on-disk size");
+
+    DiskIoDriver rdrv(cfg);
+    const uint64_t rf = rdrv.openFile(path, OpKind::Read, /*unbuffered=*/false, size);
+    Require(rf != 0, "ubw random: open read");
+    SequentialReader reader(rdrv, rf, size, cfg.chunkBytes, 4);
+    std::vector<uint8_t> got;
+    for (;;) {
+        std::vector<uint8_t> chunk;
+        bool ok = true;
+        const uint32_t n = reader.next(chunk, ok);
+        Require(ok, "ubw random: read error");
+        if (n == 0) break;
+        got.insert(got.end(), chunk.begin(), chunk.end());
+    }
+    rdrv.closeFile(rf);
+    // The whole file must equal the payload: if the unaligned middle op zero-padded past its range
+    // (the old bug), the neighbouring bytes in sector 1 would differ here.
+    Require(got == payload, "ubw random: unaligned middle write clobbered neighbour (D-03)");
+    fs::remove(tmp, ec);
+}
+
+// unbuffered-writes: with the intent OFF, no op may take the unbuffered/direct path (M5 — off is
+// equivalent to buffered), and reads still honour the small-file downgrade gate.
+void TestUnbufferedOffAndReadGate() {
+    namespace fs = std::filesystem;
+    IoDriverConfig cfg;
+    cfg.chunkBytes = 1u << 20;
+    const fs::path tmp = fs::temp_directory_path() / "fc_ubw_off.bin";
+    const std::string path = tmp.string();
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    const uint64_t size = 2u << 20;  // 2 MiB, aligned: would go direct if intent were on
+    const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 55u);
+
+    {
+        DiskIoDriver drv(cfg);
+        const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/false, size);
+        Require(wf != 0, "ubw off: open write");
+        std::vector<IoRequest> batch;
+        for (uint64_t off = 0; off < size; off += cfg.chunkBytes) {
+            IoRequest r;
+            r.kind = OpKind::Write;
+            r.fileId = wf;
+            r.offset = off;
+            const uint64_t n = std::min<uint64_t>(cfg.chunkBytes, size - off);
+            r.data.assign(payload.begin() + static_cast<std::ptrdiff_t>(off),
+                          payload.begin() + static_cast<std::ptrdiff_t>(off + n));
+            r.length = static_cast<uint32_t>(n);
+            batch.push_back(std::move(r));
+        }
+        const size_t count = batch.size();
+        while (!batch.empty()) {
+            if (drv.submit(batch) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::vector<IoCompletion> comps;
+        Require(DrainUntil(drv, count, comps, 15000) == count, "ubw off: write completions");
+        drv.closeFile(wf);
+        // M5: intent off => never direct IO; every op used the buffered handle.
+        Require(drv.counters().directIo == 0, "ubw off: no direct IO when intent off");
+    }
+    // Read-path small-file gate is retained: a small READ with unbuffered intent still downgrades.
+    {
+        const fs::path small = fs::temp_directory_path() / "fc_ubw_read_small.bin";
+        std::error_code sec;
+        fs::remove(small, sec);
+        {
+            std::ofstream os(small, std::ios::binary);
+            const std::vector<uint8_t> tiny = RandomBytes(4096, 22u);
+            os.write(reinterpret_cast<const char*>(tiny.data()),
+                     static_cast<std::streamsize>(tiny.size()));
+        }
+        DiskIoDriver drv(cfg);
+        const uint64_t rf = drv.openFile(small.string(), OpKind::Read, /*unbuffered=*/true, 0);
+        Require(rf != 0, "ubw read gate: open read");
+        Require(drv.counters().smallFileFallback >= 1,
+                "ubw read gate: small read still downgrades (read gate retained)");
+        drv.closeFile(rf);
+        fs::remove(small, sec);
+    }
+    fs::remove(tmp, ec);
+}
+
 #if defined(__linux__)
 // F1 (AC-01/02/03): fully aligned unbuffered ops on the POSIX pool must take the aligned direct IO
 // path (internal bounce buffer), NOT a per-op buffered fallback. The differentiator is
@@ -708,6 +899,9 @@ void RunDiskIoDriverTests() {
     TestSequentialReaderEarlyEof();
     TestSequentialReaderCleanEof();
     TestRealBackend();
+    RealBackendSmallSizes();
+    TestUnbufferedRandomWriteNoPollution();
+    TestUnbufferedOffAndReadGate();
 #if defined(__linux__)
     TestPosixPoolAlignedDirectIo();
     TestUringFallbackCounter();

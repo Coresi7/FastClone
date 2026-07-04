@@ -69,10 +69,15 @@ public:
         pf.expectedSize = expectedSize;
         pf.align = QueryAlign(path);
 
+        // unbuffered-writes M4/FR-13/D-02: keep the small-file (< kSmallFileBufferedMax) whole-file
+        // downgrade ONLY for reads (read opens pass expectedSize==0 so they stay buffered, zero
+        // regression). Write opens with unbuffered intent stay unbuffered regardless of size;
+        // sub-granularity / unaligned fragments already fall back per-op in DoPwrite (D-03).
         const bool wantUnbuffered =
-            unbuffered && !cfg_.forceBuffered && expectedSize >= kSmallFileBufferedMax;
-        if (unbuffered && !wantUnbuffered) {
-            counters_.smallFileFallback.fetch_add(1);  // downgraded because file is small (FR-11)
+            unbuffered && !cfg_.forceBuffered &&
+            (mode == OpKind::Read ? expectedSize >= kSmallFileBufferedMax : true);
+        if (unbuffered && !wantUnbuffered && mode == OpKind::Read) {
+            counters_.smallFileFallback.fetch_add(1);  // read small-file downgrade (FR-11)
         }
 
         const int base = (mode == OpKind::Write) ? (O_WRONLY | O_CREAT) : O_RDONLY;
@@ -120,8 +125,11 @@ public:
             pf = std::move(it->second);
             files_.erase(it);
         }
-        if (pf.mode == OpKind::Write && pf.expectedSize > 0 && pf.fd >= 0) {
-            ::ftruncate(pf.fd, static_cast<off_t>(pf.expectedSize));  // exact final size (FR-11)
+        // Exact final size on every write close (FR-11). Truncating unconditionally also gives the
+        // driver write path ofstream-trunc-equivalent overwrite semantics (a pre-existing target is
+        // trimmed to expectedSize, incl. 0 for an empty file, so no stale tail bytes survive).
+        if (pf.mode == OpKind::Write && pf.fd >= 0) {
+            ::ftruncate(pf.fd, static_cast<off_t>(pf.expectedSize));
         }
         if (pf.fd >= 0) {
             ::close(pf.fd);
@@ -167,6 +175,15 @@ public:
             }
         }
         workers_.clear();
+        // Defensive: close any fds a caller left open so a leaked fileId (e.g. an abandoned
+        // download/temp when a session tears down for reconnect) never leaks an OS fd.
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& kv : files_) {
+            if (kv.second.fd >= 0) {
+                ::close(kv.second.fd);
+            }
+        }
+        files_.clear();
     }
 
     BackendCounters counters() const override { return counters_.snapshot(); }

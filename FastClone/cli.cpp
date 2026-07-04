@@ -50,7 +50,7 @@ void PrintUsage() {
         << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         << "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
-        << "      [--delta-min-size <size>]\n"
+        << "      [--delta-min-size <size>] [--unbuffered-writes]\n"
         << "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         << "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
         << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
@@ -63,6 +63,11 @@ void PrintUsage() {
         << "      --aux-weight >= 2.0, else primary); default auto.\n"
         << "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
         << "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
+        << "  --unbuffered-writes (client-only, default off) routes all client file-content writes\n"
+        << "      through the unified disk IO driver with unbuffered write intent (bypasses the OS\n"
+        << "      page cache); final file size/content are byte-identical. Combined with\n"
+        << "      --queued-file-size, the receive side is throttled by a single budget covering the\n"
+        << "      receive queue and pending/outstanding disk writes.\n"
         << "  --tcp-send-buffer / --tcp-recv-buffer pin SO_SNDBUF/SO_RCVBUF (suffix K|M|G, range\n"
         << "      64K..1G); default 0 = kernel autotuning (recommended on high-RTT links: the\n"
         << "      window scales to the BDP). Pinning a value disables autotuning for that\n"
@@ -373,6 +378,10 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.serverHashWorkers = static_cast<uint32_t>(workers);
         } else if (arg == "--enable-hash-memcache") {
             options.enableHashMemcache = true;
+        } else if (arg == "--unbuffered-writes") {
+            // Client-only unbuffered write intent (unbuffered-writes FR-01). No value; repeated
+            // occurrences stay idempotent (each just re-sets true). server-only rejection below.
+            options.unbufferedWrites = true;
         } else if (arg == "--once") {
             options.exitAfterSync = true;
         } else if (arg == "--once-multi") {
@@ -418,6 +427,11 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     }
     if (options.mode == Mode::Client && options.enableHashMemcache) {
         throw std::runtime_error("--enable-hash-memcache is server-only");
+    }
+    // --unbuffered-writes is client-only (unbuffered-writes FR-02 / AC-03); reject on the server
+    // with a client-only-tagged message.
+    if (options.mode == Mode::Server && options.unbufferedWrites) {
+        throw std::runtime_error("--unbuffered-writes is client-only");
     }
     if (options.mode == Mode::Client && options.exitAfterSync) {
         throw std::runtime_error("--once is server-only");

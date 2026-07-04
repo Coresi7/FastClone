@@ -494,10 +494,16 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
 }
 
 struct DownloadState {
-    std::ofstream output;
+    // unbuffered-writes FR-05/AC-06: single-file download content is written through the unified
+    // disk IO driver (no std::ofstream). `writeBuffer` holds not-yet-submitted bytes; full aligned
+    // driver-chunks are submitted as FileChunks arrive, the sub-chunk tail on FileEnd.
     std::string relPath;
     std::vector<uint8_t> writeBuffer;
-    size_t flushThreshold = 0;
+    uint64_t fileId = 0;          // driver write handle (0 => not open / failed)
+    uint64_t nextWriteOffset = 0;  // offset of the next write op (== bytes already submitted)
+    uint32_t submittedWrites = 0;
+    uint32_t completedWrites = 0;
+    bool writeError = false;
 };
 
 struct BatchDownloadEntry {
@@ -591,6 +597,9 @@ int RunClient(const CliOptions& options) {
     const bool debugEnabled = IsDebugEnabled();
     // --diag flag OR FASTCLONE_DIAG env var enables diagnostics (design §A.3).
     const bool diagnostics = options.diagnostics || IsDiagEnabled();
+    // unbuffered-writes M1/FR-12: single read-only intent threaded through every client write open
+    // (whole-file/batch, single-file streaming, delta copy/range). Default false = zero regression.
+    const bool unbufferedWrites = options.unbufferedWrites;
     const TunedTransferOptions tuned = ResolveTransferOptions(options);
     const uint32_t streamLimit = tuned.streamLimit;
     const uint32_t effectiveChunkSize = EffectiveChunkSizeForStreams(tuned.chunkSize, streamLimit);
@@ -830,7 +839,14 @@ int RunClient(const CliOptions& options) {
         Hash256 verifyHash{};        // full-file XXH3-128 for the FR-23 reconstruction check
         uint64_t newFileBytes = 0;
         std::filesystem::path tempPath;
-        std::ofstream tempOut;       // random-access reconstruction writer
+        // unbuffered-writes FR-06/FR-07: reconstruction temp is written through the unified driver
+        // (no std::ofstream). copy writes (onCopy) are submitted+drained on the plan worker; range
+        // writes are submitted on the main loop. submitted/completed drive the finalize write gate
+        // (FR-08/D-06); the copy phase seeds submitted==completed via the plan result.
+        uint64_t tempFileId = 0;     // driver write handle for the temp (0 => not open)
+        uint32_t submittedWrites = 0;  // onCopy + range writes accepted by the driver
+        uint32_t completedWrites = 0;  // reaped write completions
+        bool writeError = false;       // any short write / driver error -> reconstruct_io fallback
         uint32_t pendingRanges = 0;  // outstanding miss-range tasks (DeltaRangeEnd decrements)
         bool sigReceived = false;    // guards duplicate BlockSigResponse (failover re-request)
     };
@@ -874,7 +890,14 @@ int RunClient(const CliOptions& options) {
         uint64_t newFileBytes = 0;
         Hash256 verifyHash{};
         std::filesystem::path tempPath;
-        std::ofstream tempOut;
+        // unbuffered-writes FR-06: the plan worker opens the temp on the driver and submits + drains
+        // all copy (onCopy) writes itself, so by the time the main loop applies the result the copy
+        // phase is complete. It hands the still-open handle + copy write counts to the main loop,
+        // which continues with range writes on the same handle.
+        uint64_t tempFileId = 0;
+        uint32_t submittedWrites = 0;  // copy writes submitted by the worker
+        uint32_t completedWrites = 0;  // copy write completions reaped by the worker
+        bool writeError = false;       // copy write short/error -> reconstruct_io fallback
         std::vector<DeltaRangeTask> ranges;
         delta::DeltaStats stats{};
     };
@@ -940,6 +963,11 @@ int RunClient(const CliOptions& options) {
     std::deque<IoWriteResult> ioResults;
     std::atomic<bool> ioStop = false;
     std::atomic<uint64_t> ioInFlightBytes = 0;
+    // unbuffered-writes FR-09/D-05: bytes submitted to the unified driver's WRITE queue but not yet
+    // reaped as completions (single-file streaming + delta copy/range + batch whole-file). Added on
+    // submit (+op length), subtracted on completion (-requested). Combined with incomingQueuedBytes
+    // and ioInFlightBytes it forms the single --queued-file-size backpressure budget (§3.6).
+    std::atomic<uint64_t> driverWriteOutstandingBytes{0};
     // Main-thread only: number of files dispatched to the I/O pool whose result has not
     // yet been handled. Used as a completion-gate term so the sync does not finish while
     // writes are still pending.
@@ -1158,10 +1186,19 @@ int RunClient(const CliOptions& options) {
     std::atomic<bool> recvClosed = false;
     std::string recvError;
     auto applyRecvBackpressure = [&](uint64_t queuedBytesSnapshot) {
-        if (queuedBytesSnapshot <= incomingSoftLimitBytes) {
+        // unbuffered-writes M3/FR-09/FR-10/D-05: throttle recv against the SINGLE budget = network
+        // receive queue + write-pool buffered bytes + bytes outstanding in the driver write queue,
+        // so disk-write lag (not just network backlog) reins in the receive side. With the switch
+        // off driverWriteOutstandingBytes is still maintained by the batch whole-file path; the
+        // extra terms only raise pressure when writes genuinely fall behind (bounded sleeps only,
+        // control frames keep flowing -> FR-11 / R-03).
+        const uint64_t pressure = queuedBytesSnapshot +
+                                  ioInFlightBytes.load(std::memory_order_relaxed) +
+                                  driverWriteOutstandingBytes.load(std::memory_order_relaxed);
+        if (pressure <= incomingSoftLimitBytes) {
             return;
         }
-        const uint64_t over = queuedBytesSnapshot - incomingSoftLimitBytes;
+        const uint64_t over = pressure - incomingSoftLimitBytes;
         uint64_t sleepUs = 300;
         if (over > incomingSoftLimitBytes * 2) {
             sleepUs = 5000;
@@ -1651,8 +1688,10 @@ int RunClient(const CliOptions& options) {
     auto driverWriteWholeFile = [&](const std::string& path,
                                     const std::vector<uint8_t>& data) -> bool {
         const uint64_t sz = data.size();
+        // unbuffered-writes FR-04/FR-12: express the CLI intent (was hard-coded true) so the switch
+        // controls the whole-file batch write too; off => buffered, content/size/mtime unchanged.
         const uint64_t fid =
-            clientDriver.openFile(path, fc::io::OpKind::Write, /*unbuffered=*/true, sz);
+            clientDriver.openFile(path, fc::io::OpKind::Write, unbufferedWrites, sz);
         if (fid == 0) {
             return false;
         }
@@ -1663,8 +1702,10 @@ int RunClient(const CliOptions& options) {
         uint64_t off = 0;
         uint32_t inflight = 0;
         std::vector<fc::io::IoCompletion> comps;
-        while (ok && (off < sz || inflight > 0)) {
-            while (off < sz && inflight < kWindow) {
+        // Loop until every submitted op has been reaped (even after an error): closing while ops are
+        // in flight would leak driverWriteOutstandingBytes (FR-09). Stop SUBMITTING new ops on error.
+        while (off < sz || inflight > 0) {
+            while (ok && off < sz && inflight < kWindow) {
                 const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(chunk, sz - off));
                 std::vector<fc::io::IoRequest> one(1);
                 one[0].kind = fc::io::OpKind::Write;
@@ -1677,6 +1718,7 @@ int RunClient(const CliOptions& options) {
                 if (clientDriver.submit(one) == 0) {
                     break;  // write queue full; drain in-flight below then retry
                 }
+                driverWriteOutstandingBytes.fetch_add(len, std::memory_order_relaxed);
                 off += len;
                 ++inflight;
             }
@@ -1690,6 +1732,7 @@ int RunClient(const CliOptions& options) {
                 if (inflight > 0) {
                     --inflight;
                 }
+                driverWriteOutstandingBytes.fetch_sub(c.requested, std::memory_order_relaxed);
                 if (c.status == fc::io::IoStatus::Error || c.transferred != c.requested) {
                     ok = false;
                 }
@@ -1697,6 +1740,66 @@ int RunClient(const CliOptions& options) {
         }
         clientDriver.closeFile(fid);
         return ok;
+    };
+
+    // unbuffered-writes C8 (§3.4/§3.5): reap + account WRITE completions for ONE driver file handle.
+    // Advances `completed`, drops the outstanding-bytes budget by each op's requested length and
+    // latches `writeError` on any short write / error. Non-blocking; the per-file completion gate
+    // loops with waitForFile.
+    auto reapDriverWrites = [&](uint64_t fileId, uint32_t& completed, bool& writeError) {
+        if (fileId == 0) {
+            return;
+        }
+        std::vector<fc::io::IoCompletion> comps;
+        clientDriver.drainCompletionsForFile(fileId, comps);
+        for (const fc::io::IoCompletion& c : comps) {
+            ++completed;
+            driverWriteOutstandingBytes.fetch_sub(c.requested, std::memory_order_relaxed);
+            if (c.status == fc::io::IoStatus::Error || c.transferred != c.requested) {
+                writeError = true;
+            }
+        }
+    };
+
+    // Submit ONE write op. When `blocking` (final flush / delta finalize) it retries until accepted,
+    // reaping completions to make room; otherwise returns false on a full write queue so the main
+    // loop keeps the bytes buffered and retries next frame (R-02, no control-plane stall). On accept
+    // it charges driverWriteOutstandingBytes (+len) and bumps `submitted`.
+    auto submitDriverWrite = [&](uint64_t fileId, uint64_t offset, const uint8_t* src, uint32_t len,
+                                 bool blocking, uint32_t& submitted, uint32_t& completed,
+                                 bool& writeError) -> bool {
+        std::vector<fc::io::IoRequest> one(1);
+        one[0].kind = fc::io::OpKind::Write;
+        one[0].fileId = fileId;
+        one[0].offset = offset;
+        one[0].length = len;
+        one[0].userTag = offset;
+        one[0].data.assign(src, src + len);
+        for (;;) {
+            if (clientDriver.submit(one) == 1) {
+                driverWriteOutstandingBytes.fetch_add(len, std::memory_order_relaxed);
+                ++submitted;
+                return true;
+            }
+            if (!blocking) {
+                return false;  // queue full: keep bytes buffered, retry later
+            }
+            reapDriverWrites(fileId, completed, writeError);
+            clientDriver.waitForFile(fileId, 1000);
+        }
+    };
+
+    // Per-file write completion gate (FR-08 / D-06): block until every submitted write for `fileId`
+    // has been reaped, so finalize/verify/close never race a still-in-flight write. Converges
+    // because the driver + backend workers drain independently of recv/main loop (R-03).
+    auto drainFileWritesToCompletion = [&](uint64_t fileId, uint32_t submitted, uint32_t& completed,
+                                           bool& writeError) {
+        while (completed < submitted) {
+            reapDriverWrites(fileId, completed, writeError);
+            if (completed < submitted) {
+                clientDriver.waitForFile(fileId, 1000);
+            }
+        }
     };
 
     // Async file-write worker pool (see IoWriteTask declaration). I/O-bound, so size it
@@ -2008,19 +2111,22 @@ int RunClient(const CliOptions& options) {
                 regularQueue->pop_front();
                 const fs::path abs = JoinRel(options.rootDir, rel);
                 EnsureParentDir(abs);
+                const uint64_t fileBytes =
+                    (itMeta != remoteFiles.end()) ? itMeta->second.fileSize : 0;
                 DownloadState d;
                 d.relPath = rel;
-                d.output.open(abs, std::ios::binary | std::ios::trunc);
-                if (!d.output) {
+                // unbuffered-writes FR-05: open the target on the unified driver instead of an
+                // ofstream. expectedSize=fileBytes lets the backend truncate to the exact size at
+                // close (ofstream-trunc-equivalent); fileId==0 is the former "!d.output" failure.
+                d.fileId = clientDriver.openFile(abs.string(), fc::io::OpKind::Write,
+                                                 unbufferedWrites, fileBytes);
+                if (d.fileId == 0) {
                     retryOrFail(rel);
                     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
                 } else {
                     const uint32_t sid = conn->nextStreamId++;
                     const uint64_t key = streamKey(conn->connId, sid);
-                    d.flushThreshold = downloadFlushThreshold;
-                    d.writeBuffer.reserve(d.flushThreshold);
-                    const uint64_t fileBytes =
-                        (itMeta != remoteFiles.end()) ? itMeta->second.fileSize : 0;
+                    d.writeBuffer.reserve(downloadFlushThreshold);
                     activeDownloads.emplace(key, std::move(d));
                     streamToPath.emplace(key, rel);
                     try {
@@ -2051,12 +2157,33 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    auto flushBufferedWrites = [&](DownloadState& d) {
-        if (d.writeBuffer.empty()) {
+    // unbuffered-writes FR-05: submit buffered single-file bytes to the driver. Full sector-aligned
+    // driver-chunks go first (unbuffered fast path); on FileEnd (`flushTail`) the final sub-chunk
+    // tail is flushed too, blocking until accepted. Non-flush submits are best-effort: a full write
+    // queue leaves the remainder buffered for the next frame (R-02, no control-plane stall).
+    auto pumpDownloadWrites = [&](DownloadState& d, bool flushTail) {
+        if (d.fileId == 0) {
             return;
         }
-        d.output.write(reinterpret_cast<const char*>(d.writeBuffer.data()), static_cast<std::streamsize>(d.writeBuffer.size()));
-        d.writeBuffer.clear();
+        const uint32_t chunk =
+            clientDriver.config().chunkBytes == 0 ? (1u << 20) : clientDriver.config().chunkBytes;
+        while (d.writeBuffer.size() >= chunk) {
+            if (!submitDriverWrite(d.fileId, d.nextWriteOffset, d.writeBuffer.data(), chunk,
+                                   flushTail, d.submittedWrites, d.completedWrites, d.writeError)) {
+                break;  // queue full (non-flush): keep the remainder buffered, retry next frame
+            }
+            d.nextWriteOffset += chunk;
+            d.writeBuffer.erase(d.writeBuffer.begin(),
+                                d.writeBuffer.begin() + static_cast<std::ptrdiff_t>(chunk));
+            reapDriverWrites(d.fileId, d.completedWrites, d.writeError);
+        }
+        if (flushTail && !d.writeBuffer.empty()) {
+            const uint32_t len = static_cast<uint32_t>(d.writeBuffer.size());
+            submitDriverWrite(d.fileId, d.nextWriteOffset, d.writeBuffer.data(), len,
+                              /*blocking=*/true, d.submittedWrites, d.completedWrites, d.writeError);
+            d.nextWriteOffset += len;
+            d.writeBuffer.clear();
+        }
     };
 
     auto finalizeBatchEntry = [&](BatchDownloadEntry& entry) {
@@ -2274,9 +2401,26 @@ int RunClient(const CliOptions& options) {
             return;
         }
         DeltaFileState& st = it->second;
-        if (st.tempOut.is_open()) {
-            st.tempOut.flush();
-            st.tempOut.close();
+        // unbuffered-writes FR-08/D-06: gate on every copy + range write completing before the
+        // verify read / rename, so the verify never races a still-in-flight write. Then close the
+        // temp handle (SetEndOfFile/ftruncate -> exact size, trimming any tail beyond newFileBytes).
+        drainFileWritesToCompletion(st.tempFileId, st.submittedWrites, st.completedWrites,
+                                    st.writeError);
+        const bool tempWriteOk = !st.writeError;
+        if (st.tempFileId != 0) {
+            clientDriver.closeFile(st.tempFileId);
+            st.tempFileId = 0;
+        }
+        if (!tempWriteOk) {
+            // A copy/range write failed: discard + fall back to a full download (FR-16), same as
+            // the former ofstream/reconstruct_io failure path.
+            std::error_code rec;
+            fs::remove(st.tempPath, rec);
+            deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
+            deltaAbandoned.insert(rel);
+            deltaStates.erase(it);
+            scheduleTransfer(rel);
+            return;
         }
         if (!st.tempPath.empty() && !SyncFileToDisk(st.tempPath)) {
             std::error_code rec;
@@ -2420,18 +2564,20 @@ int RunClient(const CliOptions& options) {
             return res;
         }
 
-        // Preallocate the temp up front so copy captures ("命中即捕获", design D-01 A) can seek and
-        // write into it during the SAME scan pass -- no second read, no whole-file buffer.
+        // unbuffered-writes FR-06/M2: open the reconstruction temp on the unified driver so copy
+        // captures ("命中即捕获", design D-01 A) write straight into it during the SAME scan pass.
+        // No manual preallocation: out-of-order copy/range writes land at their exact offsets and
+        // closeFile truncates to expectedSize=fileSize (trimming any temp tail beyond the new file,
+        // FR-14). copySubmitted/copyCompleted feed the plan worker's own copy-write gate below.
+        //
         EnsureParentDir(abs);
         const fs::path tmp = makeDeltaTempPath(abs);
-        std::ofstream out(tmp, std::ios::binary | std::ios::out | std::ios::trunc);
-        bool ioOk = static_cast<bool>(out);
-        if (ioOk && task.sig.fileSize > 0) {
-            // Preallocate to the final size so out-of-order range writes land correctly.
-            out.seekp(static_cast<std::streamoff>(task.sig.fileSize - 1), std::ios::beg);
-            out.put('\0');
-            ioOk = static_cast<bool>(out);
-        }
+        const uint64_t tempFileId = clientDriver.openFile(
+            tmp.string(), fc::io::OpKind::Write, unbufferedWrites, task.sig.fileSize);
+        bool ioOk = (tempFileId != 0);
+        uint32_t copySubmitted = 0;
+        uint32_t copyCompleted = 0;
+        bool copyWriteError = false;
 
         bool readErr = false;
         fc::io::SequentialReader reader(clientDriver, oldFileId, oldLen,
@@ -2468,13 +2614,14 @@ int RunClient(const CliOptions& options) {
         // content stays bit-identical to the former ReadWholeFile+BuildPlan path.
         delta::CopyCapturedFn onCopy = [&](uint64_t /*srcOffsetOld*/, uint64_t destOffsetNew,
                                            uint32_t len, const uint8_t* windowBytes) {
-            if (!ioOk) {
+            if (!ioOk || len == 0) {
                 return;
             }
-            out.seekp(static_cast<std::streamoff>(destOffsetNew), std::ios::beg);
-            out.write(reinterpret_cast<const char*>(windowBytes),
-                      static_cast<std::streamsize>(len));
-            ioOk = static_cast<bool>(out);
+            // Submit the copy bytes to the temp at their dest offset (blocking so no copy is lost).
+            // Unaligned middle fragments fall back to a buffered exact-length write in the backend
+            // (D-03) -- adjacent bytes are never clobbered, so the temp stays bit-identical.
+            submitDriverWrite(tempFileId, destOffsetNew, windowBytes, len, /*blocking=*/true,
+                              copySubmitted, copyCompleted, copyWriteError);
         };
 
         const delta::DeltaPlan plan =
@@ -2484,9 +2631,19 @@ int RunClient(const CliOptions& options) {
         res.newFileBytes = plan.newFileBytes;
         clientDriver.closeFile(oldFileId);
 
+        // Reap every copy write before handing the temp to the main loop (§3.5): the copy phase is
+        // fully drained here so finalize only has to gate the range writes. A copy write error is a
+        // reconstruct_io fallback (FR-16), same as the former ofstream write-failure path.
+        if (tempFileId != 0) {
+            drainFileWritesToCompletion(tempFileId, copySubmitted, copyCompleted, copyWriteError);
+        }
+        if (copyWriteError) {
+            ioOk = false;
+        }
+
         auto discardTemp = [&]() {
-            if (out.is_open()) {
-                out.close();
+            if (tempFileId != 0) {
+                clientDriver.closeFile(tempFileId);
             }
             std::error_code rec;
             fs::remove(tmp, rec);
@@ -2525,7 +2682,10 @@ int RunClient(const CliOptions& options) {
             }
         }
         res.tempPath = tmp;
-        res.tempOut = std::move(out);
+        res.tempFileId = tempFileId;
+        res.submittedWrites = copySubmitted;
+        res.completedWrites = copyCompleted;
+        res.writeError = copyWriteError;
         res.ok = true;
         return res;
     };
@@ -2536,9 +2696,11 @@ int RunClient(const CliOptions& options) {
     auto applyDeltaPlanResult = [&](DeltaPlanResult& res) {
         auto itState = deltaStates.find(res.rel);
         if (itState == deltaStates.end()) {
-            // File abandoned (e.g. DeltaError) while the plan was building: discard the temp.
-            if (res.tempOut.is_open()) {
-                res.tempOut.close();
+            // File abandoned (e.g. DeltaError) while the plan was building: close the temp handle
+            // (the worker already drained its copy writes) and discard the temp file.
+            if (res.tempFileId != 0) {
+                clientDriver.closeFile(res.tempFileId);
+                res.tempFileId = 0;
             }
             if (!res.tempPath.empty()) {
                 std::error_code rec;
@@ -2547,6 +2709,13 @@ int RunClient(const CliOptions& options) {
             return;
         }
         if (!res.ok) {
+            // On fallback the worker's temp handle (if opened) is closed by buildDeltaPlanOffloaded's
+            // discardTemp for its own error paths; a not-ok result that still carries a live handle
+            // (shouldn't normally happen) is closed here to avoid a driver handle leak.
+            if (res.tempFileId != 0) {
+                clientDriver.closeFile(res.tempFileId);
+                res.tempFileId = 0;
+            }
             deltaFallback(res.rel, res.fallbackReason.c_str(), res.downloadBytes, res.newFileBytes,
                           res.benefitRejected ? &res.stats : nullptr);
             deltaAbandoned.insert(res.rel);
@@ -2558,7 +2727,13 @@ int RunClient(const CliOptions& options) {
         st.verifyHash = res.verifyHash;
         st.newFileBytes = res.newFileBytes;
         st.tempPath = res.tempPath;
-        st.tempOut = std::move(res.tempOut);
+        // Adopt the worker's still-open temp handle + copy-write counts; range writes continue on
+        // the same handle (FR-07). submitted==completed here (copy phase drained by the worker).
+        st.tempFileId = res.tempFileId;
+        st.submittedWrites = res.submittedWrites;
+        st.completedWrites = res.completedWrites;
+        st.writeError = res.writeError;
+        res.tempFileId = 0;  // ownership moved to the delta state
         const uint32_t rangeCount = static_cast<uint32_t>(res.ranges.size());
         for (DeltaRangeTask& r : res.ranges) {
             pendingDeltaRanges.push_back(std::move(r));
@@ -2853,27 +3028,38 @@ int RunClient(const CliOptions& options) {
             }
             DownloadState& d = it->second;
             d.writeBuffer.insert(d.writeBuffer.end(), frame.payload.begin(), frame.payload.end());
-            if (d.writeBuffer.size() >= d.flushThreshold) {
-                flushBufferedWrites(d);
-            }
+            // Submit full aligned driver-chunks as they accumulate; keep the sub-chunk remainder
+            // buffered for the FileEnd tail flush (unbuffered-writes FR-05).
+            pumpDownloadWrites(d, /*flushTail=*/false);
         } else if (frame.type == MsgType::FileEnd) {
             auto it = activeDownloads.find(key);
             if (it == activeDownloads.end()) {
                 if (staleFromDeadLane()) { return; }
                 throw std::runtime_error("Received end for unknown stream");
             }
-            flushBufferedWrites(it->second);
-            it->second.output.flush();
-            it->second.output.close();
-            const std::string rel = it->second.relPath;
-            const FileEntry& meta = remoteFiles.at(rel);
-            SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
+            DownloadState& d = it->second;
+            const std::string rel = d.relPath;
+            // Flush the final tail, then gate on every write completing before close/mtime/counter
+            // (FR-08/D-06). closeFile truncates to the exact size (ofstream-trunc-equivalent).
+            pumpDownloadWrites(d, /*flushTail=*/true);
+            drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites, d.writeError);
+            const bool writeOk = !d.writeError;
+            clientDriver.closeFile(d.fileId);
+            d.fileId = 0;
             activeDownloads.erase(it);
             streamToPath.erase(key);
             releaseSlot();
-            ++compared;
-            ++transferred;
-            transferRetryCounts.erase(rel);
+            if (writeOk) {
+                const FileEntry& meta = remoteFiles.at(rel);
+                SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
+                ++compared;
+                ++transferred;
+                transferRetryCounts.erase(rel);
+            } else {
+                // A driver write failed: do NOT count success; route through the existing
+                // retry / delta-fallback machinery (FR-16 / AC-14).
+                retryOrFail(rel);
+            }
             PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
         } else if (frame.type == MsgType::FileError) {
             auto itBatch = activeBatchDownloads.find(key);
@@ -2892,8 +3078,13 @@ int RunClient(const CliOptions& options) {
             auto itPath = streamToPath.find(key);
             auto itDl = activeDownloads.find(key);
             if (itDl != activeDownloads.end()) {
-                itDl->second.writeBuffer.clear();
-                itDl->second.output.close();
+                DownloadState& d = itDl->second;
+                d.writeBuffer.clear();
+                // Reap any in-flight writes so driverWriteOutstandingBytes balances, then discard.
+                drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites,
+                                            d.writeError);
+                clientDriver.closeFile(d.fileId);
+                d.fileId = 0;
                 activeDownloads.erase(itDl);
             }
             releaseSlot();
@@ -2954,10 +3145,15 @@ int RunClient(const CliOptions& options) {
             }
             ActiveDeltaRange& r = itR->second;
             auto itS = deltaStates.find(r.rel);
-            if (itS != deltaStates.end() && itS->second.tempOut.is_open() && !frame.payload.empty()) {
-                itS->second.tempOut.seekp(static_cast<std::streamoff>(r.destOffset + r.received), std::ios::beg);
-                itS->second.tempOut.write(reinterpret_cast<const char*>(frame.payload.data()),
-                                          static_cast<std::streamsize>(frame.payload.size()));
+            if (itS != deltaStates.end() && itS->second.tempFileId != 0 && !frame.payload.empty()) {
+                DeltaFileState& dst = itS->second;
+                // unbuffered-writes FR-07: range bytes go to the temp at their dest offset through
+                // the driver (blocking submit so none are dropped), then reap to keep the budget
+                // tight. Unaligned fragments fall back to a buffered exact-length write (D-03).
+                submitDriverWrite(dst.tempFileId, r.destOffset + r.received, frame.payload.data(),
+                                  static_cast<uint32_t>(frame.payload.size()), /*blocking=*/true,
+                                  dst.submittedWrites, dst.completedWrites, dst.writeError);
+                reapDriverWrites(dst.tempFileId, dst.completedWrites, dst.writeError);
             }
             r.received += static_cast<uint32_t>(frame.payload.size());
         } else if (frame.type == MsgType::DeltaRangeEnd) {
@@ -3011,12 +3207,17 @@ int RunClient(const CliOptions& options) {
                 deltaSigSentAt.erase(rel);
             }
             if (itS != deltaStates.end()) {
-                if (itS->second.tempOut.is_open()) {
-                    itS->second.tempOut.close();
+                DeltaFileState& dst = itS->second;
+                // Reap any in-flight temp writes to balance the budget, then close + remove.
+                drainFileWritesToCompletion(dst.tempFileId, dst.submittedWrites, dst.completedWrites,
+                                            dst.writeError);
+                if (dst.tempFileId != 0) {
+                    clientDriver.closeFile(dst.tempFileId);
+                    dst.tempFileId = 0;
                 }
                 std::error_code rec;
-                if (!itS->second.tempPath.empty()) {
-                    fs::remove(itS->second.tempPath, rec);
+                if (!dst.tempPath.empty()) {
+                    fs::remove(dst.tempPath, rec);
                 }
                 deltaStates.erase(itS);
             }
@@ -3187,9 +3388,15 @@ int RunClient(const CliOptions& options) {
             for (uint64_t k : regularKeys) {
                 auto it = activeDownloads.find(k);
                 if (it != activeDownloads.end()) {
-                    const std::string rel = it->second.relPath;
-                    if (it->second.output.is_open()) {
-                        it->second.output.close();
+                    DownloadState& d = it->second;
+                    const std::string rel = d.relPath;
+                    // unbuffered-writes: reap in-flight writes to balance the budget, then close +
+                    // discard the driver handle before requeueing the file to a healthy lane.
+                    drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites,
+                                                d.writeError);
+                    if (d.fileId != 0) {
+                        clientDriver.closeFile(d.fileId);
+                        d.fileId = 0;
                     }
                     activeDownloads.erase(it);
                     streamToPath.erase(k);
