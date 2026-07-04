@@ -65,7 +65,7 @@ bool IsWanRtt(long rttMs) {
 
 uint32_t WanStreamsForRtt(long rttMs) {
     if (rttMs <= kWanRttThresholdMs) {
-        return 4;  // LAN / 同城: unchanged legacy auto count
+        return 4;  // LAN / metro: unchanged legacy auto count
     }
     if (rttMs <= 30) {
         return 8;
@@ -80,7 +80,7 @@ namespace {
 
 // Bandwidth-delay product expressed in *files*: how many average-sized files fit inside
 // (targetThroughput x RTT). This is the count that must stay in flight to keep the data
-// pipeline fed across one round trip (design §3.2). Saturates instead of overflowing.
+// pipeline fed across one round trip (design section 3.2). Saturates instead of overflowing.
 size_t BdpDepthFiles(long rttMs, uint64_t avgFileBytes) {
     const long rtt = std::max<long>(rttMs, kWanRttFloorMs);
     const double rttSec = static_cast<double>(rtt) / 1000.0;
@@ -106,7 +106,7 @@ size_t ComputeHashInflightDepth(long rttMs, uint32_t streamLimit, uint64_t avgFi
         std::max<size_t>(kHashFloorDepth, static_cast<size_t>(streamLimit) * 256),
         kHashFloorDepth, kHashLanCeilDepth);
     if (!IsWanRtt(rttMs)) {
-        return legacy;  // LAN / 同城: byte-for-byte legacy (HC-04 / NFR-03)
+        return legacy;  // LAN / metro: byte-for-byte legacy (HC-04 / NFR-03)
     }
     // WAN: deepen the request pipeline so it never drains within one RTT. Two lower-bound
     // terms, take the max then clamp to the raised ceiling:

@@ -52,8 +52,8 @@ std::wstring Utf8ToWideLocal(const std::string& value) {
 }
 #endif
 
-// 相对路径（UTF-8、正斜杠）拼到本地根目录。自包含，不依赖 sync_util::JoinRel（不在 FastCheck
-// link 闭包内）。
+// Join a relative path (UTF-8, forward slashes) onto the local root directory. Self-contained, does not depend on
+// sync_util::JoinRel (which is not in the FastCheck link closure).
 fs::path JoinLocal(const fs::path& root, const std::string& rel) {
 #ifdef _WIN32
     std::wstring full = root.wstring();
@@ -73,8 +73,8 @@ fs::path JoinLocal(const fs::path& root, const std::string& rel) {
 #endif
 }
 
-// 复刻 sync_engine_client 的 probeLocalFile：一次 syscall 取 size+mtime，得 optional<FileEntry>。
-// mtime 单位与 manifest 侧一致（Win=FILETIME ticks，POSIX=Unix ns），供 DecideCompare 归一比对。
+// Replicates sync_engine_client's probeLocalFile: one syscall to get size+mtime, yielding optional<FileEntry>.
+// The mtime unit matches the manifest side (Win=FILETIME ticks, POSIX=Unix ns), for DecideCompare's normalized comparison.
 std::optional<FileEntry> ProbeLocal(const fs::path& root, const std::string& rel) {
     const fs::path abs = JoinLocal(root, rel);
 #ifdef _WIN32
@@ -132,7 +132,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
 
     std::unordered_set<std::string> manifestPaths;
 
-    // 需要 hash 的文件（元数据阶段判 needHash）。已发送等待响应的记入 awaiting（按 relPath 匹配）。
+    // Files that need a hash (needHash decided in the metadata phase). Those already sent and awaiting a response go into awaiting (matched by relPath).
     struct HashNeed {
         FileEntry remote;
         std::optional<FileEntry> local;
@@ -147,7 +147,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     bool localReadFailed = false;
     std::string errorText;
 
-    // 记录一条已定类别的文件到计数与（按 filter/summaryOnly）逐文件清单。
+    // Record a file with a decided category into the counters and (per filter/summaryOnly) the per-file listing.
     auto record = [&](fc::CompareCategory category, const FileEntry& remote,
                       const std::optional<FileEntry>& local, bool hashCompared) {
         switch (category) {
@@ -178,13 +178,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         entry.type = category;
         entry.path = remote.relativePath;
         entry.hashCompared = hashCompared;
-        // localSize：本地存在才有（Same/Diff/Extra）；Missing 本地缺失 -> local 为空 -> null（FR-24）。
+        // localSize: present only when the local file exists (Same/Diff/Extra); Missing means local absent -> local empty -> null (FR-24).
         if (local.has_value()) {
             entry.localSize = local->fileSize;
         }
-        // remoteSize：远端存在才有（Same/Diff/Missing 均来自 manifest 条目，remote.fileSize 有效）；
-        // Extra 远端不存在 -> 留 nullopt -> JSON null（FR-24/AC-31）。EXTRA 传入的 remote 是临时构造、
-        // fileSize=0，绝不能填进 remoteSize。
+        // remoteSize: present only when the remote exists (Same/Diff/Missing all come from manifest entries, remote.fileSize valid);
+        // Extra means remote absent -> leave nullopt -> JSON null (FR-24/AC-31). The remote passed for EXTRA is a temporary
+        // construct with fileSize=0 and must never be filled into remoteSize.
         if (category != fc::CompareCategory::Extra) {
             entry.remoteSize = remote.fileSize;
         }
@@ -196,7 +196,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         awaiting.emplace(need.remote.relativePath, need);
         ++inFlight;
     };
-    // 维持在飞 HashRequest 数 <= --checkers（流水线深度，非 lane 数，FR-06）。
+    // Keep the in-flight HashRequest count <= --checkers (pipeline depth, not lane count, FR-06).
     auto pump = [&]() {
         while (inFlight < o.checkers && !hashQueue.empty()) {
             const HashNeed need = hashQueue.front();
@@ -216,7 +216,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
             if (frame.type == MsgType::ManifestEntry) {
                 FileEntry remote = DecodeManifestEntry(frame.payload);
                 if (remote.isDirectory) {
-                    continue;  // 目录不参与文件比对（EXTRA 也只统计文件）。
+                    continue;  // Directories do not participate in file comparison (EXTRA also counts files only).
                 }
                 ++counters.enumerated;
                 manifestPaths.insert(remote.relativePath);
@@ -229,14 +229,14 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                     record(out.category, remote, local, false);
                 }
             } else if (frame.type == MsgType::ManifestProgress) {
-                // 进度提示，忽略。
+                // Progress hint, ignore.
             } else if (frame.type == MsgType::ManifestEnd) {
                 manifestDone = true;
             } else if (frame.type == MsgType::HashResponse) {
                 const std::pair<std::string, Hash256> resp = DecodeHashResponse(frame.payload);
                 auto it = awaiting.find(resp.first);
                 if (it == awaiting.end()) {
-                    continue;  // 未知/重复响应，忽略。
+                    continue;  // Unknown/duplicate response, ignore.
                 }
                 const HashNeed need = it->second;
                 awaiting.erase(it);
@@ -247,7 +247,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                     localHash = ComputeFileHash(JoinLocal(targetRoot, need.remote.relativePath));
                     localReadable = true;
                 } catch (const std::exception& ex) {
-                    // 本地文件在 hash 阶段不可读：终止比对，返回退出码 3（边界条件）。
+                    // Local file unreadable in the hash phase: abort the comparison, return exit code 3 (boundary condition).
                     localReadFailed = true;
                     errorText = ex.what();
                     break;
@@ -257,13 +257,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                 record(cat, need.remote, need.local, true);
                 pump();
             } else {
-                // Check 不应收到 File*/Delta*/BlockSig* 等传输帧；记诊断并忽略。
+                // Check should not receive transfer frames like File*/Delta*/BlockSig*; log a diagnostic and ignore.
                 std::cerr << "[check] unexpected frame in Check session type="
                           << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
             }
         }
     } catch (const std::exception& ex) {
-        // 断连（recv 抛异常）或发送失败：标 partial，退出码 2（NFR-07/AC-48）。
+        // Disconnect (recv throws) or send failure: mark partial, exit code 2 (NFR-07/AC-48).
         disconnected = true;
         errorText = ex.what();
     }
@@ -282,13 +282,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         outcome.exit = kLocalPrecondFailed;
         std::cerr << "error: local file read failed during check: " << errorText << std::endl;
     } else {
-        // 完整比对：枚举本地多余项（FR-19），再定退出码 0/1（FR-14）。
+        // Full comparison: enumerate local extras (FR-19), then decide exit code 0/1 (FR-14).
         const std::vector<std::string> extras = CollectExtraLocal(targetRoot, manifestPaths);
         for (const std::string& rel : extras) {
             FileEntry extraEntry;
             extraEntry.relativePath = rel;
             const std::optional<FileEntry> local = ProbeLocal(targetRoot, rel);
-            // record 用 remote.fileSize 填 remoteSize（EXTRA 不设），local 填 localSize。
+            // record fills remoteSize from remote.fileSize (not set for EXTRA) and localSize from local.
             record(fc::CompareCategory::Extra, extraEntry, local, false);
         }
         outcome.exit = (counters.diff == 0 && counters.missing == 0 && counters.extraLocal == 0)
@@ -296,12 +296,12 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                            : kDiffFound;
     }
 
-    // 收尾：尽力发 SyncDone 复用服务端干净早退路径（§8.1）。断连时套接字已死，忽略失败。
+    // Wrap-up: best-effort send SyncDone to reuse the server's clean early-exit path (section 8.1). On disconnect the socket is already dead, so ignore failures.
     if (!disconnected) {
         try {
             ch.send(Frame{MsgType::SyncDone, 0, {}});
         } catch (const std::exception&) {
-            // 尽力而为，收尾发送失败不改变已定退出码。
+            // Best-effort; a wrap-up send failure does not change the already-decided exit code.
         }
     }
 

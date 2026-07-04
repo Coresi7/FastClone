@@ -21,7 +21,7 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
-// Unix-ns 级别的时间戳（> 5e17 阈值，被归一逻辑识别为 Unix ns）。
+// Unix-ns timestamp (> 5e17 threshold, recognized by normalization logic as Unix ns).
 constexpr int64_t kBaseMtimeNs = 1700000000000000000LL;
 
 fc::FileEntry MakeRemote(const std::string& rel, uint64_t size, int64_t mtimeNs) {
@@ -68,13 +68,13 @@ void TestDecideCompareSizeDiff() {
 void TestDecideCompareSizeSameMtimeSame() {
     const fc::FileEntry remote = MakeRemote("a.txt", 100, kBaseMtimeNs);
     const std::optional<fc::FileEntry> local = MakeRemote("a.txt", 100, kBaseMtimeNs);
-    // Fast：大小同 + mtime 同 -> Same，不 hash（AC-23）。
+    // Fast: same size + same mtime -> Same, no hash (AC-23).
     fc::CompareOutcome out = fc::DecideCompare(fc::CompareMode::Fast, local, remote);
     Expect(!out.needHash && out.category == fc::CompareCategory::Same, "fast same size+mtime -> Same no hash");
-    // SizeOnly：大小同 -> Same，不 hash（AC-27）。
+    // SizeOnly: same size -> Same, no hash (AC-27).
     out = fc::DecideCompare(fc::CompareMode::SizeOnly, local, remote);
     Expect(!out.needHash && out.category == fc::CompareCategory::Same, "size-only same size -> Same no hash");
-    // Strict：大小同一律 hash，忽略 mtime（AC-25）。
+    // Strict: same size always hash, ignore mtime (AC-25).
     out = fc::DecideCompare(fc::CompareMode::Strict, local, remote);
     Expect(out.needHash, "strict same size (mtime same) -> needHash");
 }
@@ -82,13 +82,13 @@ void TestDecideCompareSizeSameMtimeSame() {
 void TestDecideCompareSizeSameMtimeDiff() {
     const fc::FileEntry remote = MakeRemote("a.txt", 100, kBaseMtimeNs);
     const std::optional<fc::FileEntry> local = MakeRemote("a.txt", 100, kBaseMtimeNs + 10'000'000LL);  // +10ms
-    // Fast：大小同 + mtime 异（>2ms）-> needHash（AC-24）。
+    // Fast: same size + mtime differs (>2ms) -> needHash (AC-24).
     fc::CompareOutcome out = fc::DecideCompare(fc::CompareMode::Fast, local, remote);
     Expect(out.needHash, "fast same size, mtime diff -> needHash");
-    // SizeOnly：忽略 mtime，仍 Same（AC-27）。
+    // SizeOnly: ignores mtime, still Same (AC-27).
     out = fc::DecideCompare(fc::CompareMode::SizeOnly, local, remote);
     Expect(!out.needHash && out.category == fc::CompareCategory::Same, "size-only ignores mtime -> Same");
-    // Strict：needHash（AC-25）。
+    // Strict: needHash (AC-25).
     out = fc::DecideCompare(fc::CompareMode::Strict, local, remote);
     Expect(out.needHash, "strict same size (mtime diff) -> needHash");
 }
@@ -117,7 +117,7 @@ void TestIsLocalExtra() {
     std::unordered_set<std::string> remoteSet = {"a.txt", "b.txt"};
     Expect(!fc::IsLocalExtra("a.txt", remoteSet), "present in set -> not extra");
     Expect(fc::IsLocalExtra("z.txt", remoteSet), "absent from set -> extra");
-    // 模板兼容 sync 侧的 unordered_map<string,FileEntry>。
+    // Template compatible with the sync side's unordered_map<string,FileEntry>.
     std::unordered_map<std::string, fc::FileEntry> remoteMap;
     remoteMap["a.txt"] = MakeRemote("a.txt", 1, kBaseMtimeNs);
     Expect(!fc::IsLocalExtra("a.txt", remoteMap), "present in map -> not extra");

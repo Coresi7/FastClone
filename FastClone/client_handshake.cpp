@@ -13,7 +13,7 @@ void SendSimple(const SocketHandle& socket, MsgType type, const std::string& tex
     SendFrame(socket, frame);
 }
 
-// --- FC6 handshake: version negotiation is shared; session claim differs (design §3, §5) ---
+// --- FC6 handshake: version negotiation is shared; session claim differs (design section 3, section 5) ---
 
 // Server side: exchange Hello and validate the protocol version (FR-018 / AC-013). On
 // mismatch sends Error and throws so the version-reject path is identical to FC5.
@@ -48,7 +48,7 @@ void NegotiateHelloAsClient(const SocketHandle& socket) {
 }
 
 // Client first connection: Hello -> Auth -> AuthOk(NewSession). Returns the session
-// identity + server-advertised endpoint list (design §3.2 / FR-003/005/017).
+// identity + server-advertised endpoint list (design section 3.2 / FR-003/005/017).
 AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password) {
     NegotiateHelloAsClient(socket);
     SendSimple(socket, MsgType::Auth, password);
@@ -70,8 +70,8 @@ AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& pas
     return info;
 }
 
-// FastCheck 只读会话握手（fastcheck）：Hello -> CheckAuth(password) -> AuthOk(NewSession)。
-// 服务端在 HandshakeAndResolveSession 的 CheckAuth 分支解析后返回 SessionType::Check 会话。
+// FastCheck read-only session handshake (fastcheck): Hello -> CheckAuth(password) -> AuthOk(NewSession).
+// The server, after parsing in the CheckAuth branch of HandshakeAndResolveSession, returns a SessionType::Check session.
 AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& password) {
     NegotiateHelloAsClient(socket);
     CheckAuthInfo checkAuth;
@@ -83,7 +83,7 @@ AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& p
         throw std::runtime_error("Server authentication rejected: " + payload);
     }
     AuthOkInfo info = DecodeAuthOk(authResult.payload);
-    // Check 会话由服务端以 NewSession 角色确认；其它角色/空 sessionId 均为协议违例。
+    // The Check session is confirmed by the server with the NewSession role; any other role/empty sessionId is a protocol violation.
     if (info.role != AuthOkRole::NewSession) {
         throw std::runtime_error(
             "Protocol error: expected AuthOk role NewSession on CheckAuth, got JoinAck");

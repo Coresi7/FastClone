@@ -1,4 +1,4 @@
-// FastCloneRouteProbe — read-only multipath route diagnostics tool.
+// FastCloneRouteProbe - read-only multipath route diagnostics tool.
 //
 // Design: docs/design/route-probe-tool.md (Plan B). The shared client handshake primitives
 // now live in client_handshake.h/.cpp (fc namespace) and SplitServerKey in net_topology;
@@ -32,7 +32,7 @@
 namespace fc {
 
 // ---------------------------------------------------------------------------------------
-// Tool configuration (design §3).
+// Tool configuration (design section 3).
 // ---------------------------------------------------------------------------------------
 struct RouteProbeOptions {
     std::vector<std::pair<std::string, uint16_t>> servers;  // --server (repeatable / comma)
@@ -49,7 +49,7 @@ namespace {
 // net_topology.h. The probe links those translation units rather than re-inlining copies.
 
 // ---------------------------------------------------------------------------------------
-// CLI parsing (design §3). Independent of cli.cpp but follows the same style: UTF-8 on
+// CLI parsing (design section 3). Independent of cli.cpp but follows the same style: UTF-8 on
 // Windows, ArgAt value fetch, std::runtime_error on bad input, PrintUsage to stderr.
 // ---------------------------------------------------------------------------------------
 #ifdef _WIN32
@@ -198,7 +198,7 @@ RouteProbeOptions ParseRouteProbeArgs(const std::vector<std::string>& args) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Output helpers (design §5). Diagnostics go to stdout; errors / usage go to stderr.
+// Output helpers (design section 5). Diagnostics go to stdout; errors / usage go to stderr.
 // ---------------------------------------------------------------------------------------
 std::string PadRight(const std::string& text, size_t width) {
     std::string out = text;
@@ -378,7 +378,7 @@ void PrintLinkPlan(const std::vector<LinkPlan>& plans, const ReachabilityMatrix&
 }
 
 // ---------------------------------------------------------------------------------------
-// Core probe flow (design §4).
+// Core probe flow (design section 4).
 // ---------------------------------------------------------------------------------------
 int RunRouteProbe(const RouteProbeOptions& options) {
     // ---- (1) Connect to the first --server (OS default route, no source binding) ----
@@ -414,7 +414,7 @@ int RunRouteProbe(const RouteProbeOptions& options) {
     }
     std::cout << std::endl;
 
-    // ---- (3) Build serverEndpoints = CLI servers + advertised (design §4 addServer) ----
+    // ---- (3) Build serverEndpoints = CLI servers + advertised (design section 4 addServer) ----
     std::vector<ServerEndpoint> serverEndpoints;
     std::unordered_map<std::string, size_t> serverIndex;  // "host:port" -> index
     auto addServer = [&](const std::string& host, uint16_t port, const std::string& nicGroup) {
@@ -440,7 +440,7 @@ int RunRouteProbe(const RouteProbeOptions& options) {
     const ReachabilityMatrix matrix = ProbeReachability(localCands, serverEndpoints, options.timeoutMs);
     PrintReachabilityMatrix(matrix, options.timeoutMs);
 
-    // ---- (5) Selection (design §4 step 5, mirrors sync_engine.cpp:2011-2019) ----
+    // ---- (5) Selection (design section 4 step 5, mirrors sync_engine.cpp:2011-2019) ----
     const std::string primaryActualLocal = LocalAddressOf(primarySocket);
     const std::string primaryIface = InterfaceKeyForLocalAddress(primaryActualLocal);
     const std::string primaryDedupIface =

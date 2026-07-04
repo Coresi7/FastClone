@@ -23,7 +23,7 @@ enum class LargeFileLane {
     Auto
 };
 
-// Explicit client->server link pin (design §9.3 / FR-008). Established verbatim; the
+// Explicit client->server link pin (design section 9.3 / FR-008). Established verbatim; the
 // list order defines the primary link. local may be a source IP or an interface name.
 struct LinkPin {
     std::string local;
@@ -42,14 +42,14 @@ struct CliOptions {
     uint64_t queuedFileSizeBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     uint32_t serverHashWorkers = 0;
     bool enableHashMemcache = false;
-    // OneShot 服务端模式（--once）。仅服务端有效；服务完一个真实会话后进程退出。
+    // OneShot server mode (--once). Server-only; the process exits after serving one real session.
     bool exitAfterSync = false;
-    // 服务端专用：多真实会话并发 + 空闲宽限后优雅退出（与 --once 互斥）。映射 --once-multi（FR-01）。
+    // Server-only: multiple real sessions plus graceful exit after idle grace (mutually exclusive with --once). Maps --once-multi (FR-01).
     bool onceMulti = false;
-    // 空闲宽限毫秒数，默认 5s；仅在 onceMulti 下有效（FR-04）。--once-idle-grace。
+    // Idle grace in milliseconds, default 5s; only effective under onceMulti (FR-04). --once-idle-grace.
     uint64_t onceIdleGraceMs = 5000;
-    // 首连等待超时毫秒数，默认 300s；仅在 --once / --once-multi 下有效。--wait-connect-timeout。
-    // 仅覆盖「进入监听到首个有效连接达成之前」这一连续区间；首连后永久失效（FR-01/M3/FR-09）。
+    // First-connect wait timeout in milliseconds, default 300s; only effective under --once / --once-multi. --wait-connect-timeout.
+    // Covers only the continuous interval "from entering listen until the first valid connection is established"; permanently disabled after the first connection (FR-01/M3/FR-09).
     uint64_t waitConnectTimeoutMs = 300000;
     bool streamAutoTune = true;
     bool chunkAutoTune = true;

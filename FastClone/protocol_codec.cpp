@@ -18,7 +18,7 @@ std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info) {
         AppendString(payload, addr.endpoint);
         AppendU16(payload, addr.nicGroup);
     }
-    // FC7 connection-level capability bits, appended last (binary-delta §8.1).
+    // FC7 connection-level capability bits, appended last (binary-delta section 8.1).
     payload.push_back(info.capabilities);
     return payload;
 }
@@ -43,7 +43,7 @@ AuthOkInfo DecodeAuthOk(const std::vector<uint8_t>& payload) {
         info.serverAddrs.push_back(std::move(adv));
     }
     // FC7 capability byte trails the address list; absent => no capabilities (back-compat
-    // with fixtures / probe payloads that predate the field, binary-delta §8.1).
+    // with fixtures / probe payloads that predate the field, binary-delta section 8.1).
     if (cursor < payload.size()) {
         info.capabilities = payload[cursor++];
     }
@@ -76,7 +76,7 @@ CheckAuthInfo DecodeCheckAuth(const std::vector<uint8_t>& payload) {
     size_t cursor = 0;
     CheckAuthInfo info;
     info.password = ReadString(payload, cursor);
-    // flags 字节尾随 password；缺失时按 0 解（兼容未来演进 / 旧载荷）。
+    // The flags byte follows password; missing flags decode as 0 (compatible with future evolution and old payloads).
     if (cursor < payload.size()) {
         info.flags = payload[cursor++];
     }

@@ -57,7 +57,7 @@ private:
     SocketNative raw_ = kInvalidSocket;
 };
 
-// Optional source binding for a multipath connection (design §6.5). Empty fields mean
+// Optional source binding for a multipath connection (design section 6.5). Empty fields mean
 // "do not bind". localAddr pins the source IP (strong-host on Windows); ifaceName pins
 // the egress interface on weak-host platforms (macOS IP_BOUND_IF / Linux SO_BINDTODEVICE).
 struct ConnectBinding {
@@ -72,7 +72,7 @@ struct ConnectBinding {
 // startup before any socket is tuned; applies to every subsequently connected/accepted socket.
 void SetSocketBufferOverrides(int sndBufBytes, int rcvBufBytes);
 
-// Snapshot of kernel TCP state for one connection (diagnostics only, design wan-single-tcp §3.2).
+// Snapshot of kernel TCP state for one connection (diagnostics only, design wan-single-tcp section 3.2).
 // retrans unit differs by platform (Linux: retransmitted segments; Windows: retransmitted bytes);
 // the trend, not the absolute unit, is what diagnoses loss-driven cwnd sawtooth. valid=false when
 // the OS cannot supply it (unsupported, not a TCP socket, or the query failed).
@@ -96,7 +96,7 @@ SocketHandle CreateServer(uint16_t port);
 SocketHandle AcceptClient(const SocketHandle& listener);
 // Like AcceptClient but waits at most timeoutMs for an incoming connection. Returns nullopt
 // when the wait elapses with no pending connection (used by --once-multi so the accept loop
-// can periodically evaluate idle-grace, design §6.2). Throws on a hard accept/poll error.
+// can periodically evaluate idle-grace, design section 6.2). Throws on a hard accept/poll error.
 std::optional<SocketHandle> AcceptClientTimeout(const SocketHandle& listener, int timeoutMs);
 void SendAll(const SocketHandle& socket, const void* data, size_t length);
 void SendBuffersAll(const SocketHandle& socket, const SocketBuffer* buffers, size_t count);

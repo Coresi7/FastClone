@@ -203,7 +203,7 @@ std::pair<std::string, uint16_t> ParseHostPort(const std::string& input, uint16_
 }
 
 // Split a comma-separated endpoint list ("A:port,B,C:port") into host/port pairs,
-// each parsed via ParseHostPort with the current default port (FR-005 / design §9.2).
+// each parsed via ParseHostPort with the current default port (FR-005 / design section 9.2).
 std::vector<std::pair<std::string, uint16_t>> ParseServerList(const std::string& input,
                                                               uint16_t defaultPort) {
     std::vector<std::pair<std::string, uint16_t>> endpoints;
@@ -227,7 +227,7 @@ std::vector<std::pair<std::string, uint16_t>> ParseServerList(const std::string&
     return endpoints;
 }
 
-// Parse "<localIP|iface>=<serverIP[:port]>" into a LinkPin (FR-008 / design §9.3).
+// Parse "<localIP|iface>=<serverIP[:port]>" into a LinkPin (FR-008 / design section 9.3).
 LinkPin ParseLinkPin(const std::string& input, uint16_t defaultPort) {
     const size_t eq = input.find('=');
     if (eq == std::string::npos || eq == 0 || eq + 1 >= input.size()) {

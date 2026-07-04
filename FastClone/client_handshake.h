@@ -8,35 +8,35 @@
 
 namespace fc {
 
-// 协议版本号（内联变量，跨 TU 唯一，避免 ODR 冲突）。FC6 -> FC7：引入二进制 delta。
-// FC6 与 FC7 在 Hello 阶段严格相等检查处干净互拒（沿用既有版本不符语义，无未知帧风险，
-// binary-delta D-04 候选 C）。
+// Protocol version (inline variable, unique across TUs, avoids ODR conflicts). FC6 -> FC7: introduces binary delta.
+// FC6 and FC7 cleanly reject each other at the strict equality check in the Hello phase (reusing the existing
+// version-mismatch semantics, no unknown-frame risk, binary-delta D-04 candidate C).
 inline constexpr const char* kProtocolVersion = "FC7";
 
-// 连接级能力位（FC7，AuthOk.capabilities 载荷，binary-delta §8.1）。bit0 = 服务端具备
-// 二进制 delta 能力。客户端仅当「自身 --delta-min-size>0 且服务端通告 bit0」时才发送
-// delta 专用消息（AC-17）。
+// Connection-level capability bits (FC7, AuthOk.capabilities payload, binary-delta section 8.1). bit0 = the
+// server has binary delta capability. The client sends delta-specific messages only when "its own
+// --delta-min-size>0 and the server advertises bit0" (AC-17).
 inline constexpr uint8_t kCapDelta = 0x01;
 
-// 发送一个仅含文本载荷的简单帧（streamId=0）。
+// Send a simple frame carrying only a text payload (streamId=0).
 void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {});
 
-// 客户端 Hello 协商（失败/版本不符抛 std::runtime_error）。
+// Client-side Hello negotiation (throws std::runtime_error on failure/version mismatch).
 void NegotiateHelloAsClient(const SocketHandle& socket);
 
-// 服务端 Hello 协商（版本不符回 Error 帧并抛）。仅版本协商，不含会话状态。
+// Server-side Hello negotiation (on version mismatch, replies with an Error frame and throws). Version negotiation only, no session state.
 void NegotiateHelloAsServer(const SocketHandle& socket);
 
-// 客户端首连：Hello -> Auth -> AuthOk(NewSession)，返回会话身份+广播端点。
+// Client first connection: Hello -> Auth -> AuthOk(NewSession), returns session identity + advertised endpoints.
 AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password);
 
-// 客户端辅链路：Hello -> SessionJoin -> AuthOk(JoinAck)。
+// Client auxiliary link: Hello -> SessionJoin -> AuthOk(JoinAck).
 void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
                          const std::string& sessionId);
 
-// FastCheck 只读会话握手（fastcheck）：Hello -> CheckAuth -> AuthOk(NewSession)。
-// 与 HandshakeClientNew 同构，仅认领帧换成 MsgType::CheckAuth，向服务端标识这是 Check 会话。
-// 失败/认证失败/版本不符抛 std::runtime_error（调用方据此映射退出码 2）。
+// FastCheck read-only session handshake (fastcheck): Hello -> CheckAuth -> AuthOk(NewSession).
+// Isomorphic to HandshakeClientNew, only the claim frame is swapped to MsgType::CheckAuth, marking to the server that this is a Check session.
+// Throws std::runtime_error on failure/auth failure/version mismatch (the caller maps this to exit code 2).
 AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& password);
 
 }  // namespace fc

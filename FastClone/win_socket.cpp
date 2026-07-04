@@ -64,7 +64,7 @@ void TuneSocketForThroughput(SocketNative s) {
 #endif
 #endif
 
-    // Socket window policy (design wan-single-tcp §3.1). The old code unconditionally pinned
+    // Socket window policy (design wan-single-tcp section 3.1). The old code unconditionally pinned
     // SO_SNDBUF=SO_RCVBUF=4MB. Pinning SO_RCVBUF is what DISABLED the kernel's receive-window
     // autotuning (Linux tcp_moderate_rcvbuf / Windows Receive Window Auto-Tuning), capping the
     // receive window at 4MB and the single-connection throughput at ~4MB/RTT on high-RTT links.
@@ -204,7 +204,7 @@ void SocketHandle::Reset(SocketNative raw) {
 namespace {
 
 // Apply the per-OS multipath source binding to a fresh socket, between socket() and
-// connect() (design §6.5). Returns false only on a hard failure that should disqualify
+// connect() (design section 6.5). Returns false only on a hard failure that should disqualify
 // this address-family attempt. addrFamily is the family of the socket being bound.
 bool ApplyConnectBinding(SocketNative s, int addrFamily, const ConnectBinding& binding) {
     // Egress interface pin (weak-host platforms). Windows uses strong-host source-IP

@@ -22,7 +22,7 @@ struct BatchFileRecord {
     std::filesystem::path absPath;
 };
 
-// Multipath (FC6) handshake codecs (design §3.2 / r6-route-quality §2).
+// Multipath (FC6) handshake codecs (design section 3.2 / r6-route-quality section 2).
 // AuthOk payload: role(u8) + sessionId(str) + addrCount(u16) + (addr[str], nicGroup[u16])*.
 // role 0 = NewSession (first connection), role 1 = JoinAck (follow-up connection).
 // Each advertised endpoint carries a dense server-side physical-NIC group number so the
@@ -45,7 +45,7 @@ struct AuthOkInfo {
     AuthOkRole role = AuthOkRole::NewSession;
     std::string sessionId;
     std::vector<AdvertisedEndpoint> serverAddrs;  // advertised endpoints + NIC group
-    // FC7 connection-level capability bits (binary-delta §8.1). Appended at the END of the
+    // FC7 connection-level capability bits (binary-delta section 8.1). Appended at the END of the
     // AuthOk payload; DecodeAuthOk reads it only when bytes remain (default 0), so older
     // fixtures / probe code without the field decode as "no capabilities".
     uint8_t capabilities = 0;
@@ -63,9 +63,10 @@ struct SessionJoinInfo {
 std::vector<uint8_t> EncodeSessionJoin(const SessionJoinInfo& info);
 SessionJoinInfo DecodeSessionJoin(const std::vector<uint8_t>& payload);
 
-// CheckAuth payload（fastcheck）：password(str) + flags(u8)。刻意结构化（AppendString+flags）
-// 而非 Auth 那样的裸 password 字节，便于往返单测与未来演进。flags 当前恒 0；DecodeCheckAuth
-// 在无 flags 字节时按 0 解，沿用 DecodeAuthOk「剩余字节才读」的容错风格。
+// CheckAuth payload (fastcheck): password(str) + flags(u8). Deliberately structured (AppendString+flags)
+// rather than Auth's bare password bytes, to ease round-trip unit tests and future evolution. flags is
+// currently always 0; DecodeCheckAuth decodes it as 0 when the flags byte is absent, following DecodeAuthOk's
+// "read only when bytes remain" tolerance style.
 struct CheckAuthInfo {
     std::string password;
     uint8_t flags = 0;
@@ -92,7 +93,7 @@ std::vector<std::string> DecodeFileBatchRequest(const std::vector<uint8_t>& payl
 std::vector<uint8_t> EncodeFileBatchOpenResponse(const std::vector<BatchFileRecord>& files);
 std::vector<BatchFileRecord> DecodeFileBatchOpenResponse(const std::vector<uint8_t>& payload);
 
-// --- Binary delta (FC7, binary-delta §8.2) ---
+// --- Binary delta (FC7, binary-delta section 8.2) ---
 
 // BlockSigRequest / DeltaError / BlockSigRequest share the bare-relPath payload shape.
 std::vector<uint8_t> EncodeBlockSigRequest(const std::string& relPath);
@@ -106,7 +107,7 @@ std::string DecodeDeltaError(const std::vector<uint8_t>& payload);
 // blockCount * (weak(u32) + strong[strongLen]). The full-file hash rides along so the
 // client can run the FR-23 reconstruction check WITHOUT a separate HashRequest (which would
 // entangle the delta flow with the FallbackHash machinery). Block offsets are NOT on the
-// wire; the client derives them from index*blockSize (design §8.2).
+// wire; the client derives them from index*blockSize (design section 8.2).
 struct BlockSigResponseInfo {
     std::string relPath;
     Hash256 fileHash{};

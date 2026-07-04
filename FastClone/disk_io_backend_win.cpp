@@ -1,4 +1,4 @@
-// Windows IOCP backend with FILE_FLAG_NO_BUFFERING (unified-disk-io-driver design §3.4.1 / §7.2,
+// Windows IOCP backend with FILE_FLAG_NO_BUFFERING (unified-disk-io-driver design section 3.4.1 / section 7.2,
 // FR-03, AC-08/09). Compiles ONLY on Windows and is empty elsewhere.
 //
 // Large files (>= kSmallFileBufferedMax) are opened FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING

@@ -36,8 +36,8 @@ void CreateDirectoriesLong(const std::filesystem::path& dir);
 
 // Normalize a raw manifest mtime (which may be Unix ns or Windows FILETIME ticks) to
 // Unix nanoseconds. Returns false when the value cannot be meaningfully converted.
-// 实现已迁至 compare_phase（M1 修复：mtime 归一化单一真相源，sync 与 FastCheck 共用）。
-// 本头仅保留前向声明以兼容既有 include；调用方也可直接 #include "compare_phase.h"。
+// The implementation has moved to compare_phase (M1 fix: single source of truth for mtime normalization, shared by sync and FastCheck).
+// This header keeps only the forward declaration for compatibility with existing includes; callers may also directly #include "compare_phase.h".
 bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs);
 
 std::filesystem::path JoinRel(const std::filesystem::path& root, const std::string& relPath);

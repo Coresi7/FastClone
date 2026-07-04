@@ -1,13 +1,13 @@
-// Bounded pread/pwrite thread-pool backend (unified-disk-io-driver design §3.4.3 / §7.3 / §7.4).
+// Bounded pread/pwrite thread-pool backend (unified-disk-io-driver design section 3.4.3 / section 7.3 / section 7.4).
 //
 // This translation unit compiles ONLY on macOS and Linux and is empty everywhere else.
 //
-// macOS (design §7.4, FR-06, AC-13/N9): unbuffered intent is expressed with fcntl(F_NOCACHE, 1).
+// macOS (design section 7.4, FR-06, AC-13/N9): unbuffered intent is expressed with fcntl(F_NOCACHE, 1).
 //   This file MUST NOT reference O_DIRECT and MUST NOT reference POSIX aio (aio_read/aio_write) on
-//   the macOS path — both are compile-time absent there so the AC-13 source scan stays clean.
-// Linux (design §7.3, FR-04/05/10, AC-11/12): the fd is opened O_DIRECT for the unbuffered path;
+//   the macOS path - both are compile-time absent there so the AC-13 source scan stays clean.
+// Linux (design section 7.3, FR-04/05/10, AC-11/12): the fd is opened O_DIRECT for the unbuffered path;
 //   if O_DIRECT open fails or a direct IO returns EINVAL the op silently falls back to a buffered
-//   fd (opened from the path, no O_DIRECT) with posix_fadvise(POSIX_FADV_SEQUENTIAL) — no error
+//   fd (opened from the path, no O_DIRECT) with posix_fadvise(POSIX_FADV_SEQUENTIAL) - no error
 //   surfaces and the resulting bytes are unchanged (AC-12).
 //
 // Multiple ops are in flight via N worker threads executing synchronous pread/pwrite (FR-12); the
@@ -367,7 +367,7 @@ std::unique_ptr<PlatformIoBackend> CreatePosixPoolBackend(const IoDriverConfig& 
 
 #if defined(__APPLE__)
 // macOS has no io_uring; the bounded pread/pwrite pool (with F_NOCACHE unbuffered intent) is the
-// primary backend, not a fallback, so ioUringFallback stays 0 (design §7.4, pool header note). On
+// primary backend, not a fallback, so ioUringFallback stays 0 (design section 7.4, pool header note). On
 // Linux this factory lives in disk_io_backend_uring.cpp instead, so this definition is guarded to
 // macOS only to avoid a duplicate symbol.
 std::unique_ptr<PlatformIoBackend> CreatePlatformBackend(const IoDriverConfig& cfg) {

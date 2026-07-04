@@ -17,12 +17,12 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options);
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
 
-// --- WAN small-file tuning (design docs/design/wan-smallfile-perf.md §3.2/§3.3) ----------
+// --- WAN small-file tuning (design docs/design/wan-smallfile-perf.md section 3.2/section 3.3) ----------
 // Everything below is a pure function of the measured session RTT plus the already-resolved
 // base tuning, so it is unit-testable without the network (V-01/V-02/V-09). All thresholds
 // are compile-time tunable (constexpr). The whole WAN behavior is gated by RTT > the WAN
 // threshold (OQ-07=B): at or below it every value is byte-for-byte identical to the legacy
-// path so LAN / 同城 / 弱 SSD sessions are zero-regression (HC-04/NFR-03).
+// path so LAN / metro / weak-SSD sessions are zero-regression (HC-04/NFR-03).
 inline constexpr long kWanRttThresholdMs = 10;       // RTT > this => WAN mode gate
 inline constexpr long kWanRttFloorMs = 1;            // floor to avoid div-by-zero in BDP
 inline constexpr uint32_t kWanStreamCap = 16;        // hard cap on auto streams (FR-12/13)
@@ -38,7 +38,7 @@ inline constexpr uint64_t kWanDefaultAvgDeltaBytes = 256ull * 1024;
 // headroom (OQ-03=A). It only contributes a lower bound, never relaxes the ceilings.
 inline constexpr uint64_t kWanTargetThroughputBps = 400ull * 1000 * 1000;
 // Sliding-window transfer failure rate above which the WAN auto stream count is halved
-// (floor 4) so weak SSD/controllers self-heal (design §3.3 / FR-13 / OQ-05=C).
+// (floor 4) so weak SSD/controllers self-heal (design section 3.3 / FR-13 / OQ-05=C).
 inline constexpr double kStreamBackoffErrRate = 0.02;
 
 struct WanTuning {
@@ -52,7 +52,7 @@ struct WanTuning {
 // treated as LAN so a failed RTT probe never enables WAN behavior (AC-15).
 bool IsWanRtt(long rttMs);
 
-// RTT ladder for the auto stream count (design §3.3): <=threshold->4, then 8/12/16 by RTT.
+// RTT ladder for the auto stream count (design section 3.3): <=threshold->4, then 8/12/16 by RTT.
 uint32_t WanStreamsForRtt(long rttMs);
 
 // hash in-flight depth: legacy clamp on LAN; RTT-adaptive (breaks the old 8192 cap) on WAN.

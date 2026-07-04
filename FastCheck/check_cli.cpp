@@ -30,7 +30,7 @@ long ParseLongStrict(const std::string& value, const char* name) {
     return parsed;
 }
 
-// 解析 host 或 host:port，未带端口时用 defaultPort。
+// Parse host or host:port; use defaultPort when no port is given.
 void ParseHostPort(const std::string& input, std::string& host, uint16_t& port, uint16_t defaultPort) {
     const auto pos = input.find(':');
     if (pos == std::string::npos) {
@@ -76,7 +76,7 @@ Format ParseFormat(const std::string& value) {
     throw std::runtime_error("Invalid --format (expected text|json): " + value);
 }
 
-// --filter：逗号分隔的 DIFF/MISSING/EXTRA/SAME 子集。传入即重置为全 false 再按值置位。
+// --filter: comma-separated subset of DIFF/MISSING/EXTRA/SAME. Once passed, reset all to false then set bits by value.
 FilterSet ParseFilter(const std::string& value) {
     FilterSet filter{false, false, false, false};
     size_t start = 0;
@@ -173,7 +173,7 @@ CheckOptions ParseCheckArgs(const std::vector<std::string>& args) {
             }
             options.port = static_cast<uint16_t>(port);
         } else {
-            // 未知参数（含 --streams / --chunk-kb）：比对前失败（FR-06/07/11，AC-08）。
+            // Unknown argument (including --streams / --chunk-kb): fail before comparison (FR-06/07/11, AC-08).
             throw std::runtime_error("Unknown argument: " + arg);
         }
     }
@@ -192,7 +192,7 @@ CheckOptions ParseCheckArgs(const std::vector<std::string>& args) {
 }
 
 bool CheckLocalPreconditions(const CheckOptions& o) {
-    // --target 必须存在、是目录、可枚举（FR-12/AC-15）。
+    // --target must exist, be a directory, and be enumerable (FR-12/AC-15).
     std::error_code ec;
     const fs::path target(std::filesystem::path(o.target));
     if (!fs::exists(target, ec) || ec) {
@@ -210,7 +210,7 @@ bool CheckLocalPreconditions(const CheckOptions& o) {
             return false;
         }
     }
-    // --output 父目录必须存在（不创建，FR-12/AC-16）。
+    // --output parent directory must exist (not created, FR-12/AC-16).
     if (!o.output.empty()) {
         const fs::path outPath(std::filesystem::path(o.output));
         fs::path parent = outPath.parent_path();

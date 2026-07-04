@@ -6,7 +6,7 @@
 // 16-bit bucket + chain index, three-stage match funnel, block-size heuristic, adaptive
 // strong-checksum truncation) is an INDEPENDENT implementation from public algorithm
 // principles. No rsync (GPLv3) source was copied, adapted, or derived. The strong checksum
-// uses FastClone's existing XXH3-128 (NOT MD4/MD5). See docs/design/binary-delta.md §0.
+// uses FastClone's existing XXH3-128 (NOT MD4/MD5). See docs/design/binary-delta.md section 0.
 //
 // This header is deliberately free of <xxhash.h>: the XXH3 dependency is confined to
 // delta.cpp so translation units that only orchestrate delta (sync_engine.cpp) or unit-test
@@ -21,10 +21,10 @@
 
 namespace fc::delta {
 
-// --- Block-size heuristic constants (design §5.1 / OQ-02). delta only runs on files
+// --- Block-size heuristic constants (design section 5.1 / OQ-02). delta only runs on files
 // >= --delta-min-size (>= 1 MiB), so blockSize always lands in [kMinBlock, kMaxBlock]. ---
 constexpr uint32_t kMinBlock = 2048;     // 2 KiB lower bound
-constexpr uint32_t kMaxBlock = 131072;   // 128 KiB upper bound (requirements §5.2)
+constexpr uint32_t kMaxBlock = 131072;   // 128 KiB upper bound (requirements section 5.2)
 constexpr uint32_t kBlockAlign = 1024;   // sqrt(fileSize) rounded up to 1 KiB
 
 // --- Benefit-rejection threshold T = 0.65 (design D-02 / OQ-01), integer-only to avoid
@@ -32,7 +32,7 @@ constexpr uint32_t kBlockAlign = 1024;   // sqrt(fileSize) rounded up to 1 KiB
 constexpr uint64_t kBenefitPercentNum = 65;
 constexpr uint64_t kBenefitPercentDen = 100;
 
-// --- P0 early-stop tuning (delta-perf design §4.2/§4.3). All compile-time; adjust without
+// --- P0 early-stop tuning (delta-perf design section 4.2/section 4.3). All compile-time; adjust without
 // touching the public interface (R-04). The evaluation prefix is
 //   min(kPrefixCapBytes, max(max(kPrefixFloorBytes, blockSize*kPrefixFloorBlocks),
 //                            oldLen*kPrefixPercent/100)).
@@ -46,7 +46,7 @@ constexpr uint64_t kEarlyStopEvalStride = 4ull << 20;    // re-evaluate every 4 
 
 // Per-block signature: 32-bit weak checksum (s2<<16 | s1) + XXH3-128 strong checksum.
 // Only the first SignatureSet::strongLen bytes of `strong` are significant on the wire and
-// in comparisons (adaptive truncation, design §5.3).
+// in comparisons (adaptive truncation, design section 5.3).
 struct BlockSig {
     uint32_t weak = 0;
     std::array<uint8_t, 16> strong{};
@@ -65,7 +65,7 @@ struct SignatureSet {
 struct RollingWeak {
     uint32_t s1 = 0;
     uint32_t s2 = 0;
-    // weak32 = (s2 << 16) | s1 (design §5.2).
+    // weak32 = (s2 << 16) | s1 (design section 5.2).
     [[nodiscard]] uint32_t value() const {
         return ((s2 & 0xFFFFu) << 16) | (s1 & 0xFFFFu);
     }
@@ -88,7 +88,7 @@ uint64_t Isqrt64(uint64_t value);
 // Block-size heuristic: clamp(alignUp(isqrt(fileSize), 1KiB), kMinBlock, kMaxBlock).
 uint32_t ChooseBlockSize(uint64_t fileSize);
 
-// Adaptive strong-checksum truncation length in bytes (design §5.3): 8 / 12 / 16.
+// Adaptive strong-checksum truncation length in bytes (design section 5.3): 8 / 12 / 16.
 uint8_t ChooseStrongLen(uint32_t blockCount);
 
 // XXH3-128 over [data, data+len). Defined in delta.cpp (the only xxhash dependency).
@@ -149,7 +149,7 @@ struct MissOp {
     uint32_t len = 0;  // coalesced run of consecutive missing blocks (<= blockSize * run)
 };
 // Per-BuildPlan runtime statistics. All fields are client-local (never on the wire, HC-02);
-// they back the early-stop heuristic and the P1 observability asserts (delta-perf §3.1).
+// they back the early-stop heuristic and the P1 observability asserts (delta-perf section 3.1).
 struct DeltaStats {
     uint64_t scannedBytes = 0;        // final rolling pointer p (FR-01, monotonic)
     uint64_t matchedBytes = 0;        // matched full blocks * blockSize (FR-01, monotonic)
@@ -170,7 +170,7 @@ struct DeltaPlan {
 // default prefix formula) so existing callers (sync_engine.cpp) need no change (HC-02/NFR-04).
 struct BuildOptions {
     bool     enableEarlyStop     = true;  // AC-09 equivalence comparisons set this false
-    uint64_t prefixBytesOverride = 0;     // 0 = default formula; >0 = test seed (delta-perf §8)
+    uint64_t prefixBytesOverride = 0;     // 0 = default formula; >0 = test seed (delta-perf section 8)
 };
 
 // Projected-rejection predicate (FR-02/FR-03): extrapolate the matched fraction observed over
@@ -188,11 +188,11 @@ uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize);
 // funnel (bucket -> 32-bit weak -> truncated XXH3-128) and emit the reconstruction plan
 // (FR-13/14/15/16). The short trailing block is never matched and is always a MissOp.
 // The optional opt enables early stop (default) and test overrides; the 3-argument form keeps
-// the legacy behavior contract (delta-perf §3.1).
+// the legacy behavior contract (delta-perf section 3.1).
 DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t oldLen,
                     const BuildOptions& opt = {});
 
-// Benefit rejection (FR-17, design §5.6): reject delta when downloadBytes/newFileBytes >= T.
+// Benefit rejection (FR-17, design section 5.6): reject delta when downloadBytes/newFileBytes >= T.
 bool BenefitRejected(uint64_t downloadBytes, uint64_t newFileBytes);
 
 // --- Streaming BuildPlan (unified-disk-io-driver FR-15/16/17, AC-01..04). Produces a DeltaPlan
@@ -207,7 +207,7 @@ bool BenefitRejected(uint64_t downloadBytes, uint64_t newFileBytes);
 // implements it; in equivalence tests a memory span implements it.
 using ByteSource = std::function<size_t(uint8_t* dst, size_t maxLen)>;
 
-// Optional per-match capture (design D-01 A / FR-15 "命中即捕获"): called exactly once for each
+// Optional per-match capture (design D-01 A / FR-15 "capture on match"): called exactly once for each
 // matched full block, with the live window bytes [srcOffsetOld, srcOffsetOld+len). Lets the client
 // write the copy into the temp file during the single scan pass (no second read, no whole-file
 // buffer). Equivalence tests leave it empty; it never affects the returned DeltaPlan.

@@ -31,11 +31,11 @@ void TestAlignMath() {
     Require(IsAligned(8192, 4096), "8192 aligned to 4096");
     Require(!IsAligned(8191, 4096), "8191 not aligned");
 
-    // 16 KiB page replica (Apple Silicon) — AC-15.
+    // 16 KiB page replica (Apple Silicon) - AC-15.
     const uint32_t p16 = 16u * 1024;
     Require(AlignDown(20000, p16) == p16, "16k aligndown");
     Require(AlignUp(20000, p16) == 2u * p16, "16k alignup");
-    // 64 KiB page replica (ARM64 Linux) — AC-15.
+    // 64 KiB page replica (ARM64 Linux) - AC-15.
     const uint32_t p64 = 64u * 1024;
     Require(AlignUp(1, p64) == p64, "64k alignup tiny");
     Require(AlignDown(p64 + 1, p64) == p64, "64k aligndown");

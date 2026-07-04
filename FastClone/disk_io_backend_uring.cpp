@@ -1,9 +1,9 @@
 // Linux io_uring backend with runtime probe + bounded pread/pwrite pool fallback
-// (unified-disk-io-driver design §3.4.2 / §7.3, FR-04/05/10, AC-10/11/12).
+// (unified-disk-io-driver design section 3.4.2 / section 7.3, FR-04/05/10, AC-10/11/12).
 //
 // Compiles ONLY on Linux and is empty elsewhere. The io_uring code is additionally guarded by
 // `__has_include(<liburing.h>)`: on kernels/toolchains without liburing the io_uring segment is
-// not compiled at all and CreatePlatformBackend returns the pread/pwrite pool (design §7.3 compile
+// not compiled at all and CreatePlatformBackend returns the pread/pwrite pool (design section 7.3 compile
 // guard). At runtime, if io_uring_queue_init fails (-ENOSYS / -EPERM / resource exhaustion) the
 // backend also falls back to the pool and records ioUringFallback (AC-11). O_DIRECT is used for the
 // unbuffered path; an O_DIRECT open/IO EINVAL silently falls back to buffered (AC-12), handled by
@@ -444,7 +444,7 @@ std::unique_ptr<PlatformIoBackend> CreatePlatformBackend(const IoDriverConfig& c
     // record ioUringFallback=1 so counters()/FR-30 observe the degradation (AC-11).
     return CreatePosixPoolBackend(cfg, /*ioUringFallback=*/true);
 #else
-    // No liburing at build time: pool only (design §7.3 compile guard). This is still an io_uring
+    // No liburing at build time: pool only (design section 7.3 compile guard). This is still an io_uring
     // fallback from the caller's perspective, so record ioUringFallback=1 (AC-11).
     return CreatePosixPoolBackend(cfg, /*ioUringFallback=*/true);
 #endif

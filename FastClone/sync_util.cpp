@@ -55,7 +55,7 @@ bool IsDebugEnabled() {
     return enabled;
 }
 
-// Design §A.3: --diag must also honour the FASTCLONE_DIAG environment variable,
+// Design section A.3: --diag must also honour the FASTCLONE_DIAG environment variable,
 // reusing the same boolean parsing as FASTCLONE_DEBUG.
 bool IsDiagEnabled() {
     static const bool enabled = ParseBoolEnv("FASTCLONE_DIAG");
@@ -66,7 +66,7 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
     if (reason.empty()) {
         return false;
     }
-    // Maintenance contract (string-matched throw sites — keep in sync when editing):
+    // Maintenance contract (string-matched throw sites - keep in sync when editing):
     //   NegotiateHelloAsClient / HandshakeClientNew (FC6): "Server error: ...",
     //     "Server HELLO missing", "Protocol version mismatch: ...",
     //     "Server authentication rejected"
@@ -76,7 +76,7 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
     //   recv thread (sync_engine.cpp): "client received wrong-direction/unknown frame: ..."
     //   RecvFrame (protocol.cpp): "RecvFrame desync: ..."
     // Future: replace with DisconnectReason enum at throw sites (see sync_util.h).
-    // Handshake / configuration errors — retrying cannot succeed.
+    // Handshake / configuration errors - retrying cannot succeed.
     if (reason.find("Protocol version mismatch") != std::string::npos) {
         return true;
     }
@@ -90,14 +90,14 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
         return true;
     }
     // AuthOk role/sessionId violations (review B-04 / B4-R1: JoinAck sessionId echo check)
-    // — a malformed handshake reply cannot be fixed by retrying the same server.
+    // - a malformed handshake reply cannot be fixed by retrying the same server.
     if (reason.find("Protocol error: ") == 0) {
         return true;
     }
     if (reason.find("Server error: ") == 0) {
         return true;
     }
-    // Wire desync / wrong-direction frames — reconnecting will not realign the stream.
+    // Wire desync / wrong-direction frames - reconnecting will not realign the stream.
     if (reason.find("client received wrong-direction/unknown frame") != std::string::npos) {
         return true;
     }
@@ -107,9 +107,10 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
     return false;
 }
 
-// TryNormalizeMtimeToUnixNs 的实现已迁至 compare_phase.cpp（M1 修复：mtime 归一化单一真相源，
-// sync 与 FastCheck 共用同一份）。本 TU 不再重复定义；符号由 compare_phase.cpp 提供，
-// 链接闭包内含 compare_phase 的 target（FastClone / FastCloneTests）自动满足。
+// The TryNormalizeMtimeToUnixNs implementation has moved to compare_phase.cpp (M1 fix: single source of
+// truth for mtime normalization, shared by sync and FastCheck). This TU no longer redefines it; the symbol
+// is provided by compare_phase.cpp, which is satisfied automatically by targets whose link closure includes
+// compare_phase (FastClone / FastCloneTests).
 
 #ifdef _WIN32
 std::wstring Utf8ToWide(const std::string& value) {

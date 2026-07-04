@@ -1,9 +1,9 @@
 // Unit tests for the WAN small-file tuning pure functions
-// (docs/design/wan-smallfile-perf.md §3.2/§3.3, verification points V-01/V-02/V-09/V-11).
+// (docs/design/wan-smallfile-perf.md section 3.2/section 3.3, verification points V-01/V-02/V-09/V-11).
 //
 // These cover the RTT-gated decisions WITHOUT touching the network: RTT injection drives the
 // hash in-flight depth, the delta-signal in-flight depth and the WAN stream ladder, while the
-// LAN / 同城 path (RTT <= threshold) must stay byte-for-byte on the legacy values so the
+// LAN / metro path (RTT <= threshold) must stay byte-for-byte on the legacy values so the
 // zero-regression guarantee (HC-04/NFR-03) is machine-checked.
 
 #include "cli.h"
@@ -23,11 +23,11 @@ void Require(bool cond, const char* msg) {
 }
 
 // Legacy hash depth at the default auto stream count (streamLimit=4): the original
-// clamp(max(1024, 4*256), 1024, 8192) == 1024. Every LAN/同城 RTT must reproduce it exactly.
+// clamp(max(1024, 4*256), 1024, 8192) == 1024. Every LAN/metro RTT must reproduce it exactly.
 void TC_HashDepthLanUnchanged() {
-    for (long rtt : {-1L, 0L, 1L, 5L, 10L}) {  // probe-missing, LAN, 同城, exactly at the gate
+    for (long rtt : {-1L, 0L, 1L, 5L, 10L}) {  // probe-missing, LAN, metro, exactly at the gate
         const size_t depth = fc::ComputeHashInflightDepth(rtt, 4, 0);
-        Require(depth == 1024, "LAN/同城 hash depth must equal the legacy 1024 (zero regression)");
+        Require(depth == 1024, "LAN/metro hash depth must equal the legacy 1024 (zero regression)");
     }
     // Explicit higher stream counts still reproduce the legacy clamp on LAN.
     Require(fc::ComputeHashInflightDepth(5, 16, 0) == 4096, "legacy clamp: 16*256=4096 on LAN");

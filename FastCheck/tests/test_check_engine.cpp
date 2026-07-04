@@ -25,7 +25,7 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
-// 按相对路径查找逐文件条目（filter 通过者才入 entries）。
+// Find a per-file entry by relative path (only filter-passing ones enter entries).
 const DiffEntry* FindEntry(const CheckResult& r, const std::string& path) {
     for (const DiffEntry& e : r.entries) {
         if (e.path == path) {
@@ -35,7 +35,7 @@ const DiffEntry* FindEntry(const CheckResult& r, const std::string& path) {
     return nullptr;
 }
 
-// 内存脚本替身：recv 依次弹出 inbound；耗尽时按「有序关闭」抛异常（复刻断连语义）。send 记录帧。
+// In-memory scripted double: recv pops inbound in order; when exhausted it throws an "orderly close" exception (replicating disconnect semantics). send records frames.
 struct MockChannel {
     std::deque<Frame> inbound;
     std::vector<Frame> sent;
@@ -110,7 +110,7 @@ void AssertNoTransferFrames(const MockChannel& mock) {
     Expect(!mock.SentAny(MsgType::DeltaRangeOpen), "engine must never send DeltaRangeOpen (AC-36)");
 }
 
-// size-only 模式：same/diff/missing/extra 计数，且不发任何 HashRequest（AC-27/28/29）。
+// size-only mode: same/diff/missing/extra counts, and sends no HashRequest (AC-27/28/29).
 void TestSizeOnlyCountsNoHash() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "a.txt", "aaa");      // 3 bytes -> same as manifest
@@ -139,18 +139,18 @@ void TestSizeOnlyCountsNoHash() {
     Expect(mock.SentAny(MsgType::SyncDone), "clean finish sends SyncDone (AC-35)");
     AssertNoTransferFrames(mock);
 
-    // B-01/B-02 回归：EXTRA 的 remoteSize 必须 null、localSize=本地实际大小（FR-24/AC-31）。
+    // B-01/B-02 regression: EXTRA's remoteSize must be null, localSize=the actual local file size (FR-24/AC-31).
     const DiffEntry* extra = FindEntry(outcome.result, "extra.txt");
     Expect(extra != nullptr, "extra.txt entry present");
     Expect(!extra->remoteSize.has_value(), "EXTRA remoteSize must be null (B-01)");
     Expect(extra->localSize.has_value() && *extra->localSize == 1, "EXTRA localSize = local file size (1)");
-    // MISSING 的 remoteSize 必须为 manifest 实际大小、localSize null（FR-24/AC-31）。
+    // MISSING's remoteSize must be the actual manifest size, localSize null (FR-24/AC-31).
     const DiffEntry* missing = FindEntry(outcome.result, "missing.txt");
     Expect(missing != nullptr, "missing.txt entry present");
     Expect(missing->remoteSize.has_value() && *missing->remoteSize == 10,
            "MISSING remoteSize = manifest size (10) (B-02)");
     Expect(!missing->localSize.has_value(), "MISSING localSize must be null");
-    // DIFF（size）两侧 size 均有：local=5, remote=999。
+    // DIFF (size) both sides have a size: local=5, remote=999.
     const DiffEntry* diff = FindEntry(outcome.result, "b.txt");
     Expect(diff != nullptr, "b.txt DIFF entry present");
     Expect(diff->localSize.has_value() && *diff->localSize == 5, "DIFF localSize = 5");
@@ -160,14 +160,14 @@ void TestSizeOnlyCountsNoHash() {
     fs::remove_all(dir, ec);
 }
 
-// strict 模式：大小同触发 HashRequest；hash 相同 -> Same，不同 -> Diff（AC-25）。
+// strict mode: same size triggers HashRequest; hash equal -> Same, different -> Diff (AC-25).
 void TestStrictHashSameAndDiff() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "f1.txt", "hello");
     WriteFile(dir / "f2.txt", "world");
     const Hash256 h1 = ComputeFileHash(dir / "f1.txt");
     Hash256 wrong{};
-    wrong[0] = 0xAB;  // 故意错的远端 hash -> Diff
+    wrong[0] = 0xAB;  // deliberately wrong remote hash -> Diff
 
     MockChannel mock;
     mock.inbound.push_back(ManifestEntryFrame("f1.txt", 5));
@@ -191,7 +191,7 @@ void TestStrictHashSameAndDiff() {
     fs::remove_all(dir, ec);
 }
 
-// 双方一致 -> 退出码 0；且不发 HashRequest（size-only）。
+// Both sides identical -> exit code 0; and sends no HashRequest (size-only).
 void TestIdenticalExitZero() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "a.txt", "aaa");
@@ -216,7 +216,7 @@ void TestIdenticalExitZero() {
     fs::remove_all(dir, ec);
 }
 
-// Ctrl+C：预置 interrupted -> partial + 退出码 4（AC-21）。
+// Ctrl+C: preset interrupted -> partial + exit code 4 (AC-21).
 void TestInterruptedPartial() {
     const fs::path dir = MakeTempDir();
     MockChannel mock;
@@ -225,7 +225,7 @@ void TestInterruptedPartial() {
 
     CheckOptions o = BaseOptions(dir, Mode::SizeOnly);
     FrameChannel ch = mock.Make();
-    std::atomic<bool> interrupted{true};  // 开跑即中断
+    std::atomic<bool> interrupted{true};  // interrupted right at start
     const EngineOutcome outcome = RunCheck(o, ch, interrupted);
 
     Expect(outcome.exit == kInterrupted, "interrupted -> exit 4");
@@ -235,7 +235,7 @@ void TestInterruptedPartial() {
     fs::remove_all(dir, ec);
 }
 
-// 断连：recv 抛异常 -> partial + 退出码 2（AC-48）。
+// Disconnect: recv throws -> partial + exit code 2 (AC-48).
 void TestDisconnectExitTwo() {
     const fs::path dir = MakeTempDir();
     MockChannel mock;
@@ -253,9 +253,9 @@ void TestDisconnectExitTwo() {
     fs::remove_all(dir, ec);
 }
 
-// 空目录三态（边界条件）。
+// Empty-directory three states (boundary condition).
 void TestEmptyDirectories() {
-    // (1) manifest 空 + 本地空 -> 全 0，退出码 0。
+    // (1) manifest empty + local empty -> all 0, exit code 0.
     {
         const fs::path dir = MakeTempDir();
         MockChannel mock;
@@ -271,7 +271,7 @@ void TestEmptyDirectories() {
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
-    // (2) manifest 空 + 本地有文件 -> 全 EXTRA，退出码 1。
+    // (2) manifest empty + local has files -> all EXTRA, exit code 1.
     {
         const fs::path dir = MakeTempDir();
         WriteFile(dir / "only_local.txt", "z");
@@ -290,7 +290,7 @@ void TestEmptyDirectories() {
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
-    // (3) manifest 有文件 + 本地空 -> 全 MISSING，退出码 1。
+    // (3) manifest has files + local empty -> all MISSING, exit code 1.
     {
         const fs::path dir = MakeTempDir();
         MockChannel mock;
@@ -312,10 +312,10 @@ void TestEmptyDirectories() {
     }
 }
 
-// G1：Fast 模式 size 同 + mtime 异 -> needHash -> HashRequest -> hash 同/异分别得 Same/Diff。
-// 补 engine 层 Fast-hash 路径缺口（决策层已由 test_compare_phase 覆盖，此处补编排+收尾）。
-// manifest 用固定 mtimeNs=2023（kFixedManifestMtime），本地文件 mtime 为当前时刻（2026），
-// 归一后两侧差远 > 2ms 容差，必触发 needHash。
+// G1: Fast mode same size + mtime differs -> needHash -> HashRequest -> hash same/different yields Same/Diff respectively.
+// Fills the engine-layer Fast-hash path gap (the decision layer is already covered by test_compare_phase; here we cover orchestration + wrap-up).
+// manifest uses a fixed mtimeNs=2023 (kFixedManifestMtime), the local file mtime is the current moment (2026),
+// so after normalization the two sides differ far more than the 2ms tolerance, definitely triggering needHash.
 void TestFastHashSameAndDiff() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "f1.txt", "hello");
@@ -342,7 +342,7 @@ void TestFastHashSameAndDiff() {
     Expect(outcome.exit == kDiffFound, "one diff -> exit 1");
     AssertNoTransferFrames(mock);
 
-    // hashCompared 标志：Fast 走 hash 的条目必须 hash_compared=true（FR-24/AC-22）。
+    // hashCompared flag: entries that went through hash in Fast must have hash_compared=true (FR-24/AC-22).
     const DiffEntry* diff = FindEntry(outcome.result, "f2.txt");
     Expect(diff != nullptr, "f2.txt DIFF entry present");
     Expect(diff->hashCompared, "fast-hash DIFF entry hash_compared=true (G1)");
@@ -351,11 +351,11 @@ void TestFastHashSameAndDiff() {
     fs::remove_all(dir, ec);
 }
 
-// G3：--checkers=1 串行化在飞 HashRequest，仍能正确完成全部比对、不死锁。
-// 黑盒不可直接断言「在飞<=1」，但 checkers=1 + 多文件 hash 全完成即证明串行路径无死锁/无丢响应。
+// G3: --checkers=1 serializes in-flight HashRequests, still completing all comparisons correctly without deadlock.
+// A black box cannot directly assert "in-flight<=1", but checkers=1 + all multi-file hashes completing proves the serial path has no deadlock/no lost responses.
 void TestCheckersOneSerializesHash() {
     const fs::path dir = MakeTempDir();
-    // 写 3 个同 size 文件，使三者均触发 needHash（Fast：mtime 异于 manifest 的 2023）。
+    // Write 3 files of the same size so all three trigger needHash (Fast: mtime differs from the manifest's 2023).
     WriteFile(dir / "a.txt", "aaa");
     WriteFile(dir / "b.txt", "bbb");
     WriteFile(dir / "c.txt", "ccc");
@@ -368,7 +368,7 @@ void TestCheckersOneSerializesHash() {
     mock.inbound.push_back(ManifestEntryFrame("b.txt", 3));
     mock.inbound.push_back(ManifestEntryFrame("c.txt", 3));
     mock.inbound.push_back(ManifestEndFrame());
-    // 响应顺序与请求一致（checkers=1 下至多一个在飞，响应按序返回）。
+    // Response order matches request order (with checkers=1 at most one is in flight, responses return in order).
     mock.inbound.push_back(HashResponseFrame("a.txt", ha));
     mock.inbound.push_back(HashResponseFrame("b.txt", hb));
     mock.inbound.push_back(HashResponseFrame("c.txt", hc));
@@ -389,13 +389,13 @@ void TestCheckersOneSerializesHash() {
     fs::remove_all(dir, ec);
 }
 
-// G4：engine 层 filter 已焙进 entries 向量（record lambda 按 o.filter 过滤后才 push）。
-// --filter DIFF 时 MISSING/EXTRA 仍计数，但不出现在 entries 中。
+// G4: the engine-layer filter is already baked into the entries vector (the record lambda pushes only after filtering by o.filter).
+// With --filter DIFF, MISSING/EXTRA are still counted but do not appear in entries.
 void TestEngineFilterShapesEntries() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "same.txt", "aaa");
     WriteFile(dir / "diff.txt", "bbbbb");     // manifest 999 -> size diff -> DIFF
-    WriteFile(dir / "extra.txt", "x");        // 不在 manifest -> EXTRA
+    WriteFile(dir / "extra.txt", "x");        // not in manifest -> EXTRA
 
     MockChannel mock;
     mock.inbound.push_back(ManifestEntryFrame("same.txt", 3));
@@ -409,11 +409,11 @@ void TestEngineFilterShapesEntries() {
     std::atomic<bool> interrupted{false};
     const EngineOutcome outcome = RunCheck(o, ch, interrupted);
 
-    // 计数不受 filter 影响（摘要始终全量）。
+    // Counts are unaffected by the filter (the summary is always full).
     Expect(outcome.result.counters.diff == 1, "filter DIFF still counts diff=1");
     Expect(outcome.result.counters.missing == 1, "filter DIFF still counts missing=1");
     Expect(outcome.result.counters.extraLocal == 1, "filter DIFF still counts extra=1");
-    // entries 只含 DIFF（G4：engine 层过滤，非仅渲染层）。
+    // entries contain only DIFF (G4: engine-layer filtering, not just the render layer).
     Expect(FindEntry(outcome.result, "diff.txt") != nullptr, "DIFF entry present in entries (G4)");
     Expect(FindEntry(outcome.result, "missing.txt") == nullptr, "MISSING filtered out of entries (G4)");
     Expect(FindEntry(outcome.result, "extra.txt") == nullptr, "EXTRA filtered out of entries (G4)");

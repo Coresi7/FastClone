@@ -294,7 +294,7 @@ void TestFairness() {
     const uint64_t rf = drv.openFile("r", OpKind::Read, false, 0);
     const uint64_t wf = drv.openFile("w", OpKind::Write, false, 0);
     // Enqueue reads and writes interleaved in ONE submit() call so both queues are populated
-    // before the scheduler (blocked on the same lock) can pick — makes alternation deterministic.
+    // before the scheduler (blocked on the same lock) can pick - makes alternation deterministic.
     std::vector<IoRequest> batch;
     for (int i = 0; i < 150; ++i) {
         IoRequest r;
@@ -713,7 +713,7 @@ void TestUnbufferedRandomWriteNoPollution() {
     fs::remove(tmp, ec);
 }
 
-// unbuffered-writes: with the intent OFF, no op may take the unbuffered/direct path (M5 — off is
+// unbuffered-writes: with the intent OFF, no op may take the unbuffered/direct path (M5 - off is
 // equivalent to buffered), and reads still honour the small-file downgrade gate.
 void TestUnbufferedOffAndReadGate() {
     namespace fs = std::filesystem;

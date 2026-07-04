@@ -20,7 +20,7 @@ const char* ModeString(Mode mode) {
     }
 }
 
-// text 逐文件行的定宽类别标签。
+// Fixed-width category label for text per-file lines.
 const char* CategoryLabel(fc::CompareCategory cat) {
     switch (cat) {
         case fc::CompareCategory::Diff:
@@ -35,7 +35,7 @@ const char* CategoryLabel(fc::CompareCategory cat) {
     }
 }
 
-// json type 字段（大写类别名）。
+// json type field (uppercase category name).
 const char* CategoryJson(fc::CompareCategory cat) {
     switch (cat) {
         case fc::CompareCategory::Diff:
@@ -50,7 +50,7 @@ const char* CategoryJson(fc::CompareCategory cat) {
     }
 }
 
-// 该类别是否应出现在逐文件清单（按 filter）。
+// Whether this category should appear in the per-file listing (per filter).
 bool PassesFilter(fc::CompareCategory cat, const FilterSet& f) {
     switch (cat) {
         case fc::CompareCategory::Diff:
@@ -65,7 +65,7 @@ bool PassesFilter(fc::CompareCategory cat, const FilterSet& f) {
     }
 }
 
-// 最小 JSON 字符串转义（引号/反斜杠/控制字符）。路径为正斜杠，反斜杠罕见但仍需安全。
+// Minimal JSON string escaping (quotes/backslashes/control characters). Paths use forward slashes; backslashes are rare but still need to be safe.
 std::string JsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
@@ -102,7 +102,7 @@ std::string JsonEscape(const std::string& s) {
 
 void RenderSummaryLineText(std::ostream& os, const CheckResult& r) {
     const fc::CompareCounters& c = r.counters;
-    // NFR-07：partial 绝不输出「比对完成」成功语义。
+    // NFR-07: partial must never emit the "comparison completed" success semantics.
     if (r.partial) {
         os << "[PARTIAL] Check incomplete.";
     } else {
@@ -170,7 +170,7 @@ void RenderJson(std::ostream& os, const CheckResult& r, const FilterSet& f, bool
 
 int WriteReport(const CheckOptions& o, const CheckResult& r) {
     if (o.output.empty()) {
-        // 仅终端：按所选格式输出完整报告。
+        // Terminal only: emit the full report in the selected format.
         if (o.format == Format::Json) {
             RenderJson(std::cout, r, o.filter, o.summaryOnly);
         } else {
@@ -178,7 +178,7 @@ int WriteReport(const CheckOptions& o, const CheckResult& r) {
         }
         return 0;
     }
-    // --output：终端仅输出终态摘要行；完整报告写文件（FR-08）。
+    // --output: the terminal emits only the final summary line; the full report is written to the file (FR-08).
     RenderText(std::cout, r, o.filter, /*summaryOnly=*/true);
     std::ofstream file(std::filesystem::path(o.output), std::ios::binary | std::ios::trunc);
     if (!file) {
