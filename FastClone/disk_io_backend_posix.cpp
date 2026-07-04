@@ -348,6 +348,16 @@ std::unique_ptr<PlatformIoBackend> CreatePosixPoolBackend(const IoDriverConfig& 
     return std::make_unique<PosixPoolBackend>(cfg, ioUringFallback);
 }
 
+#if defined(__APPLE__)
+// macOS has no io_uring; the bounded pread/pwrite pool (with F_NOCACHE unbuffered intent) is the
+// primary backend, not a fallback, so ioUringFallback stays 0 (design §7.4, pool header note). On
+// Linux this factory lives in disk_io_backend_uring.cpp instead, so this definition is guarded to
+// macOS only to avoid a duplicate symbol.
+std::unique_ptr<PlatformIoBackend> CreatePlatformBackend(const IoDriverConfig& cfg) {
+    return CreatePosixPoolBackend(cfg, /*ioUringFallback=*/false);
+}
+#endif  // __APPLE__
+
 }  // namespace fc::io
 
 #endif  // __APPLE__ || __linux__
