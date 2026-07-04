@@ -1,5 +1,7 @@
 #include "sync_engine_internal.h"
 
+#include "compare_phase.h"
+
 namespace fs = std::filesystem;
 
 namespace fc {
@@ -53,34 +55,23 @@ enum class CompareAction {
     FallbackHash
 };
 
+// fastcheck 纯重构：比对判定统一走共享的 compare_phase::DecideCompare（Fast 模式），mtime 容差
+// /归一化/遗留裸值兜底逻辑已逐字迁入 compare_phase，Fast 分支真值表与旧实现字节级等价。此处仅
+// 把 CompareOutcome 映射回 client 既有的 CompareAction：Missing/Diff→TransferNow、Same→Skip、
+// needHash→FallbackHash。
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
-    constexpr int64_t kMtimeToleranceNs = 2LL * 1000LL * 1000LL;  // 2ms tolerance
-    constexpr int64_t kLegacyRawTolerance = 2LL * 1000LL * 1000LL;
-    if (!localFile.has_value()) {
-        return CompareAction::TransferNow;
+    const CompareOutcome outcome = DecideCompare(CompareMode::Fast, localFile, remoteFile);
+    if (outcome.needHash) {
+        return CompareAction::FallbackHash;
     }
-    if (localFile->fileSize != remoteFile.fileSize) {
-        return CompareAction::TransferNow;
-    }
-
-    // Cross-platform compare: normalize both sides to Unix ns before tolerance check.
-    int64_t localUnixNs = 0;
-    int64_t remoteUnixNs = 0;
-    const bool localNormalized = TryNormalizeMtimeToUnixNs(localFile->mtimeNs, localUnixNs);
-    const bool remoteNormalized = TryNormalizeMtimeToUnixNs(remoteFile.mtimeNs, remoteUnixNs);
-    if (localNormalized && remoteNormalized) {
-        const int64_t mtimeDeltaNs = std::llabs(static_cast<long long>(localUnixNs - remoteUnixNs));
-        if (mtimeDeltaNs <= kMtimeToleranceNs) {
+    switch (outcome.category) {
+        case CompareCategory::Missing:
+        case CompareCategory::Diff:
+            return CompareAction::TransferNow;
+        case CompareCategory::Same:
+        default:
             return CompareAction::Skip;
-        }
-    } else {
-        // Compatibility fallback for legacy/invalid timestamp payloads.
-        const int64_t rawDelta = std::llabs(static_cast<long long>(localFile->mtimeNs - remoteFile.mtimeNs));
-        if (rawDelta <= kLegacyRawTolerance) {
-            return CompareAction::Skip;
-        }
     }
-    return CompareAction::FallbackHash;
 }
 
 struct RemoveLocalExtrasResult {
@@ -167,7 +158,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                 }
                 ctx.localDirs.push_back(relPath);
                 subdirs.push_back(PendingDir{std::move(absPath), std::move(relPath)});
-            } else if (!remoteFiles.contains(relPath)) {
+            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck 纯重构：等价谓词
                 filesToDelete.push_back(std::move(absPath));
             }
         } while (FindNextFileW(hFind, &fd) != 0);
@@ -239,7 +230,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                 if (!isSymlink) {
                     subdirs.push_back(PendingDir{absPath, std::move(relPath)});
                 }
-            } else if (!remoteFiles.contains(relPath)) {
+            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck 纯重构：等价谓词
                 filesToDelete.push_back(absPath);
             }
         }
@@ -2158,7 +2149,10 @@ int RunClient(const CliOptions& options) {
             if (!remoteHashReady || (!localHashReady && !localFailed)) {
                 continue;
             }
-            if (localFailed || !localHashReady || !HashEquals(localHash, remoteHash)) {
+            // fastcheck 纯重构：diff/same 收尾统一走 compare_phase::ClassifyByHash。此处 :2157 已
+            // gate 掉 (!localHashReady && !localFailed)，故 localHashReady 必为 true，可读性等价于
+            // !localFailed。语义与旧 (localFailed || !localHashReady || !HashEquals(...)) 一致。
+            if (ClassifyByHash(!localFailed, localHash, remoteHash) == CompareCategory::Diff) {
                 // Same size, content differs: try block-level delta before full download.
                 if (!tryEnterDelta(rel)) {
                     scheduleTransfer(rel);

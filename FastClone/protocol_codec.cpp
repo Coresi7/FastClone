@@ -65,6 +65,24 @@ SessionJoinInfo DecodeSessionJoin(const std::vector<uint8_t>& payload) {
     return info;
 }
 
+std::vector<uint8_t> EncodeCheckAuth(const CheckAuthInfo& info) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, info.password);
+    payload.push_back(info.flags);
+    return payload;
+}
+
+CheckAuthInfo DecodeCheckAuth(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    CheckAuthInfo info;
+    info.password = ReadString(payload, cursor);
+    // flags 字节尾随 password；缺失时按 0 解（兼容未来演进 / 旧载荷）。
+    if (cursor < payload.size()) {
+        info.flags = payload[cursor++];
+    }
+    return info;
+}
+
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry) {
     std::vector<uint8_t> payload;
     payload.push_back(entry.isDirectory ? 1 : 0);

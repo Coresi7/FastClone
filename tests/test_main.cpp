@@ -15,6 +15,8 @@ void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
 void RunWanTuningTests();
+void RunComparePhaseTests();
+void RunProtocolCodecTests();
 
 int main() {
     try {
@@ -32,6 +34,8 @@ int main() {
         RunRouteSelectionTests();
         RunLinkSchedulerTests();
         RunWanTuningTests();
+        RunComparePhaseTests();
+        RunProtocolCodecTests();
         std::cout << "All FastClone tests passed." << std::endl;
         return 0;
     } catch (const std::exception& ex) {

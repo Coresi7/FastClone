@@ -21,6 +21,7 @@ set(FASTCLONE_DISK_IO_SOURCES
 add_executable(FastClone
     FastClone/cli.cpp
     FastClone/client_handshake.cpp
+    FastClone/compare_phase.cpp
     FastClone/delta.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
@@ -74,6 +75,7 @@ enable_testing()
 
 add_executable(FastCloneTests
     FastClone/cli.cpp
+    FastClone/compare_phase.cpp
     FastClone/delta.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
@@ -86,6 +88,8 @@ add_executable(FastCloneTests
     ${FASTCLONE_DISK_IO_SOURCES}
     tests/test_main.cpp
     tests/test_cli.cpp
+    tests/test_compare_phase.cpp
+    tests/test_protocol_codec.cpp
     tests/test_delta.cpp
     tests/test_streaming_buildplan.cpp
     tests/test_disk_io_align.cpp
@@ -164,3 +168,58 @@ if(WIN32)
         _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(FastCloneRouteProbe PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
+
+# --- FastCheck: 只读目录比对独立工具（fastcheck；additive，不触碰 FastClone/FastCloneTests） ---
+# 依赖闭包：check 源 + 共享 compare_phase + file_index(ComputeFileHash,+xxhash) +
+# client_handshake/protocol/protocol_codec/win_socket。明确不链 sync_engine_client/server/shared、
+# delta、main、transfer_tuning、hash_memcache、net_topology、cli（FR-33/AC-42），也不链 disk_io
+# 五件套（file_index.ComputeFileHash 不依赖 disk_io，§8.2/FR-34）。
+set(FASTCHECK_SHARED_SOURCES
+    FastCheck/check_cli.cpp
+    FastCheck/check_engine.cpp
+    FastCheck/check_report.cpp
+    FastClone/compare_phase.cpp
+    FastClone/file_index.cpp
+    FastClone/client_handshake.cpp
+    FastClone/protocol.cpp
+    FastClone/protocol_codec.cpp
+    FastClone/win_socket.cpp
+)
+
+# xxhash / Win 链接与 FastClone 复用同一解析结果，封装成函数避免在两个 target 上重复。
+function(fastcheck_configure_target tgt)
+    target_include_directories(${tgt} PRIVATE FastClone FastCheck)
+    target_link_libraries(${tgt} PRIVATE Threads::Threads)
+    if(XXHASH_FOUND)
+        target_include_directories(${tgt} PRIVATE ${XXHASH_INCLUDE_DIRS})
+        target_link_directories(${tgt} PRIVATE ${XXHASH_LIBRARY_DIRS})
+        target_link_libraries(${tgt} PRIVATE ${XXHASH_LIBRARIES})
+        target_compile_options(${tgt} PRIVATE ${XXHASH_CFLAGS_OTHER})
+    else()
+        target_include_directories(${tgt} PRIVATE ${XXHASH_INCLUDE_DIR})
+        target_link_libraries(${tgt} PRIVATE ${XXHASH_LIBRARY})
+    endif()
+    if(WIN32)
+        target_compile_definitions(${tgt} PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+        # win_socket 需 ws2_32；无 net_topology 故不需 iphlpapi/bcrypt。
+        target_link_libraries(${tgt} PRIVATE ws2_32)
+    endif()
+endfunction()
+
+add_executable(FastCheck
+    FastCheck/check_main.cpp
+    ${FASTCHECK_SHARED_SOURCES}
+)
+fastcheck_configure_target(FastCheck)
+install(TARGETS FastCheck RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# FastCheckTests：链接同 FastCheck（去 check_main.cpp，加测试入口），兼作 FastCheck link 闭包冒烟。
+add_executable(FastCheckTests
+    ${FASTCHECK_SHARED_SOURCES}
+    FastCheck/tests/test_main.cpp
+    FastCheck/tests/test_check_engine.cpp
+    FastCheck/tests/test_check_report.cpp
+    FastCheck/tests/test_check_cli.cpp
+)
+fastcheck_configure_target(FastCheckTests)
+add_test(NAME FastCheckTests COMMAND FastCheckTests)

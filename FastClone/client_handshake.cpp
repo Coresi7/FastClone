@@ -70,6 +70,30 @@ AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& pas
     return info;
 }
 
+// FastCheck 只读会话握手（fastcheck）：Hello -> CheckAuth(password) -> AuthOk(NewSession)。
+// 服务端在 HandshakeAndResolveSession 的 CheckAuth 分支解析后返回 SessionType::Check 会话。
+AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& password) {
+    NegotiateHelloAsClient(socket);
+    CheckAuthInfo checkAuth;
+    checkAuth.password = password;
+    SendFrame(socket, Frame{MsgType::CheckAuth, 0, EncodeCheckAuth(checkAuth)});
+    Frame authResult = RecvFrame(socket);
+    if (authResult.type != MsgType::AuthOk) {
+        const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
+        throw std::runtime_error("Server authentication rejected: " + payload);
+    }
+    AuthOkInfo info = DecodeAuthOk(authResult.payload);
+    // Check 会话由服务端以 NewSession 角色确认；其它角色/空 sessionId 均为协议违例。
+    if (info.role != AuthOkRole::NewSession) {
+        throw std::runtime_error(
+            "Protocol error: expected AuthOk role NewSession on CheckAuth, got JoinAck");
+    }
+    if (info.sessionId.empty()) {
+        throw std::runtime_error("Protocol error: AuthOk(NewSession) carried an empty sessionId");
+    }
+    return info;
+}
+
 // Client follow-up connection: Hello -> SessionJoin(sessionId,pwd) -> AuthOk(JoinAck).
 void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
                          const std::string& sessionId) {

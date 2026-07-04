@@ -34,4 +34,9 @@ AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& pas
 void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
                          const std::string& sessionId);
 
+// FastCheck 只读会话握手（fastcheck）：Hello -> CheckAuth -> AuthOk(NewSession)。
+// 与 HandshakeClientNew 同构，仅认领帧换成 MsgType::CheckAuth，向服务端标识这是 Check 会话。
+// 失败/认证失败/版本不符抛 std::runtime_error（调用方据此映射退出码 2）。
+AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& password);
+
 }  // namespace fc

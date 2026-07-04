@@ -16,6 +16,9 @@ enum class MsgType : uint8_t {
     // Multipath (FC6): a follow-up connection claims an existing logical session by
     // sessionId instead of starting a new one. Sent by the client in place of Auth.
     SessionJoin = 5,
+    // FastCheck（fastcheck，FC7 加法式）：只读比对客户端用 CheckAuth 认领会话，替代 Auth。
+    // 占用 SessionJoin=5 与 ManifestRequest=10 之间的空槽，不改任何既有帧布局。
+    CheckAuth = 6,
     ManifestRequest = 10,
     ManifestEntry = 11,
     ManifestEnd = 12,

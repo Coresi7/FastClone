@@ -107,30 +107,9 @@ bool IsFatalClientDisconnectReason(const std::string& reason) {
     return false;
 }
 
-bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs) {
-    // Heuristic shared with file_index.cpp compatibility logic:
-    // values above this threshold are very likely Unix nanoseconds.
-    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
-    // 1970-01-01 UTC offset in FILETIME 100ns ticks since 1601-01-01.
-    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
-
-    if (rawMtime > kLikelyUnixNsThreshold) {
-        outUnixNs = rawMtime;
-        return true;
-    }
-    // Treat lower values as FILETIME ticks. If conversion is not meaningful
-    // (e.g. unknown/legacy sentinel), caller can fall back to raw compare.
-    if (rawMtime < kWindowsEpochDiff100ns) {
-        return false;
-    }
-    const int64_t ticksSinceUnixEpoch = rawMtime - kWindowsEpochDiff100ns;
-    if (ticksSinceUnixEpoch > (std::numeric_limits<int64_t>::max)() / 100LL ||
-        ticksSinceUnixEpoch < (std::numeric_limits<int64_t>::min)() / 100LL) {
-        return false;
-    }
-    outUnixNs = ticksSinceUnixEpoch * 100LL;
-    return true;
-}
+// TryNormalizeMtimeToUnixNs 的实现已迁至 compare_phase.cpp（M1 修复：mtime 归一化单一真相源，
+// sync 与 FastCheck 共用同一份）。本 TU 不再重复定义；符号由 compare_phase.cpp 提供，
+// 链接闭包内含 compare_phase 的 target（FastClone / FastCloneTests）自动满足。
 
 #ifdef _WIN32
 std::wstring Utf8ToWide(const std::string& value) {

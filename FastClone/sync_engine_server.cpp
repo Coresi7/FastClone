@@ -71,10 +71,16 @@ struct ServerBatchStream {
 // flag that is defined later; it does not (and cannot) promote it to external linkage.
 extern std::atomic<bool> g_onceTargetClaimed;
 
+// 会话类型（fastcheck）。Sync=既有镜像同步会话（默认，既有路径零影响）；Check=FastCheck
+// 只读比对会话，只服务 manifest 与 hash 请求，不进入传输等待语义。
+enum class SessionType : uint8_t { Sync = 0, Check = 1 };
+
 // Server-side logical session shared by all connections that carry the same sessionId
 // (FR-003/004). Per D-02 it only carries merge identity + lifecycle, not transfer state.
 struct ServerSession {
     std::string sessionId;
+    // fastcheck：会话类型。默认 Sync，仅 CheckAuth 分支置 Check。既有 Sync 路径不读此字段。
+    SessionType type = SessionType::Sync;
     std::atomic<uint32_t> liveConns{0};
     // Lifecycle field: ALWAYS access under SessionRegistry::mu_ (Create/Join/SweepExpired/
     // OnConnectionClosed). It is not atomic, so any unlocked access is a data race.
@@ -222,6 +228,28 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         info.capabilities |= kCapDelta;
         try {
             SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
+        } catch (...) {
+            GetSessionRegistry().OnConnectionClosed(session);
+            throw;
+        }
+        return session;
+    }
+    if (claim.type == MsgType::CheckAuth) {
+        // fastcheck：只读比对会话认领。认证同 Auth，但解析出的会话标记为 Check 且不认领
+        // --once 目标（D-04：Check 只读，不等价于一次同步）。不通告多路端点、不置 kCapDelta
+        // （Check 不做 delta）。
+        const CheckAuthInfo info = DecodeCheckAuth(claim.payload);
+        if (info.password != password) {
+            SendSimple(socket, MsgType::AuthFail, "bad password");
+            throw std::runtime_error("Authentication failed");
+        }
+        std::shared_ptr<ServerSession> session = GetSessionRegistry().CreateSession();
+        session->type = SessionType::Check;
+        AuthOkInfo ok;
+        ok.role = AuthOkRole::NewSession;
+        ok.sessionId = session->sessionId;
+        try {
+            SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(ok)});
         } catch (...) {
             GetSessionRegistry().OnConnectionClosed(session);
             throw;
@@ -741,7 +769,8 @@ BlockSigMemCache& GetBlockSigMemCache() {
 // Per-connection session server. The FC6 handshake + session merge has already been
 // performed by the caller (HandshakeAndResolveSession); this body is unchanged from the
 // single-connection model and runs independently per connection (D-02).
-void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
+void RunSessionServer(const SocketHandle& client, const CliOptions& options,
+                      SessionType sessionType = SessionType::Sync) {
     const std::optional<fs::path> selfPath = CurrentExePath();
     const bool debugEnabled = IsDebugEnabled();
     const bool hashMemcacheEnabled = GetServerHashMemCache().Enabled();
@@ -992,6 +1021,18 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         }
                         throw;
                     }
+                } else if (sessionType == SessionType::Check &&
+                           (frame.type == MsgType::FileOpen ||
+                            frame.type == MsgType::FileBatchOpen ||
+                            frame.type == MsgType::BlockSigRequest ||
+                            frame.type == MsgType::DeltaRangeOpen)) {
+                    // fastcheck：Check 会话不服务任何传输帧；良性 FastCheck 客户端不会发这些帧
+                    // （FR-28/AC-36）。记诊断并忽略，不置 failed、不抛，避免误判为 session failed。
+                    if (debugEnabled) {
+                        std::cerr << "[check] ignore transfer frame in Check session type="
+                                  << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
+                    }
+                    continue;
                 } else if (frame.type == MsgType::FileOpen) {
                     const std::string rel = DecodeFileOpen(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, rel);
@@ -1217,11 +1258,24 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                 }
             }
         } catch (const std::exception& ex) {
-            failed.store(true);
-            done.store(true);
-            sessionHashCv.notify_all();
-            outboundCv.notify_all();
-            errorText = ex.what();
+            // fastcheck 双保险（FR-27/AC-35）：Check 会话在收齐 manifest+hash 后，客户端 FIN 或
+            // 关闭连接属于干净结束。若异常是「有序关闭类」（recv failed WSA=0 / errno=0，与
+            // 分派处 :2087 同判据），则置 done 但不置 failed，避免抛「Server session failed」。
+            const std::string what = ex.what();
+            const bool orderlyClose =
+                what.find("recv failed WSA=0") != std::string::npos ||
+                what.find("recv failed errno=0") != std::string::npos;
+            if (sessionType == SessionType::Check && orderlyClose) {
+                done.store(true);
+                sessionHashCv.notify_all();
+                outboundCv.notify_all();
+            } else {
+                failed.store(true);
+                done.store(true);
+                sessionHashCv.notify_all();
+                outboundCv.notify_all();
+                errorText = what;
+            }
         }
     });
 
@@ -2064,17 +2118,20 @@ int RunServer(const CliOptions& options) {
                 std::cout << "[mp] conn_accept conn=" << connSeq
                           << " sessionId=" << session->sessionId
                           << " live_conns=" << session->liveConns.load() << std::endl;
-                if (options.exitAfterSync && !ClaimOrMatchOnceTarget(session)) {
+                // fastcheck（D-04）：Check 会话是只读比对，不认领 --once 目标、不消耗 once 名额、
+                // 不改 once 判定（NFR-02）。仅 Sync 会话参与 ClaimOrMatchOnceTarget / completedOk。
+                const bool isCheck = (session->type == SessionType::Check);
+                if (options.exitAfterSync && !isCheck && !ClaimOrMatchOnceTarget(session)) {
                     // Fallback guard for a tiny race window: if a second Auth slipped past the
                     // pre-AuthFail check before claimed=true became visible, refuse to serve it.
                     // This path should be rare; normal second Auth is rejected in handshake.
                     std::cerr << "[mp] once_reject_post_auth_fallback conn=" << connSeq
                               << " sessionId=" << session->sessionId << std::endl;
                 } else {
-                    RunSessionServer(client, options);
+                    RunSessionServer(client, options, session->type);
                     std::cout << "[mp] conn_done conn=" << connSeq
                               << " sessionId=" << session->sessionId << std::endl;
-                    if (options.exitAfterSync || options.onceMulti) {
+                    if (!isCheck && (options.exitAfterSync || options.onceMulti)) {
                         session->completedOk.store(true, std::memory_order_relaxed);  // FR-06/07A; om: D-03
                     }
                 }
@@ -2099,7 +2156,9 @@ int RunServer(const CliOptions& options) {
                 }
                 // --once / --once-multi: any real-session lane error marks the session failed
                 // (FR-07). A pre-handshake close has session == null and never sets this (FR-08.1).
-                if ((options.exitAfterSync || options.onceMulti) && session) {
+                // fastcheck（D-04/NFR-02）：Check 会话不参与 once 判定，不折算失败聚合。
+                if ((options.exitAfterSync || options.onceMulti) && session &&
+                    session->type != SessionType::Check) {
                     session->hadError.store(true, std::memory_order_relaxed);
                 }
             }
@@ -2111,7 +2170,7 @@ int RunServer(const CliOptions& options) {
             // --once terminal check: when the last lane of the once-target closes, decide the
             // verdict (FR-06/07/07A) and wake the accept loop. completedOk is set only on the
             // clean conn_done path, so success requires it AND the absence of any lane error.
-            if (options.exitAfterSync && session) {
+            if (options.exitAfterSync && session && session->type != SessionType::Check) {
                 bool isTarget;
                 {
                     std::lock_guard<std::mutex> lk(g_onceMu);
@@ -2121,7 +2180,7 @@ int RunServer(const CliOptions& options) {
                     FireOnceTerminal(session->completedOk.load(std::memory_order_relaxed) &&
                                      !session->hadError.load(std::memory_order_relaxed));
                 }
-            } else if (options.onceMulti && session) {
+            } else if (options.onceMulti && session && session->type != SessionType::Check) {
                 // --once-multi: when a real session's last lane closes, fold its verdict into the
                 // sticky failure aggregate (B5/FR-13). The main thread later reads it at terminal.
                 // No g_onceTarget involvement (§8): every real session is served, not just one.

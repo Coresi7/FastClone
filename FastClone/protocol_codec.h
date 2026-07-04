@@ -63,6 +63,17 @@ struct SessionJoinInfo {
 std::vector<uint8_t> EncodeSessionJoin(const SessionJoinInfo& info);
 SessionJoinInfo DecodeSessionJoin(const std::vector<uint8_t>& payload);
 
+// CheckAuth payload（fastcheck）：password(str) + flags(u8)。刻意结构化（AppendString+flags）
+// 而非 Auth 那样的裸 password 字节，便于往返单测与未来演进。flags 当前恒 0；DecodeCheckAuth
+// 在无 flags 字节时按 0 解，沿用 DecodeAuthOk「剩余字节才读」的容错风格。
+struct CheckAuthInfo {
+    std::string password;
+    uint8_t flags = 0;
+};
+
+std::vector<uint8_t> EncodeCheckAuth(const CheckAuthInfo& info);
+CheckAuthInfo DecodeCheckAuth(const std::vector<uint8_t>& payload);
+
 std::vector<uint8_t> EncodeManifestEntry(const FileEntry& entry);
 FileEntry DecodeManifestEntry(const std::vector<uint8_t>& payload);
 
