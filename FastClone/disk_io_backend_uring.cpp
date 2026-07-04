@@ -74,9 +74,13 @@ public:
         uf.mode = mode;
         uf.expectedSize = expectedSize;
         uf.align = QueryAlign(path);
+        // unbuffered-writes M4/FR-13/D-02: small-file whole-file downgrade kept for reads only
+        // (read opens pass expectedSize==0 -> stay buffered). Write opens with unbuffered intent
+        // stay unbuffered regardless of size; unaligned fragments fall back per-op in IssueOrInline.
         const bool wantUnbuffered =
-            unbuffered && !cfg_.forceBuffered && expectedSize >= kSmallFileBufferedMax;
-        if (unbuffered && !wantUnbuffered) {
+            unbuffered && !cfg_.forceBuffered &&
+            (mode == OpKind::Read ? expectedSize >= kSmallFileBufferedMax : true);
+        if (unbuffered && !wantUnbuffered && mode == OpKind::Read) {
             counters_.smallFileFallback.fetch_add(1);
         }
         const int base = (mode == OpKind::Write) ? (O_WRONLY | O_CREAT) : O_RDONLY;
@@ -116,7 +120,9 @@ public:
             uf = std::move(it->second);
             files_.erase(it);
         }
-        if (uf.mode == OpKind::Write && uf.expectedSize > 0 && uf.fd >= 0) {
+        // Exact final size on every write close (ofstream-trunc-equivalent overwrite; mirrors the
+        // posix pool backend so a pre-existing target is trimmed to expectedSize, incl. 0).
+        if (uf.mode == OpKind::Write && uf.fd >= 0) {
             ::ftruncate(uf.fd, static_cast<off_t>(uf.expectedSize));
         }
         if (uf.fd >= 0) {
@@ -161,6 +167,15 @@ public:
             pump_.join();
         }
         io_uring_queue_exit(&ring_);
+        // Defensive: close any fds a caller left open so a leaked fileId (e.g. an abandoned
+        // download/temp when a session tears down for reconnect) never leaks an OS fd.
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& kv : files_) {
+            if (kv.second.fd >= 0) {
+                ::close(kv.second.fd);
+            }
+        }
+        files_.clear();
     }
 
     BackendCounters counters() const override { return counters_.snapshot(); }

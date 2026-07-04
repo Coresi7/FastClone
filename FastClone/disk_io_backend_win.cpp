@@ -85,14 +85,24 @@ public:
         const bool sizeKnown = (mode == OpKind::Read) || expectedSize > 0;
         const uint64_t sizeForPolicy = (mode == OpKind::Read) ? FileSizeOnDisk(wf.wpath) : expectedSize;
         wf.fileSize = (mode == OpKind::Read) ? sizeForPolicy : 0;
+        // unbuffered-writes M4/FR-13/D-02: the small-file (< kSmallFileBufferedMax) whole-file
+        // downgrade is kept ONLY for the read path (no dirty-page concern, zero regression). Write
+        // opens with unbuffered intent stay unbuffered regardless of size; sub-sector tails and
+        // unaligned middle fragments fall back per-op in submit() (D-03), so bytes stay exact.
         const bool wantUnbuf = unbuffered && !cfg_.forceBuffered && sizeKnown &&
-                               sizeForPolicy >= kSmallFileBufferedMax;
-        if (unbuffered && !wantUnbuf) {
+                               (mode == OpKind::Read ? sizeForPolicy >= kSmallFileBufferedMax : true);
+        if (unbuffered && !wantUnbuf && mode == OpKind::Read) {
             counters_.smallFileFallback.fetch_add(1);
         }
 
         const DWORD access = (mode == OpKind::Write) ? GENERIC_WRITE : GENERIC_READ;
-        const DWORD share = FILE_SHARE_READ;
+        // unbuffered-writes D-03: the write path may hold BOTH an unbuffered (hUnbuf) and a buffered
+        // (hBuf) handle to the same file at once (aligned ops go unbuffered, unaligned middle/tail
+        // fragments go buffered). The second open therefore needs FILE_SHARE_WRITE, otherwise it
+        // fails with a sharing violation and unaligned fragments would hit an invalid handle. Reads
+        // keep FILE_SHARE_READ only.
+        const DWORD share = (mode == OpKind::Write) ? (FILE_SHARE_READ | FILE_SHARE_WRITE)
+                                                    : FILE_SHARE_READ;
         const DWORD disp = (mode == OpKind::Write) ? OPEN_ALWAYS : OPEN_EXISTING;
 
         if (wantUnbuf) {
@@ -131,8 +141,10 @@ public:
             wf = it->second;
             files_.erase(it);
         }
-        // Restore exact size for unbuffered writes that zero-padded the final sector (FR-11).
-        if (wf.mode == OpKind::Write && wf.expectedSize > 0) {
+        // Restore the exact final size on every write close (unbuffered-writes: this also gives the
+        // driver write path ofstream-trunc-equivalent overwrite semantics, incl. truncating a
+        // pre-existing target down to an empty/expectedSize file so no stale tail bytes survive).
+        if (wf.mode == OpKind::Write) {
             HANDLE h = wf.hBuf != INVALID_HANDLE_VALUE ? wf.hBuf : wf.hUnbuf;
             if (h != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER li;
@@ -163,7 +175,21 @@ public:
         }
         const uint32_t g = wf.align.ioGranularity;
         const bool offAligned = IsAligned(req.offset, g);
-        const bool useUnbuf = wf.unbuffered && offAligned;
+        // unbuffered-writes D-03 (R-01): a write may use the unbuffered handle only when BOTH offset
+        // and length are sector-aligned, OR it is the EOF tail (offset+length == expectedSize) which
+        // is safely zero-padded and trimmed by SetEndOfFile at close. An unaligned MIDDLE fragment
+        // (delta copy/range) must NOT go unbuffered: AlignUp+zero-pad would clobber the adjacent
+        // sector bytes past its logical range. Such fragments fall back to the buffered handle with
+        // an EXACT length write (no padding). Reads keep the existing offset-aligned rule.
+        bool useUnbuf;
+        if (req.kind == OpKind::Write) {
+            const bool lenAligned = IsAligned(req.length, g);
+            const bool isEofTail = (wf.expectedSize > 0) &&
+                                   (req.offset + req.length == wf.expectedSize);
+            useUnbuf = wf.unbuffered && offAligned && (lenAligned || isEofTail);
+        } else {
+            useUnbuf = wf.unbuffered && offAligned;
+        }
 
         auto* ctx = new OpCtx();
         ctx->logicalLen = req.length;
@@ -208,7 +234,10 @@ public:
             counters_.directIo.fetch_add(1);
         } else {
             counters_.bufferedFallback.fetch_add(1);
-            if (wf.unbuffered && !offAligned) {
+            // Any op on an unbuffered-capable file that was routed to the buffered handle
+            // (unaligned offset, or a sub-sector/unaligned middle write fragment) is a
+            // per-op fallback (D-03).
+            if (wf.unbuffered && !useUnbuf) {
                 counters_.tailZeroFallback.fetch_add(1);
             }
         }
@@ -296,6 +325,18 @@ public:
             CloseHandle(port_);
             port_ = nullptr;
         }
+        // Defensive: close any file handles a caller left open so a leaked fileId (e.g. an
+        // abandoned download/temp when a session tears down for reconnect) never leaks an OS handle.
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& kv : files_) {
+            if (kv.second.hUnbuf != INVALID_HANDLE_VALUE) {
+                CloseHandle(kv.second.hUnbuf);
+            }
+            if (kv.second.hBuf != INVALID_HANDLE_VALUE) {
+                CloseHandle(kv.second.hBuf);
+            }
+        }
+        files_.clear();
     }
 
     BackendCounters counters() const override { return counters_.snapshot(); }

@@ -89,6 +89,13 @@ struct CliOptions {
     // [1M, 1T]. Parsed with ParseSizeBytesStrict (K|M|G suffix), fully orthogonal to
     // --large-file-threshold (FR-04).
     uint64_t deltaMinSizeBytes = 0;
+
+    // --- Unbuffered client writes (unbuffered-writes M1/FR-01/FR-12) ---
+    // Client-only. When set, all client file-content writes (whole-file, small-file batch,
+    // single-file download, delta copy/range) express unbuffered write intent to the unified disk
+    // IO driver so downloaded data bypasses the OS page cache. Default false = zero regression
+    // (M5/FR-03); the switch never changes final file content, only the write intent.
+    bool unbufferedWrites = false;
 };
 
 #if defined(_WIN32) && defined(_MSC_VER)

@@ -415,4 +415,26 @@ void RunCliTests() {
     ExpectThrowWith(clientArgs({"--delta-min-size", "abc"}), "--delta-min-size");
     ExpectThrowWith(clientArgs({"--delta-min-size", ""}), "--delta-min-size");
     ExpectThrowWith(clientArgs({"--delta-min-size", "5X"}), "--delta-min-size");
+
+    // ---- unbuffered-writes V-01/V-02/V-03 (AC-01/AC-02/AC-03): --unbuffered-writes parsing ------
+    // V-01 (AC-01): absent -> false (default, zero regression).
+    {
+        const fc::CliOptions opt = Parse(clientArgs({}));
+        Require(!opt.unbufferedWrites, "Expected default --unbuffered-writes off");
+    }
+    // V-02 (AC-02): present -> true; and repeated occurrences stay idempotent (still true).
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--unbuffered-writes"}));
+        Require(opt.unbufferedWrites, "Expected --unbuffered-writes on");
+    }
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--unbuffered-writes", "--unbuffered-writes"}));
+        Require(opt.unbufferedWrites, "Expected repeated --unbuffered-writes idempotent (on)");
+    }
+    // V-03 (AC-03): server-side --unbuffered-writes is a client-only CLI error.
+    ExpectThrowWith({
+                        "FastClone", "server", "--password", "pw", "--unbuffered-writes",
+                    },
+                    "client-only");
 }
