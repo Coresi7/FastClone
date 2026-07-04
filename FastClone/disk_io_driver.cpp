@@ -182,8 +182,14 @@ void DiskIoDriver::SchedulerLoop() {
         int timeout;
         {
             std::lock_guard<std::mutex> lk(qmu_);
-            const bool moreQueued = !readQ_.empty() || !writeQ_.empty();
-            timeout = (inFlight_ > 0 && !stopping) ? (moreQueued ? 0 : 2) : 0;
+            // Use a non-blocking reap ONLY when we could immediately submit more (a free in-flight
+            // slot AND queued work): the next loop iteration will then top up the pipeline without
+            // delay. Otherwise (saturated at maxInFlight, or drained but ops still in flight) block
+            // briefly so the scheduler yields the core instead of busy-spinning until a completion
+            // arrives. Any completion / new submit wakes the wait below via ccv_/qcv_.
+            const bool canSubmitMore =
+                (!readQ_.empty() || !writeQ_.empty()) && inFlight_ < cfg_.maxInFlight;
+            timeout = (inFlight_ > 0 && !stopping) ? (canSubmitMore ? 0 : 2) : 0;
         }
         const size_t got = backend_->reap(comps, 128, timeout);
         if (got > 0) {

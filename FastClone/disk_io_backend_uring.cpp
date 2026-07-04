@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -171,8 +172,13 @@ private:
             std::deque<IoRequest> batch;
             {
                 std::unique_lock<std::mutex> lk(qmu_);
-                qcv_.wait_for(lk, std::chrono::milliseconds(50),
-                              [this] { return stop_ || !pending_.empty(); });
+                // With nothing in flight there is no ring work to reap, so sleep until a submission
+                // arrives (or we stop) instead of polling. When ops ARE in flight we skip this wait
+                // and block on the ring in WaitAndReap below, so completions surface with minimal
+                // latency (replaces the old 50ms poll) and shutdown does not busy-spin.
+                if (inflight_ == 0) {
+                    qcv_.wait(lk, [this] { return stop_ || !pending_.empty(); });
+                }
                 if (stop_ && pending_.empty() && inflight_ == 0) {
                     return;
                 }
@@ -186,9 +192,30 @@ private:
                 IssueOrInline(std::move(r));
             }
             if (inflight_ > 0) {
-                Rechecks();
+                WaitAndReap();
             }
         }
+    }
+
+    // Block on the ring for the next completion (bounded), then drain any others non-blocking. The
+    // short timeout bounds how long newly-submitted pending work waits before the pump loops back
+    // to issue it; a ready completion wakes the wait immediately.
+    void WaitAndReap() {
+        io_uring_cqe* cqe = nullptr;
+        __kernel_timespec ts{};
+        ts.tv_sec = 0;
+        ts.tv_nsec = 2 * 1000 * 1000;  // 2 ms
+        const int rc = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+        if (rc == 0 && cqe != nullptr) {
+            auto* op = static_cast<UringOp*>(io_uring_cqe_get_data(cqe));
+            const int res = cqe->res;
+            io_uring_cqe_seen(&ring_, cqe);
+            if (IsRealOp(op)) {
+                FinishRing(op, res);
+                --inflight_;
+            }
+        }
+        Rechecks();  // drain any remaining ready completions
     }
 
     // Try to issue via the ring (aligned O_DIRECT / buffered whole-file); if the op cannot use the
@@ -260,6 +287,14 @@ private:
         io_uring_submit(&ring_);
     }
 
+    // True when the CQE carries one of our submitted UringOp*; false for the internal timeout CQE
+    // that some liburing versions surface from io_uring_wait_cqe_timeout (user_data == (__u64)-1).
+    // Modern liburing consumes that internally so this never trips there; kept as a cross-version
+    // guard so a sentinel is never dereferenced as a UringOp.
+    static bool IsRealOp(const UringOp* op) {
+        return op != nullptr && reinterpret_cast<uintptr_t>(op) != static_cast<uintptr_t>(-1);
+    }
+
     void Rechecks() {
         io_uring_cqe* cqe = nullptr;
         // Non-blocking peek loop so the pump can keep issuing new work.
@@ -267,7 +302,7 @@ private:
             auto* op = static_cast<UringOp*>(io_uring_cqe_get_data(cqe));
             const int res = cqe->res;
             io_uring_cqe_seen(&ring_, cqe);
-            if (op) {
+            if (IsRealOp(op)) {
                 FinishRing(op, res);
                 --inflight_;
             }
