@@ -15,6 +15,7 @@
 - 回退比对：`size + mtime` 不一致时使用 `XXH3_128`
 - 面向千万量级文件、TB 级数据的超大目录树：碎文件批量打包传输，多个文件在多条流 / 多条链路上并发（单个文件本身不跨流拆分）
 - 协议版本强校验（版本不匹配直接拒绝）
+- **FastCheck**：独立的只读比对程序，连接运行中的 server 报告本地目录与服务端的差异，不传输、不删除、不写任何文件（见 [FastCheck](#fastcheck-只读比对)）
 
 ## 预期性能
 
@@ -62,6 +63,66 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
 - `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+
+
+
+## FastCheck：只读比对
+
+`FastCheck` 是一个**独立的可执行程序**，连接运行中的 FastClone server，将本地目录与服务端 manifest 做比对。它只枚举和比对——不传输、不删除、不重命名、不写 target 目录（唯一的写操作是可选的 `--output` 报告文件）。适用于正式同步前的预检、定期备份一致性校验、只读审计。
+
+```bash
+FastCheck --server <host[:port]> --target <path> --password <pwd> [--mode fast|strict|size-only] [--checkers <n>] [--output <file>] [--format text|json] [--summary-only] [--filter DIFF,MISSING,EXTRA,SAME] [--port <n>]
+```
+
+- `--server`：服务端端点（`host` 或 `host:port`；默认端口 `27842`）
+- `--target`：本地对比目录（只读）
+- `--password`：预共享口令（与服务端一致）
+- `--mode`：比对策略（默认 `fast`）
+- `--checkers`：单连接上在飞的 HashRequest 并发上限（正整数，默认 `8`）。取代同步客户端的 `--streams`——FastCheck 没有传输流
+- `--output`：将完整报告写入文件（默认仅终端）。设置后终端只输出摘要行，文件按所选格式写完整报告
+- `--format`：`text`（默认）或 `json`
+- `--summary-only`：只输出终态摘要，不列逐文件行
+- `--filter`：逗号分隔的 `DIFF,MISSING,EXTRA,SAME` 子集（默认 `DIFF,MISSING,EXTRA`；`SAME` 需显式开启，调试用）
+- `--port`：`--server` 未带端口时的默认端口（默认 `27842`）
+
+### 比对模式
+
+| 模式 | 时间戳参与 | Hash 参与 | 速度 | 准确性 |
+|------|-----------|----------|------|--------|
+| `size-only` | 否 | 否 | 最快 | 最低 |
+| `fast`（默认）| 是 | 仅冲突时（大小同、时间异）| 快 | 高 |
+| `strict` | 忽略 | 一律（每个同 size 文件）| 慢 | 最高 |
+
+`fast` 与同步客户端的比对阶段完全一致：大小同 + mtime 在 2ms 容差内 → `SAME`；大小同但 mtime 异 → 回退到 `XXH3_128` hash 判定。`strict` 忽略 mtime，对每个同 size 文件强制 hash（适用于 FAT32 / 跨时区 / mtime 被备份软件改过的场景）。`size-only` 既不看 mtime 也不算 hash。
+
+### 输出
+
+终端进度（单行）：`same=<n> diff=<n> missing=<n> extra_local=<n> total=<n> mode=<mode>`。终态摘要始终输出；逐文件行受 `--summary-only` / `--filter` 控制。
+
+逐文件类别：
+
+- `DIFF`：两端都存在，内容/大小不同（行内附 `local=<字节> remote=<字节>`）
+- `MISSING`：服务端有、本地缺失
+- `EXTRA`：本地有、服务端没有（镜像语义下：同步会删除的项）
+- `SAME`：仅 `--filter SAME` 时才列出
+
+报告中的路径为相对根目录、正斜杠。
+
+### 退出码
+
+- `0`：比对完成，两端完全一致（`diff=0, missing=0, extra=0`）
+- `1`：比对完成，存在差异
+- `2`：连接 / 握手 / 认证失败，或比对中途断连，或参数错误
+- `3`：本地 `--target` / `--output` 前置条件失败（目录不存在、`--output` 父目录不存在），或 hash 阶段本地文件读失败——前置失败在任何 TCP 连接之前抛出
+- `4`：用户 Ctrl+C 中断；输出带 `[PARTIAL]` 标注的已收集部分
+
+### 协议与兼容性
+
+FastCheck 引入新的 `CheckAuth` 消息（FC7 加法式扩展——不升协议版本号）。服务端将该会话标记为 `Check`，照常服务 manifest 与 hash 请求，但**跳过传输阶段**，并把客户端关闭视为干净退出（不触发 reconnect 日志、不消耗 `--once` 名额）。既有 sync 客户端与旧服务器不受影响：旧服务器会干净拒绝 `CheckAuth` 认领，FastCheck 则报清晰的连接错误。
+
+### 构建
+
+FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程默认参与构建；`FastCheckTests` 按需构建）和 CMake 构建（`add_executable(FastCheck ...)` / `add_executable(FastCheckTests ...)`）中均有。它只链接自包含的共享单元（握手、协议、编解码、socket、文件索引、hash、共享的 `compare_phase` 比对逻辑）——不链传输引擎、delta、disk-IO 驱动。
 
 
 
@@ -206,6 +267,14 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `2`：同步完成但存在失败文件（可结合 `--streams` 降低并发后重试）
 - `3`：同步未完成且自动重连已禁用（`--reconnect-retries 0`），或连接中断后未启用重连
 - `4`：自动重连预算耗尽，同步仍未完成
+
+**FastCheck：**
+
+- `0`：比对完成，两端完全一致
+- `1`：比对完成，存在差异
+- `2`：连接 / 握手 / 认证失败，比对中途断连，或参数错误
+- `3`：本地 `--target` / `--output` 前置条件失败，或 hash 阶段本地文件读失败
+- `4`：用户 Ctrl+C 中断（输出带 `[PARTIAL]` 的部分报告）
 
 **服务端** `--once` **/** `--once-multi`**：**
 

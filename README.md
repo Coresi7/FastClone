@@ -15,6 +15,7 @@ Supported platforms:
 - Fallback verification: uses `XXH3_128` when `size + mtime` do not match
 - Scales to tens-of-millions-file, TB-scale trees: tiny files are batched together while many files run concurrently across multiple streams / links (a single file itself is never split across streams)
 - Strict protocol version check (version mismatch is rejected immediately)
+- **FastCheck**: a separate read-only comparison binary that reports differences between a local directory and a running server without transferring, deleting, or writing anything (see [FastCheck](#fastcheck-read-only-comparison))
 
 
 
@@ -68,6 +69,66 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
 - `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
 - `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
+
+
+
+## FastCheck: Read-Only Comparison
+
+`FastCheck` is a **separate, standalone binary** that connects to a running FastClone server and compares a local directory against the server's manifest. It only enumerates and compares — it never transfers, deletes, renames, or writes to the target directory (the only write is the optional `--output` report file). Use it for pre-sync dry-runs, periodic backup audits, or read-only auditing.
+
+```bash
+FastCheck --server <host[:port]> --target <path> --password <pwd> [--mode fast|strict|size-only] [--checkers <n>] [--output <file>] [--format text|json] [--summary-only] [--filter DIFF,MISSING,EXTRA,SAME] [--port <n>]
+```
+
+- `--server`: server endpoint (`host` or `host:port`; default port `27842`)
+- `--target`: local directory to compare (read-only)
+- `--password`: pre-shared password (must match server)
+- `--mode`: compare strategy (default `fast`)
+- `--checkers`: max in-flight concurrent hash requests on the single connection (positive integer, default `8`). Replaces `--streams` from the sync client — FastCheck has no transfer streams
+- `--output`: write the full report to a file (default: terminal only). When set, the terminal gets only the summary line and the file gets the full report in the chosen format
+- `--format`: `text` (default) or `json`
+- `--summary-only`: emit only the final summary, no per-file lines
+- `--filter`: comma-separated subset of `DIFF,MISSING,EXTRA,SAME` to list (default `DIFF,MISSING,EXTRA`; `SAME` is opt-in for debugging)
+- `--port`: default port for `--server` without one (default `27842`)
+
+### Compare Modes
+
+| Mode | Uses mtime | Uses hash | Speed | Accuracy |
+|------|-----------|----------|------|--------|
+| `size-only` | no | no | fastest | lowest |
+| `fast` (default) | yes | only on conflict (same size, mtime differs) | fast | high |
+| `strict` | ignored | always (every same-size file) | slow | highest |
+
+`fast` is identical to the sync client's comparison stage: same size + mtime within 2ms tolerance → `SAME`; same size but mtime differs → fall back to `XXH3_128` hash. `strict` ignores mtime and hashes every same-size file (for FAT32 / cross-timezone / mtime-mangled backups). `size-only` skips both mtime and hashing.
+
+### Output
+
+Terminal progress (one line): `same=<n> diff=<n> missing=<n> extra_local=<n> total=<n> mode=<mode>`. Final summary is always printed; per-file lines are gated by `--summary-only` / `--filter`.
+
+Per-file categories:
+
+- `DIFF` — exists on both sides, content/size differs (line includes `local=<bytes> remote=<bytes>`)
+- `MISSING` — exists on server, missing locally
+- `EXTRA` — exists locally, not on server (mirror semantics: would be deleted by a sync)
+- `SAME` — only listed with `--filter SAME`
+
+Paths in the report are relative to the root, with forward slashes.
+
+### Exit Codes
+
+- `0`: comparison complete, both sides identical (`diff=0, missing=0, extra=0`)
+- `1`: comparison complete, differences found
+- `2`: connection / handshake / authentication failure, or mid-compare disconnect, or argument error
+- `3`: local `--target` / `--output` precondition failed (missing dir, non-existent `--output` parent), or local file read failure during hashing — raised before any TCP connection for preconditions
+- `4`: interrupted by Ctrl+C; a `[PARTIAL]` report is emitted with whatever was collected
+
+### Protocol & Compatibility
+
+FastCheck introduces a new `CheckAuth` message (FC7 additive — no protocol version bump). The server marks the session as `Check`, serves the manifest and hash requests as usual, but **skips the transfer phase** and treats the client's close as a clean exit (no reconnect noise, no `--once` budget consumption). Existing sync clients and older servers are unaffected: an old server cleanly rejects a `CheckAuth` claim, and FastCheck reports a clear connection error.
+
+### Build
+
+FastCheck is part of the Visual Studio solution (`FastClone.slnx` — the `FastCheck` project builds by default; `FastCheckTests` is opt-in) and the CMake build (`add_executable(FastCheck ...)` / `add_executable(FastCheckTests ...)`). It links only the self-contained shared units (handshake, protocol, codec, sockets, file index, hash, and the shared `compare_phase` comparison logic) — not the transfer engine, delta, or disk-IO driver.
 
 
 
@@ -206,6 +267,14 @@ If the connection drops before the manifest is fully received, the client automa
 - `2`: sync completed with failed files (try lowering concurrency, e.g. `--streams`)
 - `3`: sync incomplete and auto-reconnect disabled (`--reconnect-retries 0`), or connection dropped without reconnect enabled
 - `4`: auto-reconnect budget exhausted with the sync still incomplete
+
+**FastCheck:**
+
+- `0`: comparison complete, both sides identical
+- `1`: comparison complete, differences found
+- `2`: connection / handshake / authentication failure, mid-compare disconnect, or argument error
+- `3`: local `--target` / `--output` precondition failed, or local file read failure during hashing
+- `4`: interrupted by Ctrl+C (partial report emitted)
 
 **Server** `--once` **/** `--once-multi`**:**
 
