@@ -39,14 +39,17 @@ struct ServerStream {
     std::string relativePath;
 };
 
-// Binary delta (FC7) server-side byte-range stream. Opened lazily on DeltaRangeOpen, seeked
-// to `offset`, then `remaining` bytes are streamed back as DeltaRangeChunk frames followed
-// by a single DeltaRangeEnd. Owned exclusively by the send loop (no I/O under any lock).
+// Binary delta (FC7) server-side byte-range stream. Opened on DeltaRangeOpen through the unified
+// disk IO driver (unified-disk-io-driver C10 / design §5.6); `remaining` bytes starting at
+// `nextReadOffset` are streamed back as DeltaRangeChunk frames followed by a single DeltaRangeEnd.
+// Owned exclusively by the send loop (no I/O under any lock); the driver handle is closed on
+// completion/error and on session teardown.
 struct ServerRangeStream {
-    std::ifstream input;
     std::string relativePath;
     uint64_t remaining = 0;
-    bool errored = false;  // open/read failure -> emit DeltaError instead of DeltaRangeEnd
+    bool errored = false;      // open/read failure -> emit DeltaError instead of DeltaRangeEnd
+    uint64_t fileId = 0;       // driver file handle (0 = none)
+    uint64_t nextReadOffset = 0;  // next file offset to read from
 };
 
 struct ServerBatchStream {
@@ -639,6 +642,68 @@ ReadGate& GetServerReadGate() {
     return gate;
 }
 
+// Read-ahead window (in-flight ops) each server SequentialReader keeps over its file. Total disk
+// read concurrency is bounded by the driver's maxInFlight, not per-reader (design §5.2/FR-20).
+constexpr uint32_t kServerReadAhead = 4;
+
+// Process-wide unified disk IO driver for the server (unified-disk-io-driver C9/C10): the single
+// locus for signature/hash miss reads and delta range reads, replacing per-path inline file reads
+// and the ReadGate concurrency cap (design §3.1/§5.2, FR-20). Mirrors the GetServerHashPool()
+// singleton lifetime (never torn down; process-scoped).
+fc::io::DiskIoDriver& GetServerDiskIoDriver() {
+    static fc::io::IoDriverConfig cfg = [] {
+        fc::io::IoDriverConfig c;
+        return c;
+    }();
+    static fc::io::DiskIoDriver driver(cfg);
+    return driver;
+}
+
+// Read up to `want` bytes at `offset` from an already-open driver file, blocking for that single
+// op (the same blocking granularity as the former synchronous ifstream read in the send loop, so
+// send-loop responsiveness is unchanged). Returns bytes read; 0 with err=true on a hard error.
+uint32_t DriverReadRangeChunk(uint64_t fileId, uint64_t offset, uint32_t want,
+                              std::vector<uint8_t>& out, bool& err) {
+    out.clear();
+    fc::io::DiskIoDriver& drv = GetServerDiskIoDriver();
+    std::vector<fc::io::IoRequest> batch(1);
+    batch[0].kind = fc::io::OpKind::Read;
+    batch[0].fileId = fileId;
+    batch[0].offset = offset;
+    batch[0].length = want;
+    batch[0].prio = fc::io::Prio::Large;
+    batch[0].userTag = offset;
+    for (int tries = 0; !batch.empty(); ++tries) {
+        if (drv.submit(batch) > 0) {
+            break;
+        }
+        if (tries > 5000) {  // ~5s of a persistently full/cancelled queue -> give up
+            err = true;
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::vector<fc::io::IoCompletion> comps;
+    for (;;) {
+        drv.drainCompletionsForFile(fileId, comps);
+        if (!comps.empty()) {
+            break;
+        }
+        drv.waitForFile(fileId, 1000);
+        drv.drainCompletionsForFile(fileId, comps);
+        if (!comps.empty()) {
+            break;
+        }
+    }
+    fc::io::IoCompletion& c = comps.front();
+    if (c.status == fc::io::IoStatus::Error) {
+        err = true;
+        return 0;
+    }
+    out = std::move(c.data);
+    return static_cast<uint32_t>(out.size());
+}
+
 bool TryReadHashFingerprint(const fs::path& absPath, HashFingerprint& out) {
     std::error_code ec;
     if (!fs::exists(absPath, ec) || ec) {
@@ -810,10 +875,66 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         GetServerHashPool().Enqueue([&, rel, abs, fingerprint, fingerprintValid]() {
                             Hash256 hash{};
                             bool hashOk = true;
+                            // C9: read the file content through the unified driver and stream it
+                            // into XXH3, instead of ComputeFileHash's inline read. Same bytes ->
+                            // identical Hash256 (AC-06). IO/CPU decoupled; concurrency bounded by
+                            // the driver, not per-worker (FR-19).
                             try {
-                                hash = ComputeFileHash(abs);
+                                std::error_code ec;
+                                const uint64_t fileSize =
+                                    static_cast<uint64_t>(fs::file_size(abs, ec));
+                                if (ec) {
+                                    hashOk = false;
+                                } else {
+                                    const uint64_t fid = GetServerDiskIoDriver().openFile(
+                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+                                    if (fid == 0) {
+                                        hashOk = false;
+                                    } else {
+                                        bool rerr = false;
+                                        fc::io::SequentialReader reader(GetServerDiskIoDriver(), fid,
+                                                                        fileSize,
+                                                                        kServerSigChunkBytes,
+                                                                        kServerReadAhead);
+                                        std::vector<uint8_t> cbuf;
+                                        size_t cpos = 0;
+                                        auto src = [&](uint8_t* dst, size_t maxLen) -> size_t {
+                                            size_t written = 0;
+                                            while (written < maxLen) {
+                                                if (cpos < cbuf.size()) {
+                                                    const size_t take = std::min<size_t>(
+                                                        cbuf.size() - cpos, maxLen - written);
+                                                    std::memcpy(dst + written, cbuf.data() + cpos,
+                                                                take);
+                                                    cpos += take;
+                                                    written += take;
+                                                    continue;
+                                                }
+                                                bool okr = true;
+                                                cbuf.clear();
+                                                cpos = 0;
+                                                const uint32_t n = reader.next(cbuf, okr);
+                                                if (!okr) {
+                                                    rerr = true;
+                                                    break;
+                                                }
+                                                if (n == 0) {
+                                                    break;
+                                                }
+                                            }
+                                            return written;
+                                        };
+                                        hash = ComputeHashFromSource(src);
+                                        GetServerDiskIoDriver().closeFile(fid);
+                                        if (rerr) {
+                                            hashOk = false;
+                                        }
+                                    }
+                                }
                             } catch (...) {
                                 hashOk = false;
+                            }
+                            if (!hashOk) {
                                 hash.fill(0xFF);
                             }
                             if (hashMemcacheEnabled && hashOk) {
@@ -962,16 +1083,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                 return;
                             }
 
-                            // Bound concurrent disk reads (M7/FR-14/NFR-02). The permit is taken
-                            // OUTSIDE any session lock (R-05); RAII release covers every exit
-                            // path (R-04). A false guard means we aborted because done flipped
-                            // while waiting -> treat as cancelled (no response).
-                            ReadGateGuard guard(GetServerReadGate(), done);
-                            if (!guard) {
-                                finalize();
-                                return;
-                            }
-
+                            // C9 (design §5.2/FR-20): the file content read now flows through the
+                            // unified driver; disk-read concurrency is bounded by the driver
+                            // (maxInFlight + read queue + fairness), so the ReadGate permit is no
+                            // longer taken on this path. GetServerReadGate()/ReadGate stay defined
+                            // (D-08 A: no unrelated deletion). Skip heavy IO if already tearing down.
                             bool ok = true;
                             delta::StreamingResult res;
                             {
@@ -981,49 +1097,48 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                                 if (ec) {
                                     ok = false;
                                 } else {
-                                    try {
-                                        std::ifstream in(abs, std::ios::binary);
-                                        if (!in) {
-                                            ok = false;
-                                        } else {
-                                            // Single sequential pass: 1 MiB chunks feed the
-                                            // StreamingSigner, producing the SignatureSet AND the
-                                            // full-file XXH3-128 without ever buffering the whole
+                                    const uint64_t fid = GetServerDiskIoDriver().openFile(
+                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+                                    if (fid == 0) {
+                                        ok = false;
+                                    } else {
+                                        try {
+                                            // Single sequential pass: 1 MiB chunks from the driver
+                                            // feed the StreamingSigner, producing the SignatureSet
+                                            // AND the full-file XXH3-128 without buffering the whole
                                             // file and without a second scan (FR-01/FR-02/NFR-01/
-                                            // NFR-03). thread_local buffer is reused across tasks.
+                                            // NFR-03). Bytes are identical to the former ifstream
+                                            // pass, so the SignatureSet + fileHash are unchanged.
                                             delta::StreamingSigner signer(fileSize);
-                                            thread_local std::vector<uint8_t> buf;
-                                            if (buf.size() != kServerSigChunkBytes) {
-                                                buf.resize(kServerSigChunkBytes);
-                                            }
-                                            while (in) {
-                                                in.read(reinterpret_cast<char*>(buf.data()),
-                                                        static_cast<std::streamsize>(buf.size()));
-                                                const std::streamsize got = in.gcount();
-                                                if (got <= 0) {
+                                            fc::io::SequentialReader reader(GetServerDiskIoDriver(),
+                                                                            fid, fileSize,
+                                                                            kServerSigChunkBytes,
+                                                                            kServerReadAhead);
+                                            std::vector<uint8_t> cbuf;
+                                            for (;;) {
+                                                bool okr = true;
+                                                cbuf.clear();
+                                                const uint32_t n = reader.next(cbuf, okr);
+                                                if (!okr) {
+                                                    ok = false;  // genuine read error -> DeltaError
                                                     break;
                                                 }
-                                                signer.Update(buf.data(),
-                                                              static_cast<size_t>(got));
-                                            }
-                                            if (!in.eof() && in.fail()) {
-                                                ok = false;  // genuine read error -> DeltaError
+                                                if (n == 0) {
+                                                    break;
+                                                }
+                                                signer.Update(cbuf.data(), cbuf.size());
                                             }
                                             if (ok) {
                                                 // Byte-count / XXH3 errors throw -> caught below.
                                                 res = signer.Finish();
                                             }
+                                        } catch (...) {
+                                            ok = false;
                                         }
-                                    } catch (...) {
-                                        ok = false;
+                                        GetServerDiskIoDriver().closeFile(fid);
                                     }
                                 }
                             }
-
-                            // Hand the disk-read permit back the instant IO is done, BEFORE any
-                            // outbound/session lock (R-05). The RAII destructor becomes a no-op
-                            // but still guards the early-throw paths above.
-                            guard.release();
 
                             if (ok && blockSigMemcacheEnabled) {
                                 try {
@@ -1067,20 +1182,18 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                         throw;
                     }
                 } else if (frame.type == MsgType::DeltaRangeOpen) {
-                    // Binary delta (FC7, design §6.3): cheap pread equivalent. Open + seek
-                    // here; the send loop streams the bytes lock-free. Failure -> DeltaError.
+                    // Binary delta (FC7, design §6.3): C10 routes the range read through the unified
+                    // driver (design §5.6). Open here (handle validation); the send loop streams the
+                    // bytes via the driver lock-free. Open failure -> DeltaError.
                     const DeltaRangeRequest req = DecodeDeltaRangeOpen(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, req.relPath);
                     ServerRangeStream rs;
                     rs.relativePath = req.relPath;
                     rs.remaining = req.length;
-                    rs.input.open(abs, std::ios::binary);
-                    if (!rs.input) {
-                        enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
-                        continue;
-                    }
-                    rs.input.seekg(static_cast<std::streamoff>(req.offset), std::ios::beg);
-                    if (!rs.input) {
+                    rs.nextReadOffset = req.offset;
+                    rs.fileId = GetServerDiskIoDriver().openFile(abs.string(), fc::io::OpKind::Read,
+                                                                /*unbuffered=*/true, 0);
+                    if (rs.fileId == 0) {
                         enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
                         continue;
                     }
@@ -1310,32 +1423,43 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
                     ServerRangeStream& rs = it->second;
                     size_t burstBytes = 0;
                     bool finished = false;
+                    std::vector<uint8_t> chunk;
                     while (rs.remaining > 0 && burstBytes < perStreamBurstBytes) {
                         const uint64_t toRead =
                             std::min<uint64_t>(rs.remaining, static_cast<uint64_t>(effectiveChunkSize));
-                        std::vector<uint8_t> chunk(static_cast<size_t>(toRead));
-                        rs.input.read(reinterpret_cast<char*>(chunk.data()),
-                                      static_cast<std::streamsize>(chunk.size()));
-                        const std::streamsize got = rs.input.gcount();
-                        if (got <= 0) {
+                        bool readErr = false;
+                        const uint32_t got = DriverReadRangeChunk(
+                            rs.fileId, rs.nextReadOffset, static_cast<uint32_t>(toRead), chunk,
+                            readErr);
+                        if (readErr || got == 0) {
                             rs.errored = true;
                             break;
                         }
-                        chunk.resize(static_cast<size_t>(got));
-                        burstBytes += static_cast<size_t>(got);
+                        rs.nextReadOffset += got;
+                        burstBytes += got;
                         rs.remaining -= static_cast<uint64_t>(got);
-                        sendFrames.push_back(Frame{MsgType::DeltaRangeChunk, it->first, std::move(chunk)});
+                        sendFrames.push_back(
+                            Frame{MsgType::DeltaRangeChunk, it->first, std::move(chunk)});
+                        chunk.clear();
                         didWork = true;
                     }
                     if (rs.errored) {
                         sendFrames.push_back(Frame{MsgType::DeltaError, it->first,
                                                    EncodeDeltaError(rs.relativePath)});
+                        if (rs.fileId != 0) {
+                            GetServerDiskIoDriver().closeFile(rs.fileId);
+                            rs.fileId = 0;
+                        }
                         it = activeRangeStreams.erase(it);
                         didWork = true;
                         continue;
                     }
                     if (rs.remaining == 0) {
                         sendFrames.push_back(Frame{MsgType::DeltaRangeEnd, it->first, {}});
+                        if (rs.fileId != 0) {
+                            GetServerDiskIoDriver().closeFile(rs.fileId);
+                            rs.fileId = 0;
+                        }
                         it = activeRangeStreams.erase(it);
                         finished = true;
                         didWork = true;
@@ -1464,6 +1588,16 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options) {
         sessionHashCv.notify_all();
         outboundCv.notify_all();
         errorText = ex.what();
+    }
+
+    // C10: release any driver file handles still held by in-flight range streams. The send loop
+    // closes each on completion/error, but a session that tore down mid-range leaves some open;
+    // the process-global driver would otherwise leak these handles across sessions.
+    for (auto& kv : activeRangeStreams) {
+        if (kv.second.fileId != 0) {
+            GetServerDiskIoDriver().closeFile(kv.second.fileId);
+            kv.second.fileId = 0;
+        }
     }
 
     if (debugEnabled && failed.load()) {

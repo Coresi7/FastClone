@@ -55,6 +55,67 @@ struct Entry {
     uint32_t blockIndex = 0;  // index into sig.blocks
 };
 
+// Forward-only sliding window over a sequential byte source (unified-disk-io-driver §4.2). Serves
+// contiguous views [p, p+len) and single bytes for a monotonically advancing cursor while holding
+// at most (readAheadChunk + blockSize) bytes — no whole-file allocation (FR-15/AC-04). The BuildPlan
+// scan advances p only forward (by 1 on a roll, by L on a match), so every access is >= the cursor.
+class SlidingWindow {
+public:
+    SlidingWindow(uint64_t total, ByteSource src, size_t chunk)
+        : total_(total), src_(std::move(src)), chunk_(chunk == 0 ? size_t{1} : chunk) {}
+
+    // Drop the consumed prefix below `p` once it grows past one chunk (amortized O(1) per byte).
+    // Called at the top of each scan step, before any live window pointer exists.
+    void advance(uint64_t p) {
+        if (p > physBase_) {
+            const size_t drop = static_cast<size_t>(p - physBase_);
+            if (drop >= chunk_) {
+                buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(drop));
+                physBase_ = p;
+            }
+        }
+    }
+
+    // Contiguous view of [p, p+len). Requires physBase_ <= p and p+len <= total_.
+    const uint8_t* window(uint64_t p, uint32_t len) {
+        loadTo(p + len);
+        return buf_.data() + static_cast<size_t>(p - physBase_);
+    }
+
+    // Single byte at absolute offset `off` (off >= physBase_, off < total_). Never compacts, so a
+    // look-ahead read of oldData[p+L] cannot discard bytes the cursor still needs.
+    uint8_t byteAt(uint64_t off) {
+        loadTo(off + 1);
+        return buf_[static_cast<size_t>(off - physBase_)];
+    }
+
+private:
+    void loadTo(uint64_t end) {
+        if (end > total_) {
+            end = total_;
+        }
+        while (physBase_ + buf_.size() < end) {
+            const size_t before = buf_.size();
+            const uint64_t deficit = end - (physBase_ + buf_.size());
+            size_t want = chunk_ > deficit ? chunk_ : static_cast<size_t>(deficit);
+            buf_.resize(before + want);
+            const size_t got = src_(buf_.data() + before, want);
+            if (got < want) {
+                buf_.resize(before + got);
+                if (got == 0) {
+                    break;  // source exhausted (should coincide with total_)
+                }
+            }
+        }
+    }
+
+    uint64_t total_;
+    ByteSource src_;
+    size_t chunk_;
+    std::vector<uint8_t> buf_;
+    uint64_t physBase_ = 0;
+};
+
 }  // namespace
 
 RollingWeak WeakInit(const uint8_t* p, uint32_t L) {
@@ -492,6 +553,171 @@ bool BenefitRejected(uint64_t downloadBytes, uint64_t newFileBytes) {
     // reject <=> downloadBytes / newFileBytes >= 0.65, integer form (>= is reject, FR-17):
     //   downloadBytes * 100 >= newFileBytes * 65.
     return downloadBytes * kBenefitPercentDen >= newFileBytes * kBenefitPercentNum;
+}
+
+DeltaPlan BuildPlanStreaming(const SignatureSet& sig, uint64_t oldLen, const ByteSource& source,
+                             const StreamingPlanOptions& opt, const CopyCapturedFn& onCopy) {
+    // Mirrors BuildPlan exactly (design D-02 A). The ONLY difference vs. BuildPlan is that every
+    // oldData[] access is served by `win` (a forward-only sliding window); all candidate/CSR/
+    // early-stop/copy-coalesce arithmetic is identical, so the result is bit-identical (AC-02/03).
+    DeltaPlan plan;
+    plan.newFileBytes = sig.fileSize;
+    if (sig.blockCount == 0 || sig.blockSize == 0) {
+        return plan;
+    }
+    const uint32_t L = sig.blockSize;
+    const uint32_t blockCount = sig.blockCount;
+    const uint8_t strongLen = sig.strongLen;
+
+    auto blockLen = [&](uint32_t i) -> uint32_t {
+        const uint64_t off = static_cast<uint64_t>(i) * L;
+        return static_cast<uint32_t>(std::min<uint64_t>(L, sig.fileSize - off));
+    };
+
+    std::vector<uint8_t> matched(blockCount, 0);
+    std::vector<uint64_t> matchedSrc(blockCount, 0);
+
+    constexpr uint32_t kBuckets = 1u << 16;
+    std::vector<uint32_t> bucketStart(kBuckets + 1, 0);
+    uint32_t fullBlockCount = 0;
+    for (uint32_t i = 0; i < blockCount; ++i) {
+        if (blockLen(i) != L) {
+            continue;
+        }
+        ++bucketStart[BucketOf(sig.blocks[i].weak) + 1];
+        ++fullBlockCount;
+    }
+    for (uint32_t b = 0; b < kBuckets; ++b) {
+        bucketStart[b + 1] += bucketStart[b];
+    }
+    std::vector<Entry> entries(fullBlockCount);
+    std::vector<uint32_t> fillPos(bucketStart.begin(), bucketStart.begin() + kBuckets);
+    for (uint32_t ii = blockCount; ii-- > 0;) {
+        if (blockLen(ii) != L) {
+            continue;
+        }
+        const uint16_t b = BucketOf(sig.blocks[ii].weak);
+        const uint32_t pos = fillPos[b]++;
+        entries[pos].weak = sig.blocks[ii].weak;
+        entries[pos].blockIndex = ii;
+    }
+
+    uint64_t scannedBytes = 0;
+    uint64_t matchedBytes = 0;
+    bool earlyStopped = false;
+    const uint64_t prefixBytes = opt.build.prefixBytesOverride > 0
+                                     ? opt.build.prefixBytesOverride
+                                     : EarlyStopPrefixBytes(oldLen, L);
+
+    if (oldLen >= L) {
+        SlidingWindow win(oldLen, source, opt.readAheadChunkBytes);
+        uint64_t p = 0;
+        uint64_t nextEval = prefixBytes;
+        RollingWeak w = WeakInit(win.window(0, L), L);
+        while (true) {
+            win.advance(p);  // amortized compaction on the monotonic cursor (AC-04)
+            const uint32_t weak32 = w.value();
+            const uint16_t bucket = BucketOf(weak32);
+            bool matchedHere = false;
+            std::array<uint8_t, 16> strong{};
+            bool strongComputed = false;
+            const uint32_t kStart = bucketStart[bucket];
+            const uint32_t kEnd = bucketStart[bucket + 1];
+            for (uint32_t k = kStart; k < kEnd; ++k) {
+                const Entry& e = entries[k];
+                if (e.weak != weak32) {
+                    continue;
+                }
+                ++plan.stats.weakCandidateHits;
+                const uint32_t node = e.blockIndex;
+                if (matched[node]) {
+                    continue;
+                }
+                if (!strongComputed) {
+                    strong = StrongHash(win.window(p, L), L);
+                    strongComputed = true;
+                    ++plan.stats.strongComputations;
+                }
+                if (std::equal(strong.begin(), strong.begin() + strongLen,
+                               sig.blocks[node].strong.begin())) {
+                    matched[node] = 1;
+                    matchedSrc[node] = p;
+                    matchedHere = true;
+                    if (onCopy) {
+                        // Live block bytes are in the window right now: capture for the temp write
+                        // during this single pass (D-01 A). destOffset = node * blockSize.
+                        onCopy(p, static_cast<uint64_t>(node) * L, L, win.window(p, L));
+                    }
+                    break;
+                }
+            }
+            if (matchedHere) {
+                matchedBytes += L;
+                p += L;
+                if (p + L > oldLen) {
+                    break;
+                }
+                win.advance(p);
+                w = WeakInit(win.window(p, L), L);
+            } else {
+                if (p + L >= oldLen) {
+                    break;
+                }
+                const uint8_t outByte = win.byteAt(p);
+                const uint8_t inByte = win.byteAt(p + L);
+                WeakRoll(w, outByte, inByte, L);
+                ++p;
+            }
+            if (opt.build.enableEarlyStop && p >= nextEval) {
+                if (ProjectedRejected(matchedBytes, p, oldLen, plan.newFileBytes)) {
+                    earlyStopped = true;
+                    break;
+                }
+                nextEval = p + kEarlyStopEvalStride;
+            }
+        }
+        scannedBytes = p;
+    }
+
+    plan.stats.scannedBytes = scannedBytes;
+    plan.stats.matchedBytes = matchedBytes;
+    plan.stats.earlyStopped = earlyStopped;
+
+    if (earlyStopped) {
+        plan.copies.clear();
+        plan.misses.clear();
+        plan.downloadBytes = plan.newFileBytes;
+        return plan;
+    }
+
+    uint64_t missRunStart = 0;
+    uint64_t missRunBytes = 0;
+    bool inMissRun = false;
+    auto flushMiss = [&]() {
+        if (inMissRun) {
+            plan.misses.push_back(MissOp{missRunStart, static_cast<uint32_t>(missRunBytes)});
+            plan.downloadBytes += missRunBytes;
+            inMissRun = false;
+            missRunBytes = 0;
+        }
+    };
+    for (uint32_t i = 0; i < blockCount; ++i) {
+        const uint64_t destOff = static_cast<uint64_t>(i) * L;
+        const uint32_t blen = blockLen(i);
+        if (matched[i]) {
+            flushMiss();
+            plan.copies.push_back(CopyOp{matchedSrc[i], destOff, blen});
+        } else {
+            if (!inMissRun) {
+                inMissRun = true;
+                missRunStart = destOff;
+                missRunBytes = 0;
+            }
+            missRunBytes += blen;
+        }
+    }
+    flushMiss();
+    return plan;
 }
 
 }  // namespace fc::delta

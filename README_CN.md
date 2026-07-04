@@ -38,6 +38,8 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 - `--wait-connect-timeout`：`--once` / `--once-multi` 的首连等待窗口（默认 `300s`，支持 `s`/`m`/`h` 后缀，取值必须 `> 0`）；若在其耗尽前仍无有效客户端连接，服务端以退出码 `6` 退出。一旦出现首个有效连接，该计时永久失效。仅与 `--once` 或 `--once-multi` 同用时有效
 - `--password`：预共享口令（必填）
 
+服务端启动时会先打印配置 banner，随后逐行列出本机下发的端点（`[mp]   <ip>:<port>`，每个本机网卡地址一行），便于直接复制一个交给客户端使用。若请求端口已被其他进程占用，服务端会打印明确的 `cannot listen on port ...` 错误并以退出码 `7` 退出，而不是"看似已监听"地静默继续。
+
 
 
 ### 客户端
@@ -165,6 +167,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - 客户端用 rsync 式滚动校验 + XXH3-128 块哈希（独立实现——无 rsync 源码，MIT 干净）将服务端新文件与本地旧副本匹配，只下载缺失范围（跨多链路分摊），在本地重建。结果会用 XXH3-128 与服务端校验；哈希不符或收益过低（几乎要下载整文件）时自动回退全量传输。
 - **FC7 协议**：delta 需要协议版本 FC7。FC7 与旧版 FC6 **不互通**，客户端与服务端须同步升级。
 - 默认关闭：它以本地读盘 + CPU 换取更少的网络字节——在带宽受限 / 广域网链路上净赚，但在高带宽局域网上往往不划算。
+- 大文件 delta 采用**全流式**处理（无整文件缓冲），并对服务端签名生成与客户端旧文件扫描统一使用**无缓冲直接 I/O**（Windows `FILE_FLAG_NO_BUFFERING`、Linux `O_DIRECT`、macOS `F_NOCACHE`）。因此 delta 可作用于多 GB 大文件而不会撑爆内存，批量读/写绕过 OS 文件缓存（robocopy 式），吞吐更可预测；小文件与不足一个扇区的尾部回退到缓冲 I/O。服务端文件读并发有上限以保护磁盘 IOPS，统一异步 IO 驱动使 IO 与哈希计算重叠。
 
 
 
@@ -210,6 +213,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `1`：参数/用法错误（如 `--once` 与 `--enable-hash-memcache` 同用、`--once` 与 `--once-multi` 同用、`--once-idle-grace` 未配 `--once-multi`、`--wait-connect-timeout` 未配 `--once`/`--once-multi`，或在客户端误用这些开关）
 - `5`：某个已服务会话失败或中止（任意 lane 发生错误；`--once-multi` 按聚合，任一失败即 `5`）——与客户端的 `2` 区分，确保每个退出码语义唯一
 - `6`：在 `--wait-connect-timeout` 耗尽前仍未建立任何有效客户端连接（服务端首连等待超时）；详见[首连等待超时](#首连等待超时--wait-connect-timeout)
+- `7`：服务端无法在请求端口上 bind/listen（例如端口已被其他进程占用）
 
 
 

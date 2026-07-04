@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -193,5 +194,37 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
 
 // Benefit rejection (FR-17, design §5.6): reject delta when downloadBytes/newFileBytes >= T.
 bool BenefitRejected(uint64_t downloadBytes, uint64_t newFileBytes);
+
+// --- Streaming BuildPlan (unified-disk-io-driver FR-15/16/17, AC-01..04). Produces a DeltaPlan
+// byte-for-byte equal to BuildPlan(sig, oldData, oldLen, opt.build) but reads the local old file
+// sequentially through a byte source instead of requiring the whole file in one contiguous buffer.
+// The match/roll/early-stop/copy-coalesce logic is SHARED with BuildPlan (design D-02 A): the only
+// change is that every random oldData[] access is served by a forward-only sliding window that
+// holds at most read-ahead-chunk + blockSize bytes (never a whole-file allocation, AC-04). ---
+
+// Sequential byte source: fill up to maxLen bytes at dst, return the count written (0 => EOF).
+// Invoked only with monotonically advancing demand. In production the driver's SequentialReader
+// implements it; in equivalence tests a memory span implements it.
+using ByteSource = std::function<size_t(uint8_t* dst, size_t maxLen)>;
+
+// Optional per-match capture (design D-01 A / FR-15 "命中即捕获"): called exactly once for each
+// matched full block, with the live window bytes [srcOffsetOld, srcOffsetOld+len). Lets the client
+// write the copy into the temp file during the single scan pass (no second read, no whole-file
+// buffer). Equivalence tests leave it empty; it never affects the returned DeltaPlan.
+using CopyCapturedFn =
+    std::function<void(uint64_t srcOffsetOld, uint64_t destOffsetNew, uint32_t len,
+                       const uint8_t* windowBytes)>;
+
+struct StreamingPlanOptions {
+    BuildOptions build;                       // same early-stop / prefix-override semantics
+    uint32_t readAheadChunkBytes = 1u << 20;  // sliding-window refill granularity (memory bound)
+};
+
+// Streaming equivalent of BuildPlan. oldLen must be the true old-file size so the window never
+// reads past EOF (the caller takes it from fs::file_size). For any (sig, byte sequence, opt.build)
+// every field of the returned DeltaPlan and DeltaStats equals BuildPlan's (AC-02/03).
+DeltaPlan BuildPlanStreaming(const SignatureSet& sig, uint64_t oldLen, const ByteSource& source,
+                             const StreamingPlanOptions& opt = {},
+                             const CopyCapturedFn& onCopy = {});
 
 }  // namespace fc::delta

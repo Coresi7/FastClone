@@ -8,6 +8,7 @@
 
 #include "client_handshake.h"
 #include "delta.h"
+#include "disk_io_driver.h"
 #include "file_index.h"
 #include "hash_memcache.h"
 #include "link_scheduler.h"
@@ -42,6 +43,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>

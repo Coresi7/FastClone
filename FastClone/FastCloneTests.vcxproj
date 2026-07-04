@@ -156,6 +156,10 @@
   <ItemGroup>
     <ClInclude Include="cli.h" />
     <ClInclude Include="delta.h" />
+    <ClInclude Include="disk_io_align.h" />
+    <ClInclude Include="disk_io_backend.h" />
+    <ClInclude Include="disk_io_backend_pool.h" />
+    <ClInclude Include="disk_io_driver.h" />
     <ClInclude Include="file_index.h" />
     <ClInclude Include="hash_memcache.h" />
     <ClInclude Include="link_scheduler.h" />
@@ -172,6 +176,11 @@
          main.cpp / transfer_tuning.cpp / route_probe_main.cpp / client_handshake.cpp). -->
     <ClCompile Include="cli.cpp" />
     <ClCompile Include="delta.cpp" />
+    <ClCompile Include="disk_io_align.cpp" />
+    <ClCompile Include="disk_io_driver.cpp" />
+    <ClCompile Include="disk_io_backend_win.cpp" />
+    <ClCompile Include="disk_io_backend_posix.cpp" />
+    <ClCompile Include="disk_io_backend_uring.cpp" />
     <ClCompile Include="file_index.cpp" />
     <ClCompile Include="hash_memcache.cpp" />
     <ClCompile Include="net_topology.cpp" />
@@ -187,6 +196,9 @@
     <ClCompile Include="..\tests\test_main.cpp" />
     <ClCompile Include="..\tests\test_cli.cpp" />
     <ClCompile Include="..\tests\test_delta.cpp" />
+    <ClCompile Include="..\tests\test_streaming_buildplan.cpp" />
+    <ClCompile Include="..\tests\test_disk_io_align.cpp" />
+    <ClCompile Include="..\tests\test_disk_io_driver.cpp" />
     <ClCompile Include="..\tests\test_read_gate.cpp" />
     <ClCompile Include="..\tests\test_file_index.cpp" />
     <ClCompile Include="..\tests\test_hash_memcache.cpp" />
