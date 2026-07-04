@@ -1,7 +1,7 @@
-// Unit tests for the r6-route-quality route selection rewrite (design §8).
+// Unit tests for the r6-route-quality route selection rewrite (design section 8).
 //   - SelectAutoLinks: edge-scored greedy matching with client+server NIC dedup, primary
 //     two-sided preemption, address-family preference and same-subnet scoring.
-//   - AuthOk encode/decode round-trip carrying (endpoint, nicGroup) pairs (§2 / §6.3).
+//   - AuthOk encode/decode round-trip carrying (endpoint, nicGroup) pairs (section 2 / section 6.3).
 // SelectAutoLinks is a pure function over a ReachabilityMatrix, so these tests construct
 // synthetic matrices and assert the chosen LinkPlans without touching the network.
 
@@ -302,7 +302,7 @@ void TC_ScoringHelpers() {
     Require(!fc::SameSubnet("30.29.53.12", 24, "2402:dead::25"), "cross-family must not match");
 }
 
-// ---- AuthOk encode/decode round-trip (§2 / §6.3) ---------------------------------------
+// ---- AuthOk encode/decode round-trip (section 2 / section 6.3) ---------------------------------------
 void TC_AuthOkRoundTrip() {
     fc::AuthOkInfo in;
     in.role = fc::AuthOkRole::NewSession;

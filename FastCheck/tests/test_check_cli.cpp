@@ -55,7 +55,7 @@ void TestDefaults() {
 }
 
 void TestRequiredMissing() {
-    // 缺 --server / --target / --password 任一 -> 抛（AC-04）。
+    // Missing any of --server / --target / --password -> throw (AC-04).
     Expect(ParseThrows({"--target", "t", "--password", "p"}), "missing --server throws");
     Expect(ParseThrows({"--server", "h", "--password", "p"}), "missing --target throws");
     Expect(ParseThrows({"--server", "h", "--target", "t"}), "missing --password throws");
@@ -93,7 +93,7 @@ void TestStreamsRejected() {
     const std::string t = "t";
     Expect(ParseThrows({"--server", "h", "--target", t, "--password", "p", "--streams", "4"}),
            "--streams rejected as unknown arg (AC-08)");
-    // usage 文本不出现 --streams（AC-08）。
+    // The usage text does not mention --streams (AC-08).
     std::ostringstream captured;
     std::streambuf* old = std::cerr.rdbuf(captured.rdbuf());
     PrintUsage();
@@ -128,24 +128,24 @@ void TestSummaryOnlyFlag() {
 }
 
 void TestPreconditions() {
-    // target 不存在 -> false（AC-15）。
+    // target does not exist -> false (AC-15).
     CheckOptions bad;
     bad.target = (fs::temp_directory_path() / "fastclone_nonexistent_xyz_123").string();
     Expect(!CheckLocalPreconditions(bad), "nonexistent target -> precondition fail");
 
-    // target 存在且为目录 -> true。
+    // target exists and is a directory -> true.
     const fs::path dir = MakeTempDir();
     CheckOptions ok;
     ok.target = dir.string();
     Expect(CheckLocalPreconditions(ok), "existing dir target -> precondition ok");
 
-    // output 父目录不存在 -> false（AC-16）。
+    // output parent directory does not exist -> false (AC-16).
     CheckOptions badOut;
     badOut.target = dir.string();
     badOut.output = (fs::temp_directory_path() / "no_such_dir_abc" / "out.json").string();
     Expect(!CheckLocalPreconditions(badOut), "nonexistent --output parent -> precondition fail");
 
-    // output 父目录存在 -> true。
+    // output parent directory exists -> true.
     CheckOptions okOut;
     okOut.target = dir.string();
     okOut.output = (dir / "report.json").string();

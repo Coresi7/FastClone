@@ -247,7 +247,7 @@ void TestRollingMatchesBruteForce() {
 }
 
 void TestBlockSizeHeuristic() {
-    // V-02 / AC-02: the §5.1 boundary table.
+    // V-02 / AC-02: the section 5.1 boundary table.
     Require(fc::delta::ChooseBlockSize(1ULL << 20) == 2048, "1 MiB block size");
     Require(fc::delta::ChooseBlockSize(16ULL << 20) == 4096, "16 MiB block size");
     Require(fc::delta::ChooseBlockSize(128ULL << 20) == 12288, "128 MiB block size");
@@ -576,7 +576,7 @@ void TestOptimizedEqualsReference() {
         cases.push_back({RandomBytes(180000, 7), RandomBytes(180000, 8)});
     }
     {  // duplicate blocks: new has two identical blocks, old holds the content once -> the
-       // descending candidate-order replication is what makes the outputs match (§5.4).
+       // descending candidate-order replication is what makes the outputs match (section 5.4).
         std::vector<uint8_t> block = RandomBytes(4096, 9);  // ample for a full block
         std::vector<uint8_t> n;
         n.insert(n.end(), block.begin(), block.end());
@@ -633,8 +633,8 @@ void CheckStreamEquivalent(const std::vector<uint8_t>& data, const std::vector<s
     }
 }
 
-// V-06: full boundary dataset — empty, tiny, sub/at/over blockSize, multi-chunk + tail, and a
-// ~1 MiB random buffer — each under multiple chunk sizes (V-01/V-02/V-03).
+// V-06: full boundary dataset - empty, tiny, sub/at/over blockSize, multi-chunk + tail, and a
+// ~1 MiB random buffer - each under multiple chunk sizes (V-01/V-02/V-03).
 void TestStreamingEquivalenceDataset() {
     const std::vector<size_t> tinyChunks = {1, 2, 3, 7, 2048, 100003, (1u << 20)};
     const uint64_t sizes[] = {0, 1, 2, 2047, 2048, 2049, 4096, 5000, 100000};
@@ -668,7 +668,7 @@ void TestStreamingCrossChunkBlock() {
 }
 
 // V-03 guard: fileHash uses the RAW XXH3 layout (ComputeBufferHash), which must differ from the
-// canonical layout used by per-block strong checksums — catches an accidental canonical mix-up.
+// canonical layout used by per-block strong checksums - catches an accidental canonical mix-up.
 void TestStreamingRawVsCanonical() {
     using namespace fc::delta;
     const std::vector<uint8_t> data = RandomBytes(4096, 99);

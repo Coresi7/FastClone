@@ -5,12 +5,12 @@
 
 namespace fc {
 
-// Per-lane load snapshot used by the multipath transfer scheduler (design §8). A "lane" is
+// Per-lane load snapshot used by the multipath transfer scheduler (design section 8). A "lane" is
 // one client->server transport connection in the pool; `inFlight` is the number of download
 // streams (files / small-file batches) opened on it but not yet completed -- i.e. the lane's
 // outstanding-request queue depth.
 //
-// weight/bias drive the weighted shortest-queue rule (aux-weight design §3.1): the comparison
+// weight/bias drive the weighted shortest-queue rule (aux-weight design section 3.1): the comparison
 // value is effectiveLoad = (inFlight + bias) / weight. Both carry defaults that reproduce the
 // original least-inFlight behavior exactly (weight=1.0, bias=0), so existing aggregate
 // initializers like LaneLoad{true, 5} stay valid and zero-regression (FR-06).

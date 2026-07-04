@@ -10,7 +10,7 @@ using namespace detail;
 
 namespace detail {
 // Read an entire regular file into memory (binary delta server-side signature generation /
-// design §6.3 "sequentially read the whole file"). Returns false on any open/read failure.
+// design section 6.3 "sequentially read the whole file"). Returns false on any open/read failure.
 bool ReadWholeFile(const fs::path& abs, std::vector<uint8_t>& out) {
     std::error_code ec;
     const uint64_t size = static_cast<uint64_t>(fs::file_size(abs, ec));
@@ -40,7 +40,7 @@ struct ServerStream {
 };
 
 // Binary delta (FC7) server-side byte-range stream. Opened on DeltaRangeOpen through the unified
-// disk IO driver (unified-disk-io-driver C10 / design §5.6); `remaining` bytes starting at
+// disk IO driver (unified-disk-io-driver C10 / design section 5.6); `remaining` bytes starting at
 // `nextReadOffset` are streamed back as DeltaRangeChunk frames followed by a single DeltaRangeEnd.
 // Owned exclusively by the send loop (no I/O under any lock); the driver handle is closed on
 // completion/error and on session teardown.
@@ -71,15 +71,15 @@ struct ServerBatchStream {
 // flag that is defined later; it does not (and cannot) promote it to external linkage.
 extern std::atomic<bool> g_onceTargetClaimed;
 
-// 会话类型（fastcheck）。Sync=既有镜像同步会话（默认，既有路径零影响）；Check=FastCheck
-// 只读比对会话，只服务 manifest 与 hash 请求，不进入传输等待语义。
+// Session type (fastcheck). Sync=the existing mirror sync session (default, zero impact on the existing path); Check=FastCheck
+// read-only comparison session, serving only manifest and hash requests, not entering transfer-wait semantics.
 enum class SessionType : uint8_t { Sync = 0, Check = 1 };
 
 // Server-side logical session shared by all connections that carry the same sessionId
 // (FR-003/004). Per D-02 it only carries merge identity + lifecycle, not transfer state.
 struct ServerSession {
     std::string sessionId;
-    // fastcheck：会话类型。默认 Sync，仅 CheckAuth 分支置 Check。既有 Sync 路径不读此字段。
+    // fastcheck: session type. Default Sync, only the CheckAuth branch sets Check. The existing Sync path does not read this field.
     SessionType type = SessionType::Sync;
     std::atomic<uint32_t> liveConns{0};
     // Lifecycle field: ALWAYS access under SessionRegistry::mu_ (Create/Join/SweepExpired/
@@ -92,7 +92,7 @@ struct ServerSession {
     std::atomic<bool> hadError{false};
 };
 
-// Process-wide registry: sessionId -> session, with idle TTL reclaim (design §5.1/§5.3).
+// Process-wide registry: sessionId -> session, with idle TTL reclaim (design section 5.1/section 5.3).
 class SessionRegistry {
 public:
     // New first connection: mint an unguessable token (NFR-007) and register it with one
@@ -112,7 +112,7 @@ public:
     }
 
     // --once-multi snapshot: number of real sessions still holding a live lane (multi-lane
-    // counts as 1, design §6.1 / FR-08) and the cumulative count of created real sessions.
+    // counts as 1, design section 6.1 / FR-08) and the cumulative count of created real sessions.
     // Derived from the single source of truth (liveConns) under mu_ so it stays consistent
     // with concurrent Create/Join/Close (NFR-02). O(active sessions), polled ~5x/s.
     struct IdleSnapshot {
@@ -235,9 +235,9 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         return session;
     }
     if (claim.type == MsgType::CheckAuth) {
-        // fastcheck：只读比对会话认领。认证同 Auth，但解析出的会话标记为 Check 且不认领
-        // --once 目标（D-04：Check 只读，不等价于一次同步）。不通告多路端点、不置 kCapDelta
-        // （Check 不做 delta）。
+        // fastcheck: read-only comparison session claim. Authentication is the same as Auth, but the parsed session is
+        // marked Check and does not claim the --once target (D-04: Check is read-only, not equivalent to one sync). Does not
+        // advertise multipath endpoints and does not set kCapDelta (Check does no delta).
         const CheckAuthInfo info = DecodeCheckAuth(claim.payload);
         if (info.password != password) {
             SendSimple(socket, MsgType::AuthFail, "bad password");
@@ -671,12 +671,12 @@ ReadGate& GetServerReadGate() {
 }
 
 // Read-ahead window (in-flight ops) each server SequentialReader keeps over its file. Total disk
-// read concurrency is bounded by the driver's maxInFlight, not per-reader (design §5.2/FR-20).
+// read concurrency is bounded by the driver's maxInFlight, not per-reader (design section 5.2/FR-20).
 constexpr uint32_t kServerReadAhead = 4;
 
 // Process-wide unified disk IO driver for the server (unified-disk-io-driver C9/C10): the single
 // locus for signature/hash miss reads and delta range reads, replacing per-path inline file reads
-// and the ReadGate concurrency cap (design §3.1/§5.2, FR-20). Mirrors the GetServerHashPool()
+// and the ReadGate concurrency cap (design section 3.1/section 5.2, FR-20). Mirrors the GetServerHashPool()
 // singleton lifetime (never torn down; process-scoped).
 fc::io::DiskIoDriver& GetServerDiskIoDriver() {
     static fc::io::IoDriverConfig cfg = [] {
@@ -1026,8 +1026,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             frame.type == MsgType::FileBatchOpen ||
                             frame.type == MsgType::BlockSigRequest ||
                             frame.type == MsgType::DeltaRangeOpen)) {
-                    // fastcheck：Check 会话不服务任何传输帧；良性 FastCheck 客户端不会发这些帧
-                    // （FR-28/AC-36）。记诊断并忽略，不置 failed、不抛，避免误判为 session failed。
+                    // fastcheck: a Check session serves no transfer frames; a well-behaved FastCheck client will not send these frames
+                    // (FR-28/AC-36). Log a diagnostic and ignore, do not set failed and do not throw, avoiding a false session-failed verdict.
                     if (debugEnabled) {
                         std::cerr << "[check] ignore transfer frame in Check session type="
                                   << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
@@ -1084,7 +1084,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     }
                     outboundCv.notify_one();
                 } else if (frame.type == MsgType::BlockSigRequest) {
-                    // Binary delta (FC7, design §6.3). Generate (or memcache-hit) the block
+                    // Binary delta (FC7, design section 6.3). Generate (or memcache-hit) the block
                     // signature set + full-file XXH3-128 and reply BlockSigResponse; any
                     // failure replies DeltaError so the client falls back to full download.
                     const std::string rel = DecodeBlockSigRequest(frame.payload);
@@ -1124,7 +1124,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                                 return;
                             }
 
-                            // C9 (design §5.2/FR-20): the file content read now flows through the
+                            // C9 (design section 5.2/FR-20): the file content read now flows through the
                             // unified driver; disk-read concurrency is bounded by the driver
                             // (maxInFlight + read queue + fairness), so the ReadGate permit is no
                             // longer taken on this path. GetServerReadGate()/ReadGate stay defined
@@ -1223,8 +1223,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                         throw;
                     }
                 } else if (frame.type == MsgType::DeltaRangeOpen) {
-                    // Binary delta (FC7, design §6.3): C10 routes the range read through the unified
-                    // driver (design §5.6). Open here (handle validation); the send loop streams the
+                    // Binary delta (FC7, design section 6.3): C10 routes the range read through the unified
+                    // driver (design section 5.6). Open here (handle validation); the send loop streams the
                     // bytes via the driver lock-free. Open failure -> DeltaError.
                     const DeltaRangeRequest req = DecodeDeltaRangeOpen(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, req.relPath);
@@ -1258,9 +1258,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                 }
             }
         } catch (const std::exception& ex) {
-            // fastcheck 双保险（FR-27/AC-35）：Check 会话在收齐 manifest+hash 后，客户端 FIN 或
-            // 关闭连接属于干净结束。若异常是「有序关闭类」（recv failed WSA=0 / errno=0，与
-            // 分派处 :2087 同判据），则置 done 但不置 failed，避免抛「Server session failed」。
+            // fastcheck double safeguard (FR-27/AC-35): for a Check session, after receiving all of manifest+hash, a client
+            // FIN or connection close is a clean end. If the exception is an "orderly-close class" one (recv failed WSA=0 / errno=0,
+            // same criterion as the dispatch site :2087), set done but not failed, avoiding throwing "Server session failed".
             const std::string what = ex.what();
             const bool orderlyClose =
                 what.find("recv failed WSA=0") != std::string::npos ||
@@ -1655,7 +1655,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
     }
 
     if (debugEnabled && failed.load()) {
-        // Exception-window context snapshot for post-mortem (AC-B3 / design §B.4):
+        // Exception-window context snapshot for post-mortem (AC-B3 / design section B.4):
         // session id + lock-wait/critical-section stats + outbound & hash queues + in-flight tasks.
         size_t highQueued = 0, manifestQueued = 0, pendingAdopt = 0, pendingHashes = 0;
         {
@@ -1749,7 +1749,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
 
 namespace {
 
-// --- OneShot server mode (--once) process-wide state (design §2.3 / §3.5/§3.6) ---
+// --- OneShot server mode (--once) process-wide state (design section 2.3 / section 3.5/section 3.6) ---
 // Single-instance per process: main() calls RunServer at most once (R-04). All only ever
 // read/written when options.exitAfterSync is true; default values are inert otherwise.
 std::atomic<bool>         g_onceShouldExit{false};
@@ -1816,14 +1816,14 @@ void FireOnceTerminal(bool success) {
     WakeAcceptLoop();
 }
 
-// --- --once-multi process-wide state (design §4.3 / §6.4-6.6) ---
+// --- --once-multi process-wide state (design section 4.3 / section 6.4-6.6) ---
 // Sticky failure aggregate: set true the first time any real session ends not-clean and never
 // reset (B5 / FR-13). Read once by the main thread when firing the terminal verdict. The
 // once-multi exit channel reuses g_onceShouldExit / g_onceExitCode / g_onceTerminalFired (D-04);
-// it deliberately does NOT touch g_onceTarget / g_onceMu (those stay --once-only, §8).
+// it deliberately does NOT touch g_onceTarget / g_onceMu (those stay --once-only, section 8).
 std::atomic<bool> g_omAnyFailure{false};
 
-// --- --wait-connect-timeout in-flight handshake guard (design §3.7 / NFR-04 / FR-07) ---
+// --- --wait-connect-timeout in-flight handshake guard (design section 3.7 / NFR-04 / FR-07) ---
 // Counts connections that have been accepted and dispatched to a handshake thread but whose
 // outcome (createdTotal++ on Auth success, or close on probe/failure) is not yet observable.
 // fetch_add happens on the main thread before dispatch; fetch_sub at the handshake thread's
@@ -1848,7 +1848,7 @@ void FireOnceMultiTerminal() {
     WakeAcceptLoop();
 }
 
-// Main-thread idle-grace evaluator (design §6.4). idleSince lives on the RunServer stack and is
+// Main-thread idle-grace evaluator (design section 6.4). idleSince lives on the RunServer stack and is
 // touched ONLY here, so arm/cancel can never race (D-01). State is derived purely from the
 // registry snapshot: served (createdTotal>0) gates entry (FR-12/B4); activeRealSessions==0 arms
 // the timer (FR-09) and any new real session re-arms it from zero (FR-10); probes never change
@@ -1878,15 +1878,15 @@ void EvaluateIdleGrace(uint64_t graceMs,
 }
 
 // Bounded extra window (past the deadline) during which an in-flight handshake may still defer the
-// wait-connect timeout (design §3.7 "defer one tick", made finite to fix B-01). A genuine handshake
+// wait-connect timeout (design section 3.7 "defer one tick", made finite to fix B-01). A genuine handshake
 // latches createdTotal within milliseconds, so a sub-second cap never falsely kills a real
 // connection racing the boundary (AC-09 / NFR-04); but it guarantees that a TCP connection which is
-// accepted and then never sends any handshake bytes — leaving its handshake thread blocked in recv
-// with g_inFlightHandshakes stuck at >0 — can no longer suppress the timeout indefinitely
+// accepted and then never sends any handshake bytes - leaving its handshake thread blocked in recv
+// with g_inFlightHandshakes stuck at >0 - can no longer suppress the timeout indefinitely
 // (FR-07 / FR-08 / AC-08).
 constexpr int kWaitConnectInFlightGraceMs = 1000;
 
-// Main-thread first-connect-wait evaluator (design §3.3). waitConnectDeadline / firstConnSeen
+// Main-thread first-connect-wait evaluator (design section 3.3). waitConnectDeadline / firstConnSeen
 // live on the RunServer stack and are touched ONLY here, so the same "main-thread single-writer"
 // discipline as idle-grace applies (no races, D-01). Returns true iff the wait window has elapsed
 // with no valid connection, i.e. the caller must exit with kExitWaitConnectTimeout (FR-08).
@@ -1895,7 +1895,7 @@ constexpr int kWaitConnectInFlightGraceMs = 1000;
 //   - Probe connections never increment createdTotal, so they do not stop the timer (FR-07); an
 //     in-flight handshake (g_inFlightHandshakes>0) defers the timeout, but only within the BOUNDED
 //     grace window [deadline, deadline+kWaitConnectInFlightGraceMs). This avoids killing a real
-//     connection at the deadline boundary (NFR-04 / §3.7) while ensuring an accepted-but-silent
+//     connection at the deadline boundary (NFR-04 / section 3.7) while ensuring an accepted-but-silent
 //     connection whose handshake thread is parked in recv cannot block the timeout forever (B-01).
 bool EvaluateWaitConnect(uint64_t timeoutMs, bool& firstConnSeen,
                          const std::chrono::steady_clock::time_point& deadline) {
@@ -1918,7 +1918,7 @@ bool EvaluateWaitConnect(uint64_t timeoutMs, bool& firstConnSeen,
     // the timeout from firing.
     if (g_inFlightHandshakes.load(std::memory_order_acquire) > 0 &&
         now < deadline + std::chrono::milliseconds(kWaitConnectInFlightGraceMs)) {
-        return false;  // genuine handshake may still latch createdTotal (NFR-04 / §3.7)
+        return false;  // genuine handshake may still latch createdTotal (NFR-04 / section 3.7)
     }
     std::cout << "[wc] wait_connect_timeout threshold_ms=" << timeoutMs
               << " no_valid_connection=1" << std::endl;  // FR-13 / AC-13
@@ -1965,7 +1965,7 @@ int RunServer(const CliOptions& options) {
                   << std::endl;
     }
 
-    // Collect the server's advertised endpoint list once at startup (FR-005 / §6.1, r6 §6.1).
+    // Collect the server's advertised endpoint list once at startup (FR-005 / section 6.1, r6 section 6.1).
     // Sent to the first connection in AuthOk so the client can extend the connection pool.
     // Each endpoint carries a dense per-physical-NIC group: all addresses of one adapter
     // (its IPv4 + IPv6) share one group, letting the client dedup by server NIC (L-r6-01).
@@ -1999,16 +1999,16 @@ int RunServer(const CliOptions& options) {
     const bool debugEnabled = IsDebugEnabled();
     std::atomic<uint64_t> connIdCounter{0};
     std::atomic<uint32_t> activeSessions{0};
-    // --once-multi accept-loop evaluation tick (design §6.2). grace is measured by wall clock,
+    // --once-multi accept-loop evaluation tick (design section 6.2). grace is measured by wall clock,
     // so its resolution is +/- one tick (negligible for second-scale grace).
     constexpr int kOnceMultiTickMs = 200;
-    // --once-multi idle timer: main-thread-only, so arm/cancel can never race (design §6.4/§7).
+    // --once-multi idle timer: main-thread-only, so arm/cancel can never race (design section 6.4/section 7).
     std::optional<std::chrono::steady_clock::time_point> idleSince;
-    // --wait-connect-timeout (design §3.3): arm a first-connect deadline for --once / --once-multi.
+    // --wait-connect-timeout (design section 3.3): arm a first-connect deadline for --once / --once-multi.
     // Both timer state slots are main-thread-only (same discipline as idleSince). firstConnSeen
     // latches the moment the first valid connection appears and permanently disables the timer
     // (FR-09); under --once it also reverts the accept loop from per-tick polling back to the
-    // original blocking accept so the post-first-connection path is byte-for-byte unchanged (§3.6).
+    // original blocking accept so the post-first-connection path is byte-for-byte unchanged (section 3.6).
     constexpr int kWaitConnectTickMs = 200;
     const bool waitConnectActive = options.exitAfterSync || options.onceMulti;
     std::optional<std::chrono::steady_clock::time_point> waitConnectDeadline;
@@ -2047,7 +2047,7 @@ int RunServer(const CliOptions& options) {
                 throw;
             }
             if (!maybe) {
-                // Timeout tick: evaluate first-connect-wait BEFORE idle-grace (design §3.8). Before
+                // Timeout tick: evaluate first-connect-wait BEFORE idle-grace (design section 3.8). Before
                 // the first valid connection idle-grace is a no-op (served==false), so the ordering
                 // is side-effect free; after it, wait-connect is permanently disabled.
                 // onceMulti implies waitConnectActive (waitConnectActive = exitAfterSync || onceMulti),
@@ -2059,13 +2059,13 @@ int RunServer(const CliOptions& options) {
                     return kExitWaitConnectTimeout;  // FR-08
                 }
                 // Timeout tick: evaluate idle-grace ONLY when nothing was accepted this tick,
-                // so a just-accepted connection is never immediately judged idle (design §6.2/R-02).
+                // so a just-accepted connection is never immediately judged idle (design section 6.2/R-02).
                 EvaluateIdleGrace(options.onceIdleGraceMs, idleSince);
                 continue;
             }
             client = std::move(*maybe);
         } else if (waitConnectActive && !firstConnSeen) {
-            // --once first-connect wait (design §3.6): poll with a short tick instead of blocking
+            // --once first-connect wait (design section 3.6): poll with a short tick instead of blocking
             // accept so wait-connect can fire when only probes (or nothing) arrive (AC-07/AC-08).
             // Once firstConnSeen latches, the branch below resumes the original blocking accept.
             std::optional<SocketHandle> maybe;
@@ -2106,7 +2106,7 @@ int RunServer(const CliOptions& options) {
         }
         const uint64_t connSeq = connIdCounter.fetch_add(1) + 1;
         activeSessions.fetch_add(1);
-        // wait-connect in-flight guard (§3.7): mark this connection's handshake as pending before
+        // wait-connect in-flight guard (section 3.7): mark this connection's handshake as pending before
         // dispatch; the thread's single exit drops it. Inert when wait-connect is not armed.
         g_inFlightHandshakes.fetch_add(1, std::memory_order_acq_rel);
         std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
@@ -2118,8 +2118,8 @@ int RunServer(const CliOptions& options) {
                 std::cout << "[mp] conn_accept conn=" << connSeq
                           << " sessionId=" << session->sessionId
                           << " live_conns=" << session->liveConns.load() << std::endl;
-                // fastcheck（D-04）：Check 会话是只读比对，不认领 --once 目标、不消耗 once 名额、
-                // 不改 once 判定（NFR-02）。仅 Sync 会话参与 ClaimOrMatchOnceTarget / completedOk。
+                // fastcheck (D-04): a Check session is a read-only comparison; it does not claim the --once target, does not
+                // consume a once slot, and does not change the once verdict (NFR-02). Only Sync sessions participate in ClaimOrMatchOnceTarget / completedOk.
                 const bool isCheck = (session->type == SessionType::Check);
                 if (options.exitAfterSync && !isCheck && !ClaimOrMatchOnceTarget(session)) {
                     // Fallback guard for a tiny race window: if a second Auth slipped past the
@@ -2137,7 +2137,7 @@ int RunServer(const CliOptions& options) {
                 }
             } catch (const std::exception& ex) {
                 // Distinguish pre-handshake close (reachability probe: client connects
-                // then immediately closes before sending any bytes → recv returns 0,
+                // then immediately closes before sending any bytes -> recv returns 0,
                 // WSA=0 / errno=0) from a real session error. Pre-handshake closes are
                 // benign; suppress [mp] conn_error noise and demote to debug.
                 const bool preHandshake = (session == nullptr);
@@ -2156,7 +2156,7 @@ int RunServer(const CliOptions& options) {
                 }
                 // --once / --once-multi: any real-session lane error marks the session failed
                 // (FR-07). A pre-handshake close has session == null and never sets this (FR-08.1).
-                // fastcheck（D-04/NFR-02）：Check 会话不参与 once 判定，不折算失败聚合。
+                // fastcheck (D-04/NFR-02): a Check session does not participate in the once verdict and is not folded into the failure aggregation.
                 if ((options.exitAfterSync || options.onceMulti) && session &&
                     session->type != SessionType::Check) {
                     session->hadError.store(true, std::memory_order_relaxed);
@@ -2183,7 +2183,7 @@ int RunServer(const CliOptions& options) {
             } else if (options.onceMulti && session && session->type != SessionType::Check) {
                 // --once-multi: when a real session's last lane closes, fold its verdict into the
                 // sticky failure aggregate (B5/FR-13). The main thread later reads it at terminal.
-                // No g_onceTarget involvement (§8): every real session is served, not just one.
+                // No g_onceTarget involvement (section 8): every real session is served, not just one.
                 if (remaining == 0) {
                     const bool ok = session->completedOk.load(std::memory_order_relaxed) &&
                                     !session->hadError.load(std::memory_order_relaxed);
@@ -2193,7 +2193,7 @@ int RunServer(const CliOptions& options) {
                 }
             }
             activeSessions.fetch_sub(1);
-            // wait-connect in-flight guard (§3.7): single exit for every dispatched connection,
+            // wait-connect in-flight guard (section 3.7): single exit for every dispatched connection,
             // covering the clean, error, and pre-handshake-close paths (R-03: no leak -> no stall).
             g_inFlightHandshakes.fetch_sub(1, std::memory_order_acq_rel);
         }).detach();

@@ -1,7 +1,7 @@
 #pragma once
 
 // Platform IO backend abstraction for the unified disk IO driver (unified-disk-io-driver design
-// §7.1 matrix, FR-03..FR-10). Each platform provides ONE concrete backend, selected at compile
+// section 7.1 matrix, FR-03..FR-10). Each platform provides ONE concrete backend, selected at compile
 // time (design D-04, strong isolation so macOS never compiles an O_DIRECT / POSIX-aio branch):
 //   Windows : IOCP + FILE_FLAG_NO_BUFFERING            (disk_io_backend_win.cpp)
 //   Linux   : io_uring (runtime probe) + O_DIRECT       (disk_io_backend_uring.cpp)
@@ -11,7 +11,7 @@
 // executes submitted ops with multiple ops in flight and reaps completions in batches.
 //
 // Buffer ownership is by value (std::vector), so lifetime is RAII and bounded by queue depth x
-// chunk size — never by whole-file size (NFR memory / AC-04). Reads move their bytes out in the
+// chunk size - never by whole-file size (NFR memory / AC-04). Reads move their bytes out in the
 // completion; writes move their source bytes into the request.
 
 #include "disk_io_align.h"
@@ -65,7 +65,7 @@ struct IoDriverConfig {
     uint32_t backendConcurrency = 4;  // in-flight ops / worker threads for the pool backends
     uint32_t maxReadQueue = 256;
     uint32_t maxWriteQueue = 256;
-    uint32_t readWeight = 1;          // fair-share credits (design §3.2 / D-03)
+    uint32_t readWeight = 1;          // fair-share credits (design section 3.2 / D-03)
     uint32_t writeWeight = 1;
     uint32_t chunkBytes = 1u << 20;   // 1 MiB read-ahead / write chunk granularity
     uint32_t maxInFlight = 16;        // cap on submitted-not-completed ops (bounds memory, FR-12)

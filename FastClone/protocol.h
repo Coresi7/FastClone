@@ -16,8 +16,8 @@ enum class MsgType : uint8_t {
     // Multipath (FC6): a follow-up connection claims an existing logical session by
     // sessionId instead of starting a new one. Sent by the client in place of Auth.
     SessionJoin = 5,
-    // FastCheck（fastcheck，FC7 加法式）：只读比对客户端用 CheckAuth 认领会话，替代 Auth。
-    // 占用 SessionJoin=5 与 ManifestRequest=10 之间的空槽，不改任何既有帧布局。
+    // FastCheck (fastcheck, FC7 additive): the read-only comparison client claims a session with CheckAuth, replacing Auth.
+    // Occupies the empty slot between SessionJoin=5 and ManifestRequest=10, without changing any existing frame layout.
     CheckAuth = 6,
     ManifestRequest = 10,
     ManifestEntry = 11,
@@ -25,7 +25,7 @@ enum class MsgType : uint8_t {
     ManifestProgress = 13,
     HashRequest = 20,
     HashResponse = 21,
-    // Binary delta (FC7, binary-delta §8.2). Independent message types (not reusing
+    // Binary delta (FC7, binary-delta section 8.2). Independent message types (not reusing
     // FileChunk) so the delta state machine stays isolated from the regular download path.
     BlockSigRequest = 22,   // C->S: relPath
     BlockSigResponse = 23,  // S->C: relPath + signature set

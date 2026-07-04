@@ -162,7 +162,7 @@ void DiskIoDriver::SchedulerLoop() {
             const bool idle = readQ_.empty() && writeQ_.empty();
             // On stop, once the queues are flushed we exit even if ops are still in flight: the
             // backend->shutdown() in the destructor quiesces/frees any remaining in-flight ops
-            // (design §3.6). This keeps teardown deadlock-free regardless of reap timing.
+            // (design section 3.6). This keeps teardown deadlock-free regardless of reap timing.
             if (stop_ && idle) {
                 return;
             }

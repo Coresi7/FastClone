@@ -49,15 +49,15 @@ bool LessEqual128(const U128& x, const U128& y) {
     return x.hi < y.hi || (x.hi == y.hi && x.lo <= y.lo);
 }
 
-// Inlined-weak hash entry for the CSR (bucket-contiguous) candidate layout (FR-09 / §5.2).
+// Inlined-weak hash entry for the CSR (bucket-contiguous) candidate layout (FR-09 / section 5.2).
 struct Entry {
     uint32_t weak = 0;        // inlined so candidate filtering reads 8 contiguous bytes
     uint32_t blockIndex = 0;  // index into sig.blocks
 };
 
-// Forward-only sliding window over a sequential byte source (unified-disk-io-driver §4.2). Serves
+// Forward-only sliding window over a sequential byte source (unified-disk-io-driver section 4.2). Serves
 // contiguous views [p, p+len) and single bytes for a monotonically advancing cursor while holding
-// at most (readAheadChunk + blockSize) bytes — no whole-file allocation (FR-15/AC-04). The BuildPlan
+// at most (readAheadChunk + blockSize) bytes - no whole-file allocation (FR-15/AC-04). The BuildPlan
 // scan advances p only forward (by 1 on a roll, by L on a match), so every access is >= the cursor.
 class SlidingWindow {
 public:
@@ -119,7 +119,7 @@ private:
 }  // namespace
 
 RollingWeak WeakInit(const uint8_t* p, uint32_t L) {
-    // s1 = Σ X[j], s2 = Σ (j+1)*X[j]. Accumulating in uint32_t may overflow 2^32, but the
+    // s1 = sum(X[j]), s2 = sum((j+1)*X[j]). Accumulating in uint32_t may overflow 2^32, but the
     // final &0xFFFF is correct anyway because (X mod 2^32) mod 2^16 == X mod 2^16.
     uint32_t s1 = 0;
     uint32_t s2 = 0;
@@ -135,7 +135,7 @@ RollingWeak WeakInit(const uint8_t* p, uint32_t L) {
 }
 
 void WeakRoll(RollingWeak& w, uint8_t outByte, uint8_t inByte, uint32_t L) {
-    // Update s2 with the OLD s1 first, then update s1 (design §5.2). Subtraction can wrap in
+    // Update s2 with the OLD s1 first, then update s1 (design section 5.2). Subtraction can wrap in
     // uint32_t, but masking to 16 bits yields the correct value mod 2^16 regardless.
     const uint32_t s1 = w.s1;
     const uint32_t s2 = w.s2;
@@ -354,7 +354,7 @@ StreamingResult StreamingSigner::Finish() {
 }
 
 uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize) {
-    // floor = max(kPrefixFloorBytes, blockSize * kPrefixFloorBlocks) — small-file evidence
+    // floor = max(kPrefixFloorBytes, blockSize * kPrefixFloorBlocks) - small-file evidence
     // floor and at least kPrefixFloorBlocks blocks of evidence (B5/B4).
     uint64_t floorBytes = kPrefixFloorBytes;
     const uint64_t blockFloor = static_cast<uint64_t>(blockSize) * kPrefixFloorBlocks;
@@ -363,7 +363,7 @@ uint64_t EarlyStopPrefixBytes(uint64_t oldLen, uint32_t blockSize) {
     }
     const uint64_t pct = oldLen / 100 * kPrefixPercent + (oldLen % 100) * kPrefixPercent / 100;
     uint64_t prefix = floorBytes > pct ? floorBytes : pct;
-    if (prefix > kPrefixCapBytes) {  // min(cap, ...) performance cap (§4.3)
+    if (prefix > kPrefixCapBytes) {  // min(cap, ...) performance cap (section 4.3)
         prefix = kPrefixCapBytes;
     }
     return prefix;
@@ -374,7 +374,7 @@ bool ProjectedRejected(uint64_t matchedBytes, uint64_t scannedBytes,
     if (scannedBytes == 0) {
         return false;  // no evidence yet -> never project
     }
-    // Early stop <=> matchedBytes*oldLen*100 <= newFileBytes*35*scannedBytes (delta-perf §4.1),
+    // Early stop <=> matchedBytes*oldLen*100 <= newFileBytes*35*scannedBytes (delta-perf section 4.1),
     // 35 == kBenefitPercentDen - kBenefitPercentNum. Fold the small constants into one factor
     // each (safe for any realistic file < 2^57 bytes) and compare in 128 bits.
     const U128 left = Mul64(matchedBytes, oldLen * kBenefitPercentDen);
@@ -404,8 +404,8 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
 
     // CSR (bucket-contiguous) candidate layout over FULL blocks only: the trailing short block
     // (len < blockSize) cannot be located by a fixed blockSize rolling window, so it is
-    // excluded and always a miss (§5.1). bucketStart is a prefix sum; entries holds the
-    // inlined-weak candidates packed per bucket so candidate scans read sequentially (§5.2).
+    // excluded and always a miss (section 5.1). bucketStart is a prefix sum; entries holds the
+    // inlined-weak candidates packed per bucket so candidate scans read sequentially (section 5.2).
     constexpr uint32_t kBuckets = 1u << 16;
     std::vector<uint32_t> bucketStart(kBuckets + 1, 0);
     uint32_t fullBlockCount = 0;
@@ -423,7 +423,7 @@ DeltaPlan BuildPlan(const SignatureSet& sig, const uint8_t* oldData, uint64_t ol
     std::vector<uint32_t> fillPos(bucketStart.begin(), bucketStart.begin() + kBuckets);
     // Iterate block index DESCENDING so the first block written to a bucket (highest index)
     // lands at the lowest slot: scanning a bucket [start,end) then visits blocks in descending
-    // index order, byte-for-byte replicating the legacy head-insert chain order (FR-11/§5.4).
+    // index order, byte-for-byte replicating the legacy head-insert chain order (FR-11/section 5.4).
     for (uint32_t ii = blockCount; ii-- > 0;) {
         if (blockLen(ii) != L) {
             continue;

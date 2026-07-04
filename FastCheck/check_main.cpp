@@ -1,9 +1,10 @@
-// FastCheck — 独立只读目录比对工具（fastcheck）。连接现有 FastClone server，仅枚举、比对、
-// 输出报告；对本地/远端目录零副作用（除显式 --output 报告文件）。退出码 0-4 一值一义。
+// FastCheck - standalone read-only directory comparison tool (fastcheck). Connects to an existing FastClone server,
+// only enumerates, compares and outputs a report; zero side effects on local/remote directories (except the explicit
+// --output report file). Exit codes 0-4 are one value one meaning.
 //
-// 入口流程（AC-01/21）：解析 CLI（失败→usage+2）→ 前置本地/输出检查（失败→3，不连接）→
-// 安装 Ctrl+C → ConnectTo（失败→2）→ HandshakeClientCheck（失败/认证失败→2）→ RunCheck →
-// WriteReport → 返回 engine 建议退出码。断连/协议异常统一映射退出码 2。
+// Entry flow (AC-01/21): parse CLI (failure->usage+2) -> precondition local/output checks (failure->3, no connect) ->
+// install Ctrl+C -> ConnectTo (failure->2) -> HandshakeClientCheck (failure/auth failure->2) -> RunCheck ->
+// WriteReport -> return the engine's suggested exit code. Disconnect/protocol exceptions all map to exit code 2.
 
 #include "check_cli.h"
 #include "check_engine.h"
@@ -26,7 +27,7 @@
 namespace fc::check {
 namespace {
 
-// Ctrl+C 中断标志：信号/控制台处理器仅置位，engine 每轮观察后干净收尾（FR-15/AC-21）。
+// Ctrl+C interrupt flag: the signal/console handler only sets it; the engine observes it each round and cleanly finishes (FR-15/AC-21).
 std::atomic<bool> g_interrupted{false};
 
 #ifdef _WIN32
@@ -61,9 +62,9 @@ void InstallInterruptHandler() {
 #endif
 }
 
-// 主流程。返回 check 专用退出码。
+// Main flow. Returns the check-specific exit code.
 int RunMain(const CheckOptions& options) {
-    // 前置本地/输出检查（在任何 TCP 之前，FR-12）。
+    // Precondition local/output checks (before any TCP, FR-12).
     if (!CheckLocalPreconditions(options)) {
         return kLocalPrecondFailed;
     }
@@ -99,7 +100,7 @@ int RunMain(const CheckOptions& options) {
     try {
         outcome = RunCheck(options, channel, g_interrupted);
     } catch (const std::exception& ex) {
-        // engine 内部已捕获断连，此处兜底其它协议异常：退出码 2。
+        // The engine already catches disconnects internally; this is a fallback for other protocol exceptions: exit code 2.
         std::cerr << "error: check aborted: " << ex.what() << std::endl;
         ShutdownBoth(socket);
         return kConnFailed;
@@ -118,7 +119,7 @@ int wmain(int argc, wchar_t** argv) {
 #else
 int main(int argc, char** argv) {
 #endif
-    fc::WsaContext wsa;  // RAII Winsock init。
+    fc::WsaContext wsa;  // RAII Winsock init.
 
     std::vector<std::string> args;
     if (argc > 1) {
@@ -138,7 +139,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& ex) {
         fc::check::PrintUsage();
         std::cerr << "argument error: " << ex.what() << std::endl;
-        return fc::check::kConnFailed;  // 参数错误：非 0/1（FR-11），取 2（D-03）。
+        return fc::check::kConnFailed;  // parameter error: not 0/1 (FR-11), use 2 (D-03).
     }
 
     return fc::check::RunMain(options);

@@ -56,7 +56,7 @@ private:
 
 // RAII permit holder: acquires on construction, releases on destruction (R-04: success, failure,
 // exception and cancellation paths all release exactly once). release() can hand the permit back
-// early (before taking any session lock, design §3.3 step 5); the destructor is then a no-op.
+// early (before taking any session lock, design section 3.3 step 5); the destructor is then a no-op.
 class ReadGateGuard {
 public:
     ReadGateGuard(ReadGate& gate, const std::atomic<bool>& done)

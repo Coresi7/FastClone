@@ -1,4 +1,4 @@
-// Unit tests for the multipath transfer scheduler's lane selection (design §8).
+// Unit tests for the multipath transfer scheduler's lane selection (design section 8).
 // SelectLeastLoadedLane is a pure function over a per-lane load snapshot, so these tests
 // construct synthetic lane vectors and assert which lane is chosen, with no network / threads.
 //   - shortest-queue (least outstanding streams) selection,
@@ -282,7 +282,7 @@ void TC_FloatTieLowestIndexStable() {
     }
 }
 
-// ---- §5.1 disconnect / unhealthy-lane selection regression (V-12~V-15) ----------------------
+// ---- section 5.1 disconnect / unhealthy-lane selection regression (V-12~V-15) ----------------------
 
 // V-12 / scenario 1: a dead aux is skipped even if it is the emptiest + highest weight.
 void TC_DeadAuxSkippedWeighted() {

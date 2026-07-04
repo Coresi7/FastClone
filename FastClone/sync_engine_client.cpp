@@ -55,10 +55,10 @@ enum class CompareAction {
     FallbackHash
 };
 
-// fastcheck 纯重构：比对判定统一走共享的 compare_phase::DecideCompare（Fast 模式），mtime 容差
-// /归一化/遗留裸值兜底逻辑已逐字迁入 compare_phase，Fast 分支真值表与旧实现字节级等价。此处仅
-// 把 CompareOutcome 映射回 client 既有的 CompareAction：Missing/Diff→TransferNow、Same→Skip、
-// needHash→FallbackHash。
+// fastcheck pure refactor: comparison decisions all go through the shared compare_phase::DecideCompare (Fast mode);
+// the mtime tolerance / normalization / legacy raw-value fallback logic has been migrated verbatim into compare_phase,
+// and the Fast branch truth table is byte-level equivalent to the old implementation. Here we only map CompareOutcome
+// back to the client's existing CompareAction: Missing/Diff->TransferNow, Same->Skip, needHash->FallbackHash.
 CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
     const CompareOutcome outcome = DecideCompare(CompareMode::Fast, localFile, remoteFile);
     if (outcome.needHash) {
@@ -158,7 +158,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                 }
                 ctx.localDirs.push_back(relPath);
                 subdirs.push_back(PendingDir{std::move(absPath), std::move(relPath)});
-            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck 纯重构：等价谓词
+            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck pure refactor: equivalent predicate
                 filesToDelete.push_back(std::move(absPath));
             }
         } while (FindNextFileW(hFind, &fd) != 0);
@@ -230,7 +230,7 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                 if (!isSymlink) {
                     subdirs.push_back(PendingDir{absPath, std::move(relPath)});
                 }
-            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck 纯重构：等价谓词
+            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck pure refactor: equivalent predicate
                 filesToDelete.push_back(absPath);
             }
         }
@@ -292,7 +292,7 @@ bool SyncFileToDisk(const fs::path& path) {
 #endif
 }
 
-// One client-side transport connection in the multipath pool (design §4.2). connId 0 is
+// One client-side transport connection in the multipath pool (design section 4.2). connId 0 is
 // the primary link. Non-copyable/non-movable (atomics + thread); held via unique_ptr.
 struct ClientConnection {
     uint32_t connId = 0;
@@ -317,7 +317,7 @@ struct EstablishedLink {
 };
 
 // Heuristic: a textual local endpoint is a source IP if it looks like a numeric address
-// (contains '.' for IPv4 or ':' for IPv6); otherwise it is an interface name (design §6.5).
+// (contains '.' for IPv4 or ':' for IPv6); otherwise it is an interface name (design section 6.5).
 ConnectBinding BindingFromLocal(const std::string& local) {
     ConnectBinding binding;
     if (local.empty()) {
@@ -332,7 +332,7 @@ ConnectBinding BindingFromLocal(const std::string& local) {
 }
 
 // Establish the auxiliary (non-primary) connections of the pool and JOIN them to the
-// session (design §6, FR-005/007/008/009). Best-effort: a failed lane is skipped, never
+// session (design section 6, FR-005/007/008/009). Best-effort: a failed lane is skipped, never
 // fatal (FR-016 / NFR-002). The primary lane (already connected) is excluded via
 // primaryServerKey. Explicit --link pins bypass automatic selection (FR-008 / AC-005).
 std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& options,
@@ -356,7 +356,7 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
     };
     std::vector<Plan> plans;
 
-    // NIC lookup table for debug logging: ip → LocalAddress (friendlyName, ifaceKey).
+    // NIC lookup table for debug logging: ip -> LocalAddress (friendlyName, ifaceKey).
     // Populated lazily only when debug output is enabled.
     std::unordered_map<std::string, LocalAddress> nicLookup;
     if (debugEnabled) {
@@ -376,7 +376,7 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
         // CLI endpoints have no NIC group (unknown); advertised endpoints carry the server's
         // physical-NIC group as "g<n>". When an advertised endpoint matches a CLI entry
         // (e.g. --server 30.29.53.25 == the primary), backfill the real group onto it so the
-        // primary lane's server endpoint resolves to its true NIC for dedup (L-r6-01 / §7.1).
+        // primary lane's server endpoint resolves to its true NIC for dedup (L-r6-01 / section 7.1).
         std::vector<ServerEndpoint> serverEndpoints;
         std::unordered_map<std::string, size_t> serverIndex;  // "host:port" -> index
         auto addServer = [&](const std::string& host, uint16_t port, const std::string& nicGroup) {
@@ -405,7 +405,7 @@ std::vector<EstablishedLink> EstablishAuxiliaryConnections(const CliOptions& opt
         // (degenerate == FC5 behavior, FR-020-adjacent).
         if (serverEndpoints.size() > 1 || localCands.size() > 1) {
             const ReachabilityMatrix matrix = ProbeReachability(localCands, serverEndpoints);
-            // Secondary RTT source (design §3.1 / D-01): the minimum reachable connect RTT in
+            // Secondary RTT source (design section 3.1 / D-01): the minimum reachable connect RTT in
             // the probe matrix is a single-round-trip estimate that refines the primary lane's
             // connect timing. Single-NIC single-server WAN never probes, so this stays unset
             // and the connect-measured RTT is the sole source.
@@ -595,7 +595,7 @@ int RunClient(const CliOptions& options) {
     };
     WsaContext wsa;
     const bool debugEnabled = IsDebugEnabled();
-    // --diag flag OR FASTCLONE_DIAG env var enables diagnostics (design §A.3).
+    // --diag flag OR FASTCLONE_DIAG env var enables diagnostics (design section A.3).
     const bool diagnostics = options.diagnostics || IsDiagEnabled();
     // unbuffered-writes M1/FR-12: single read-only intent threaded through every client write open
     // (whole-file/batch, single-file streaming, delta copy/range). Default false = zero regression.
@@ -646,14 +646,14 @@ int RunClient(const CliOptions& options) {
     // ConnectTo + handshake failures (server not ready) reuse the same reconnect budget
     // as mid-session drops; see ScheduleClientReconnectOrExit().
     while (true) {
-    // Multipath connection pool (design §4.2). pool[0] is the primary link.
+    // Multipath connection pool (design section 4.2). pool[0] is the primary link.
     std::vector<std::unique_ptr<ClientConnection>> pool;
     std::string sessionId;
     // Binary delta (FC7): enabled this session only when the client opted in
     // (--delta-min-size > 0) AND the server advertised the delta capability bit in AuthOk
-    // (binary-delta §8.1 / AC-17). Set right after the primary handshake below.
+    // (binary-delta section 8.1 / AC-17). Set right after the primary handshake below.
     bool deltaEnabled = false;
-    // Measured session RTT (design §3.1, FR-01). Primary source: the primary lane's TCP
+    // Measured session RTT (design section 3.1, FR-01). Primary source: the primary lane's TCP
     // connect timing (one round trip). Secondary: the probe matrix minimum (when multipath
     // probing runs). 0 == unknown -> treated as LAN so a missing RTT never enables WAN
     // behavior nor aborts the sync (AC-15 / B7).
@@ -745,7 +745,7 @@ int RunClient(const CliOptions& options) {
         std::cout << "[mp] pool_size=" << pool.size() << " sessionId=" << sessionId << std::endl;
     }
 
-    // --- WAN small-file second-pass tuning (design §3.1/§3.2/§3.3, FR-01/02/12/13) ---
+    // --- WAN small-file second-pass tuning (design section 3.1/section 3.2/section 3.3, FR-01/02/12/13) ---
     // Refine the connect-measured RTT with the probe matrix minimum when available; either
     // source missing degrades to LAN behavior (AC-15 / B7). RTT now drives the stream count,
     // hash in-flight depth and delta-signal depth -- not just route selection (FR-01).
@@ -763,12 +763,12 @@ int RunClient(const CliOptions& options) {
     const size_t maxInFlightDeltaSig = wanTune.maxInFlightDeltaSig;
     // Soft-reserve pool[0] as the control lane when WAN + >=2 healthy lanes: large/bulk data
     // is biased onto aux lanes so hash/BlockSig traffic is not head-of-line blocked behind a
-    // big file on the same TCP (design §3.5, FR-09/10/11). Single-lane WAN relies on the
+    // big file on the same TCP (design section 3.5, FR-09/10/11). Single-lane WAN relies on the
     // main-loop control-first ordering alone.
     const bool wanControlReserve = wanMode && (pool.size() >= 2);
     // Failure-rate backoff bookkeeping (FR-13 / NFR-04): sampled windows of completions vs
     // failures; on a weak SSD spike the effective stream count is halved (floor 4) so the
-    // session self-heals without the user manually降级 (NFR-06 / B8).
+    // session self-heals without the user manually downgrading (NFR-06 / B8).
     size_t lastBackoffFailed = 0;
     size_t lastBackoffCompleted = 0;
     auto lastBackoffCheck = std::chrono::steady_clock::now();
@@ -787,7 +787,7 @@ int RunClient(const CliOptions& options) {
                   << std::endl;
     }
 
-    // Manifest is requested only on the primary link (design §7.5): the server enumerates
+    // Manifest is requested only on the primary link (design section 7.5): the server enumerates
     // and streams the manifest on the first connection; auxiliary lanes carry file data only.
     // A peer reset between the handshake and this request (mid-session drop, e.g. server
     // killed) must not be fatal: no manifest was received, so honor the reconnect budget and
@@ -811,7 +811,7 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<std::string, FileEntry> remoteFiles;
     std::unordered_set<std::string> remoteDirs;
     // Transfer state is keyed by a composite (connId, streamId) so each lane has an
-    // independent streamId space and frames never collide across connections (design §7.5).
+    // independent streamId space and frames never collide across connections (design section 7.5).
     // Invariant: connId and streamId each occupy a disjoint 32-bit half of the 64-bit key.
     // connId is sourced from a uint32_t connection counter and streamId from a uint32_t
     // stream counter, so neither can overflow its half today. The static_assert pins the
@@ -832,7 +832,7 @@ int RunClient(const CliOptions& options) {
     std::unordered_set<std::string> scheduledTransfers;
     std::unordered_map<std::string, uint8_t> transferRetryCounts;
 
-    // --- Binary delta (FC7) per-session state (reset every session, binary-delta §6.4) ---
+    // --- Binary delta (FC7) per-session state (reset every session, binary-delta section 6.4) ---
     // Each in-progress delta file: verification hash from BlockSigResponse, temp reconstruct
     // file + writer, and the count of outstanding (possibly sliced) miss ranges.
     struct DeltaFileState {
@@ -869,13 +869,13 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<uint64_t, ActiveDeltaRange> activeDeltaRanges;  // (connId,streamId) -> range
     uint64_t deltaReconstructed = 0;  // diagnostics: files completed via delta this session
 
-    // --- BuildPlan offload (design §3.4, FR-07/FR-10) ---
+    // --- BuildPlan offload (design section 3.4, FR-07/FR-10) ---
     // The heavy delta reconstruct (old-file read + delta::BuildPlan + temp pre-write) used to
     // run synchronously on the main loop inside BlockSigResponse handling, periodically
     // freezing the control plane on massive small-file sets. It is offloaded to a worker pool
     // (same task-queue + result-deque pattern as the hash workers); the main loop only applies
     // results (state mutation + range enqueue) so the wire protocol, plan inputs/outputs and
-    // 落盘 XXH3-128 verification are unchanged (FR-08 / NFR-05).
+    // on-disk XXH3-128 verification are unchanged (FR-08 / NFR-05).
     struct DeltaPlanTask {
         std::string rel;
         Hash256 fileHash{};
@@ -914,7 +914,7 @@ int RunClient(const CliOptions& options) {
     std::unordered_set<std::string> hashResolved;
     std::unordered_set<std::string> hashRequested;
     std::deque<std::string> pendingHashRequests;
-    // Parallel enqueue timestamps for the control-plane latency P95 (AC-07 / §3.5): pushed
+    // Parallel enqueue timestamps for the control-plane latency P95 (AC-07 / section 3.5): pushed
     // alongside pendingHashRequests (single push site) and popped at send (single pop site),
     // so it stays index-aligned with pendingHashRequests.
     std::deque<std::chrono::steady_clock::time_point> pendingHashRequestsAt;
@@ -966,7 +966,7 @@ int RunClient(const CliOptions& options) {
     // unbuffered-writes FR-09/D-05: bytes submitted to the unified driver's WRITE queue but not yet
     // reaped as completions (single-file streaming + delta copy/range + batch whole-file). Added on
     // submit (+op length), subtracted on completion (-requested). Combined with incomingQueuedBytes
-    // and ioInFlightBytes it forms the single --queued-file-size backpressure budget (§3.6).
+    // and ioInFlightBytes it forms the single --queued-file-size backpressure budget (section 3.6).
     std::atomic<uint64_t> driverWriteOutstandingBytes{0};
     // Main-thread only: number of files dispatched to the I/O pool whose result has not
     // yet been handled. Used as a completion-gate term so the sync does not finish while
@@ -977,7 +977,7 @@ int RunClient(const CliOptions& options) {
     // locus for old-file reads (streaming delta plan), download/temp writes, and the finalize
     // verify read. Declared before the worker pools so it outlives every thread that submits to
     // it (all pools are joined before RunClient returns / rethrows). Read/write share one driver
-    // so fairness + backpressure apply across the whole client (design §3.2/§5.4).
+    // so fairness + backpressure apply across the whole client (design section 3.2/section 5.4).
     fc::io::IoDriverConfig clientIoCfg;
     fc::io::DiskIoDriver clientDriver(clientIoCfg);
     std::cout << "[disk-io] backend=" << clientDriver.backendName() << std::endl;
@@ -1054,13 +1054,13 @@ int RunClient(const CliOptions& options) {
     size_t hashRequestsSent = 0;
     size_t hashResponsesReceived = 0;
     // hash in-flight cap: RTT-adaptive on WAN (breaks the legacy 8192 ceiling, FR-02/AC-02),
-    // byte-for-byte the legacy clamp on LAN/同城 (HC-04). See ComputeHashInflightDepth.
+    // byte-for-byte the legacy clamp on LAN/metro (HC-04). See ComputeHashInflightDepth.
     const size_t maxInFlightHashRequests = wanTune.maxInFlightHashRequests;
     size_t hashInflightPeak = 0;        // observability (NFR-07 / AC-12 / AC-02)
     size_t deltaSigInFlight = 0;        // BlockSigRequests sent but not yet answered (WAN gate)
     size_t deltaSigInflightPeak = 0;    // observability (NFR-07 / AC-12)
     // --- AC-12 / NFR-07 acceptance observability (reviewer B-02 / B-03) ---
-    uint64_t manifestTotalBytes = 0;             // sum of remote file sizes (AC-12 总字节数)
+    uint64_t manifestTotalBytes = 0;             // sum of remote file sizes (AC-12 total bytes)
     std::array<uint64_t, 6> smallFileSizeHist{}; // <4K /4-16K /16-64K /64-256K /256K-1M />=1M
     uint64_t blockSigWaitTotalUs = 0;            // sum of per-file BlockSig wait (AC-04)
     size_t blockSigWaitCount = 0;                // files that completed a BlockSig round trip
@@ -1157,7 +1157,7 @@ int RunClient(const CliOptions& options) {
     };
 
     // Incoming frames carry their originating connId so the main loop can demux transfer
-    // streams per connection (design §7.5). All lanes share one queue + worker pool.
+    // streams per connection (design section 7.5). All lanes share one queue + worker pool.
     struct IncomingFrame {
         uint32_t connId = 0;
         Frame frame;
@@ -1211,7 +1211,7 @@ int RunClient(const CliOptions& options) {
         }
         std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
     };
-    // Per-connection receiver (design §7.5). One thread per lane, all feeding the SAME
+    // Per-connection receiver (design section 7.5). One thread per lane, all feeding the SAME
     // shared incoming queues + worker pool. Frames are tagged with the lane's connId so
     // the main loop can demux transfer streams. On failure the lane is marked unhealthy
     // (failover is decided by the main loop); recvClosed is only set when ALL lanes die.
@@ -1360,7 +1360,7 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Binary delta gate (binary-delta §6.2, FR-05~FR-08). Returns true only when the file
+    // Binary delta gate (binary-delta section 6.2, FR-05~FR-08). Returns true only when the file
     // is admitted into the delta flow (a BlockSigRequest is queued); the caller falls back to
     // scheduleTransfer() on false, with zero side effects (FR-06). Conditions, all required:
     //   G2 deltaEnabled (--delta-min-size>0 and server advertised the capability)
@@ -1420,7 +1420,7 @@ int RunClient(const CliOptions& options) {
                           << "/" << static_cast<uint32_t>(kMaxTransferRetries)
                           << std::endl;
             }
-            // Observable requeue (AC-018 / design §11): a file/batch entry put back into the
+            // Observable requeue (AC-018 / design section 11): a file/batch entry put back into the
             // pending pool for redistribution to a healthy lane (the dead lane's connId is
             // reported by the adjacent "[mp] conn_down ... requeued_files=" line).
             if (debugEnabled) {
@@ -1680,7 +1680,7 @@ int RunClient(const CliOptions& options) {
         });
     }
 
-    // C8: write a whole file through the unified driver (design §5.4). Sequential 1 MiB write ops
+    // C8: write a whole file through the unified driver (design section 5.4). Sequential 1 MiB write ops
     // with a bounded in-flight window overlap the writes; the driver's win backend pads the final
     // sub-sector tail and restores the exact size with SetEndOfFile, and OPEN_ALWAYS + a full
     // [0,size) overwrite + SetEndOfFile is byte-identical to the former ofstream trunc+write. Blocks
@@ -1742,7 +1742,7 @@ int RunClient(const CliOptions& options) {
         return ok;
     };
 
-    // unbuffered-writes C8 (§3.4/§3.5): reap + account WRITE completions for ONE driver file handle.
+    // unbuffered-writes C8 (section 3.4/section 3.5): reap + account WRITE completions for ONE driver file handle.
     // Advances `completed`, drops the outstanding-bytes budget by each op's requested length and
     // latches `writeError` on any short write / error. Non-blocking; the per-file completion gate
     // loops with waitForFile.
@@ -1832,7 +1832,7 @@ int RunClient(const CliOptions& options) {
                 results.clear();
                 for (IoWriteTask& t : batch) {
                     // C8: the file payload write is now issued through the unified disk IO driver
-                    // (design §5.4) instead of an inline ofstream, so all client file-content IO
+                    // (design section 5.4) instead of an inline ofstream, so all client file-content IO
                     // shares one locus with read/write fairness + backpressure. Bytes and final
                     // size are identical to the former trunc+write path.
                     const fs::path abs = JoinRel(options.rootDir, t.relPath);
@@ -1926,7 +1926,7 @@ int RunClient(const CliOptions& options) {
         while (!pendingHashRequests.empty() && (hashRequestsSent - hashResponsesReceived) < maxInFlightHashRequests) {
             const std::string rel = pendingHashRequests.front();
             pendingHashRequests.pop_front();
-            // Control-plane enqueue->send latency sample (AC-07 / §3.5).
+            // Control-plane enqueue->send latency sample (AC-07 / section 3.5).
             if (!pendingHashRequestsAt.empty()) {
                 const auto waited = std::chrono::steady_clock::now() - pendingHashRequestsAt.front();
                 pendingHashRequestsAt.pop_front();
@@ -1951,7 +1951,7 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Adaptive connection selection (design §8): shortest-queue / least-outstanding-requests.
+    // Adaptive connection selection (design section 8): shortest-queue / least-outstanding-requests.
     // Among healthy lanes below streamLimit, pick the one with the fewest in-flight streams
     // (SelectLeastLoadedLane). This is self-correcting on lane speed -- a slow lane holds its
     // streams longer so its inFlight stays high and it stops drawing new work, while a fast
@@ -1972,7 +1972,7 @@ int RunClient(const CliOptions& options) {
             // nudge the primary down by +1 so a little file work can flow to aux first; once
             // manifestDone the bias is gone and ordering returns to pure weighted load.
             uint32_t laneBias = (!manifestDone && cptr->isPrimary) ? 1u : 0u;
-            // WAN control-lane soft reservation (design §3.5, FR-09/10/11): bias the primary up
+            // WAN control-lane soft reservation (design section 3.5, FR-09/10/11): bias the primary up
             // by a full stream count so bulk data prefers aux lanes, leaving pool[0]'s send
             // window for hash/BlockSig control traffic. Bias only reorders -- it never relaxes
             // the streamLimit cap -- so the primary is still used once aux lanes saturate and no
@@ -2003,7 +2003,7 @@ int RunClient(const CliOptions& options) {
         auto hasBatchBacklog = [&]() -> bool {
             return !pendingBatchTransfers.empty() || !pendingRetryBatchTransfers.empty();
         };
-        // Global in-flight bound = streamLimit per healthy lane (design §8.3); with the
+        // Global in-flight bound = streamLimit per healthy lane (design section 8.3); with the
         // <=8 pool cap this is the R-05 safeguard against fan-out exploding server fds.
         const size_t healthy = std::max<size_t>(1, healthyConnCount());
         const size_t globalSlotCap = static_cast<size_t>(activeStreamLimit) * healthy;
@@ -2069,7 +2069,7 @@ int RunClient(const CliOptions& options) {
                         break;
                     }
                     ++conn->inFlight;
-                    // Observable link-task allocation (AC-018 / design §11): which lane a
+                    // Observable link-task allocation (AC-018 / design section 11): which lane a
                     // small-file batch was assigned to, with size and primary flag.
                     if (debugEnabled) {
                         std::cout << "[mp] alloc kind=batch connId=" << conn->connId
@@ -2139,7 +2139,7 @@ int RunClient(const CliOptions& options) {
                         break;
                     }
                     ++conn->inFlight;
-                    // Observable link-task allocation (AC-018 / design §11): which lane a
+                    // Observable link-task allocation (AC-018 / design section 11): which lane a
                     // file was assigned to, incl. large-file primary-pin routing (FR-012).
                     if (debugEnabled) {
                         std::cout << "[mp] alloc kind=file connId=" << conn->connId
@@ -2276,9 +2276,9 @@ int RunClient(const CliOptions& options) {
             if (!remoteHashReady || (!localHashReady && !localFailed)) {
                 continue;
             }
-            // fastcheck 纯重构：diff/same 收尾统一走 compare_phase::ClassifyByHash。此处 :2157 已
-            // gate 掉 (!localHashReady && !localFailed)，故 localHashReady 必为 true，可读性等价于
-            // !localFailed。语义与旧 (localFailed || !localHashReady || !HashEquals(...)) 一致。
+            // fastcheck pure refactor: diff/same finalization all goes through compare_phase::ClassifyByHash. Here :2157 has
+            // already gated out (!localHashReady && !localFailed), so localHashReady must be true; for readability this is
+            // equivalent to !localFailed. Semantics match the old (localFailed || !localHashReady || !HashEquals(...)).
             if (ClassifyByHash(!localFailed, localHash, remoteHash) == CompareCategory::Diff) {
                 // Same size, content differs: try block-level delta before full download.
                 if (!tryEnterDelta(rel)) {
@@ -2379,7 +2379,7 @@ int RunClient(const CliOptions& options) {
         compareDispatchBuffer.clear();
     };
 
-    // --- Binary delta (FC7) client orchestration (design §6.1/§6.7) ---
+    // --- Binary delta (FC7) client orchestration (design section 6.1/section 6.7) ---
     auto makeDeltaTempPath = [&](const fs::path& target) -> fs::path {
         static std::atomic<uint64_t> ctr{0};
         const uint64_t n = ctr.fetch_add(1, std::memory_order_relaxed);
@@ -2532,7 +2532,7 @@ int RunClient(const CliOptions& options) {
     };
 
     // Worker-side heavy reconstruct for one BlockSigResponse (runs OFF the main loop, design
-    // §3.4): read the local old file, build the plan, apply the benefit gate (FR-17), pre-write
+    // section 3.4): read the local old file, build the plan, apply the benefit gate (FR-17), pre-write
     // all copy ops to a temp file, and slice the miss ranges. Touches NO shared state -- it
     // only fills a DeltaPlanResult the main loop later applies. Pure plan inputs/outputs are
     // identical to the former synchronous path (FR-08 / NFR-05).
@@ -2543,7 +2543,7 @@ int RunClient(const CliOptions& options) {
         res.newFileBytes = task.sig.fileSize;
         const fs::path abs = JoinRel(options.rootDir, task.rel);
 
-        // Old-file size is metadata (not driver IO, design §6) and bounds the streaming window so
+        // Old-file size is metadata (not driver IO, design section 6) and bounds the streaming window so
         // it never allocates a whole-file buffer (AC-04).
         std::error_code sizeEc;
         const uint64_t oldLen = static_cast<uint64_t>(fs::file_size(abs, sizeEc));
@@ -2565,7 +2565,7 @@ int RunClient(const CliOptions& options) {
         }
 
         // unbuffered-writes FR-06/M2: open the reconstruction temp on the unified driver so copy
-        // captures ("命中即捕获", design D-01 A) write straight into it during the SAME scan pass.
+        // captures ("capture on match", design D-01 A) write straight into it during the SAME scan pass.
         // No manual preallocation: out-of-order copy/range writes land at their exact offsets and
         // closeFile truncates to expectedSize=fileSize (trimming any temp tail beyond the new file,
         // FR-14). copySubmitted/copyCompleted feed the plan worker's own copy-write gate below.
@@ -2631,7 +2631,7 @@ int RunClient(const CliOptions& options) {
         res.newFileBytes = plan.newFileBytes;
         clientDriver.closeFile(oldFileId);
 
-        // Reap every copy write before handing the temp to the main loop (§3.5): the copy phase is
+        // Reap every copy write before handing the temp to the main loop (section 3.5): the copy phase is
         // fully drained here so finalize only has to gate the range writes. A copy write error is a
         // reconstruct_io fallback (FR-16), same as the former ofstream write-failure path.
         if (tempFileId != 0) {
@@ -2690,7 +2690,7 @@ int RunClient(const CliOptions& options) {
         return res;
     };
 
-    // Main-thread application of one finished plan (design §3.4): mutate deltaStates, hand the
+    // Main-thread application of one finished plan (design section 3.4): mutate deltaStates, hand the
     // pre-written temp + ranges to the transfer machinery, or fall back. Mirrors the former
     // synchronous tail of beginDeltaReconstruct exactly.
     auto applyDeltaPlanResult = [&](DeltaPlanResult& res) {
@@ -2754,12 +2754,12 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Send queued BlockSigRequests on the control lane (binary-delta §6.1). On send failure
+    // Send queued BlockSigRequests on the control lane (binary-delta section 6.1). On send failure
     // the lane is marked down and the requests are requeued for a healthy control lane.
-    // WAN (design §3.4, FR-05/06): cap the in-flight BlockSig pipeline at maxInFlightDeltaSig
+    // WAN (design section 3.4, FR-05/06): cap the in-flight BlockSig pipeline at maxInFlightDeltaSig
     // so a single file's RTT is amortized across a deep batch of concurrent files rather than
     // being a per-file fixed wait. maxInFlightDeltaSig == 0 (LAN) keeps the legacy "send the
-    // whole queue every pass" behavior, so 同城/LAN is unchanged (HC-04). Requests that do not
+    // whole queue every pass" behavior, so metro/LAN is unchanged (HC-04). Requests that do not
     // fit this pass stay queued (no correctness loss, FR-08).
     auto pumpDeltaSignatures = [&]() {
         if (pendingDeltaSigRequests.empty()) {
@@ -3123,7 +3123,7 @@ int RunClient(const CliOptions& options) {
                     deltaSigSentAt.erase(itSent);
                 }
             }
-            // Offload the heavy reconstruct to the worker pool (design §3.4). Set sigReceived
+            // Offload the heavy reconstruct to the worker pool (design section 3.4). Set sigReceived
             // on the main thread so a duplicate response (failover re-request) is ignored and
             // the failover re-request scan never re-queues a file already being planned.
             auto itSt = deltaStates.find(info.relPath);
@@ -3364,7 +3364,7 @@ int RunClient(const CliOptions& options) {
     const size_t kDelayedLowWater = 256 * 1024;
     bool ingestPaused = false;
 
-    // Per-connection failover (design §10). A lane whose recvThread failed is drained:
+    // Per-connection failover (design section 10). A lane whose recvThread failed is drained:
     // its in-flight files are requeued to healthy lanes (FR-015), reusing the existing
     // retry budget (FR-019). Only when EVERY lane is down do we set recvClosed to trigger
     // the session-level reconnect path (FR-016 / AC-012).
@@ -3492,7 +3492,7 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // BuildPlan offload pool (design §3.4). Spawned here, after every reconstruct helper is in
+    // BuildPlan offload pool (design section 3.4). Spawned here, after every reconstruct helper is in
     // scope; same task-queue + result-deque pattern as the hash workers above.
     std::vector<std::thread> deltaPlanWorkers;
     deltaPlanWorkers.reserve(workerCount);
@@ -3532,7 +3532,7 @@ int RunClient(const CliOptions& options) {
             tryStartTransfers();
             pumpDeltaSignatures();
             {
-                // Apply finished BuildPlan offload results (design §3.4): enqueue their miss
+                // Apply finished BuildPlan offload results (design section 3.4): enqueue their miss
                 // ranges before tryStartDeltaRanges so data starts the same iteration.
                 std::deque<DeltaPlanResult> plansReady;
                 {
@@ -3626,9 +3626,9 @@ int RunClient(const CliOptions& options) {
                 }
             }
 
-            // WAN parallelism failure-rate backoff (design §3.3, FR-13 / NFR-04 / B8): on a
+            // WAN parallelism failure-rate backoff (design section 3.3, FR-13 / NFR-04 / B8): on a
             // weak SSD/controller failure spike, halve the effective stream count (floor 4) so
-            // the session self-heals without the user manually降级 (NFR-06). No-op on LAN and
+            // the session self-heals without the user manually downgrading (NFR-06). No-op on LAN and
             // unless the WAN auto-tune actually raised the count above 4.
             if (wanMode && options.streamAutoTune && activeStreamLimit > 4) {
                 const auto nowBk = std::chrono::steady_clock::now();
@@ -3729,7 +3729,7 @@ int RunClient(const CliOptions& options) {
                               << std::chrono::duration<double>(now - lastCtrlEventAt).count()
                               << " max_ctrl_gap_sec=" << maxCtrlGapSec
                               << std::endl;
-                    // Per-lane kernel TCP state (design wan-single-tcp §3.2): cwnd sawtooth +
+                    // Per-lane kernel TCP state (design wan-single-tcp section 3.2): cwnd sawtooth +
                     // rising retrans is the smoking gun for loss-driven AIMD on a single TCP.
                     // retrans unit differs by platform (Linux: segments, Windows: bytes), so it
                     // is labelled explicitly to avoid cross-platform misreads (reviewer S-02).

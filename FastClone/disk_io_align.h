@@ -1,9 +1,9 @@
 #pragma once
 
 // Runtime alignment + aligned allocation for the unified disk IO driver
-// (unified-disk-io-driver design §7.5, FR-08/FR-09/FR-11).
+// (unified-disk-io-driver design section 7.5, FR-08/FR-09/FR-11).
 //
-// HARD cross-platform constraint (design §7, task red line): every page size, device logical
+// HARD cross-platform constraint (design section 7, task red line): every page size, device logical
 // block size and direct-IO granularity below is obtained AT RUNTIME. There is deliberately no
 // literal 4096 or 512 used as a page size, sector size, device block size, offset-alignment or
 // length-padding constant anywhere in this module (AC-14/AC-15). The only compile-time constant
@@ -38,7 +38,7 @@ AlignInfo MakeAlignInfo(uint32_t pageSize, uint32_t deviceBlockSize);
 
 // Query alignment for the volume that hosts `path`. The path is used only to select the correct
 // volume/device; the query itself reads metadata, not file content, so it does not go through the
-// driver (design §6). When the device block query is unavailable the granularity falls back to the
+// driver (design section 6). When the device block query is unavailable the granularity falls back to the
 // runtime page size (still never a literal 512/4096).
 AlignInfo QueryAlign(const std::string& path);
 

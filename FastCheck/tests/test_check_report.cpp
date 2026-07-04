@@ -25,7 +25,7 @@ bool Contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-// 造 2 same + 1 diff + 1 missing + 1 extra 场景（AC-29 计数形状 + 逐文件条目）。
+// Build a 2 same + 1 diff + 1 missing + 1 extra scenario (AC-29 count shape + per-file entries).
 CheckResult MakeSampleResult() {
     CheckResult r;
     r.mode = Mode::Fast;
@@ -47,13 +47,13 @@ CheckResult MakeSampleResult() {
     DiffEntry missing;
     missing.type = fc::CompareCategory::Missing;
     missing.path = "a/missing.txt";
-    missing.remoteSize = 30;  // local 缺失 -> localSize 为空
+    missing.remoteSize = 30;  // local missing -> localSize empty
     r.entries.push_back(missing);
 
     DiffEntry extra;
     extra.type = fc::CompareCategory::Extra;
     extra.path = "a/extra.txt";
-    extra.localSize = 40;  // remote 缺失 -> remoteSize 为空
+    extra.localSize = 40;  // remote missing -> remoteSize empty
     r.entries.push_back(extra);
 
     DiffEntry same;
@@ -68,7 +68,7 @@ CheckResult MakeSampleResult() {
 
 void TestTextFullReport() {
     const CheckResult r = MakeSampleResult();
-    FilterSet f;  // 默认 diff/missing/extra
+    FilterSet f;  // default diff/missing/extra
     std::ostringstream os;
     RenderText(os, r, f, /*summaryOnly=*/false);
     const std::string text = os.str();
@@ -94,20 +94,20 @@ void TestTextSummaryOnly() {
 
 void TestFilterDiffOnly() {
     const CheckResult r = MakeSampleResult();
-    FilterSet f{true, false, false, false};  // 仅 DIFF
+    FilterSet f{true, false, false, false};  // DIFF only
     std::ostringstream os;
     RenderText(os, r, f, /*summaryOnly=*/false);
     const std::string text = os.str();
     Expect(Contains(text, "[DIFF]"), "filter DIFF lists DIFF");
     Expect(!Contains(text, "[MISSING]"), "filter DIFF hides MISSING (AC-12)");
     Expect(!Contains(text, "[EXTRA]"), "filter DIFF hides EXTRA (AC-12)");
-    // 摘要仍显示三类计数（FR-21）。
+    // The summary still shows all three category counts (FR-21).
     Expect(Contains(text, "diff=1 missing=1 extra_local=1"), "summary still shows all counts (AC-12)");
 }
 
 void TestFilterSame() {
     const CheckResult r = MakeSampleResult();
-    FilterSet f{false, false, false, true};  // 仅 SAME
+    FilterSet f{false, false, false, true};  // SAME only
     std::ostringstream os;
     RenderText(os, r, f, /*summaryOnly=*/false);
     Expect(Contains(os.str(), "[SAME]"), "filter SAME lists SAME entry (AC-13)");
@@ -125,7 +125,7 @@ void TestJsonReport() {
     Expect(Contains(json, "\"total_compared\": 4"), "json total_compared = same+diff+missing = 4");
     Expect(Contains(json, "\"partial\": false"), "json partial=false for complete run");
     Expect(Contains(json, "\"type\": \"DIFF\""), "json diff entry type DIFF");
-    // 缺失一侧 size 为 null（FR-24/AC-31）。
+    // The missing side's size is null (FR-24/AC-31).
     Expect(Contains(json, "\"local_size\": null"), "missing entry local_size null");
     Expect(Contains(json, "\"remote_size\": null"), "extra entry remote_size null");
 }
@@ -145,7 +145,7 @@ void TestPartialText() {
     Expect(Contains(osj.str(), "\"partial\": true"), "partial json summary.partial=true (AC-21)");
 }
 
-// G2：--output 写盘路径。终端仅得摘要行；文件得完整报告（按 format）；写盘失败返回非 0。
+// G2: --output write-to-disk path. The terminal gets only the summary line; the file gets the full report (per format); write failure returns non-zero.
 fs::path MakeTempReportDir() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     fs::path dir = fs::temp_directory_path() / ("fastclone_rep_" + std::to_string(stamp));
@@ -160,9 +160,9 @@ void TestWriteReportTextToFile() {
     CheckOptions o;
     o.output = outFile.string();
     o.format = Format::Text;
-    o.filter = FilterSet{};  // 默认 diff/missing/extra
+    o.filter = FilterSet{};  // default diff/missing/extra
 
-    // 捕获终端（cout）：--output 时终端仅摘要行，无逐文件 [DIFF] 行。
+    // Captured terminal (cout): with --output, the terminal shows only the summary line and no per-file [DIFF] lines.
     std::ostringstream captured;
     std::streambuf* oldCout = std::cout.rdbuf(captured.rdbuf());
     const int rc = WriteReport(o, r);
@@ -172,7 +172,7 @@ void TestWriteReportTextToFile() {
     Expect(Contains(captured.str(), "Check completed"), "terminal still gets summary line (G2)");
     Expect(!Contains(captured.str(), "[DIFF]"), "terminal has no per-file lines when --output set (G2)");
 
-    // 文件得完整 text 报告（含逐文件行）。
+    // The file gets the full text report (including per-file lines).
     std::ifstream in(outFile, std::ios::binary);
     Expect(in.good(), "report file created (G2)");
     std::ostringstream fileContent;
@@ -201,7 +201,7 @@ void TestWriteReportJsonToFile() {
     std::cout.rdbuf(oldCout);
 
     Expect(rc == 0, "WriteReport(json, --output) returns 0 (G2)");
-    // 终端摘要是 text 形式（设计：--output 时终端恒为 text 摘要）。
+    // The terminal summary is in text form (by design: with --output the terminal is always a text summary).
     Expect(Contains(captured.str(), "Check completed"), "terminal gets text summary even for json --output (G2)");
 
     std::ifstream in(outFile, std::ios::binary);
@@ -218,7 +218,7 @@ void TestWriteReportJsonToFile() {
 }
 
 void TestWriteReportNoOutputGoesToCout() {
-    // 无 --output：完整报告走 cout（按 format）。此处验 text 全量到 cout。
+    // No --output: the full report goes to cout (per format). Here we verify the full text goes to cout.
     const fs::path dir = MakeTempReportDir();
     const CheckResult r = MakeSampleResult();
     CheckOptions o;

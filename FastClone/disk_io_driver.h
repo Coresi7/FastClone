@@ -1,9 +1,9 @@
 #pragma once
 
-// Unified async disk IO driver (unified-disk-io-driver design §3). A single scheduler thread pulls
-// from bounded read/write queues with weighted-credit fairness + small-op priority (§3.2), submits
+// Unified async disk IO driver (unified-disk-io-driver design section 3). A single scheduler thread pulls
+// from bounded read/write queues with weighted-credit fairness + small-op priority (section 3.2), submits
 // to the platform backend keeping multiple ops in flight (FR-12/13), and reaps completions into
-// per-file completion queues for batch hand-off (§3.7). Backpressure (FR-27), cancellation (FR-28),
+// per-file completion queues for batch hand-off (section 3.7). Backpressure (FR-27), cancellation (FR-28),
 // error isolation (FR-29) and observability counters (FR-30) live here; the backend only executes.
 //
 // This header pulls in only disk_io_backend.h (no <windows.h>/<liburing.h>), so callers such as
@@ -72,7 +72,7 @@ public:
     void waitForFile(uint64_t fileId, int timeoutMs);
 
     // Cancel: flush not-yet-submitted ops as Cancelled completions and stop accepting new ones;
-    // already-submitted ops are still reaped (design §3.6 / AC-23). Idempotent.
+    // already-submitted ops are still reaped (design section 3.6 / AC-23). Idempotent.
     void requestCancel();
 
     IoCounters counters() const;
@@ -116,7 +116,7 @@ private:
     std::thread scheduler_;
 };
 
-// Sequential read helper (design §3.1). Issues a bounded read-ahead window of ops over one file and
+// Sequential read helper (design section 3.1). Issues a bounded read-ahead window of ops over one file and
 // yields completed chunks in strict offset order, hiding reordering behind a simple pull interface.
 // Suitable as the ByteSource for BuildPlanStreaming and for the server hash/sig streaming reads.
 class SequentialReader {

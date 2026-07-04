@@ -188,7 +188,7 @@ std::vector<LocalAddress> EnumerateLocalCandidates() {
                 continue;
             }
             // OnLinkPrefixLength is the on-link subnet prefix of this address; feed it into
-            // SelectAutoLinks' same-subnet scoring (§4.3). LH fields exist on Vista+.
+            // SelectAutoLinks' same-subnet scoring (section 4.3). LH fields exist on Vista+.
             const IP_ADAPTER_UNICAST_ADDRESS_LH* lh =
                 reinterpret_cast<const IP_ADAPTER_UNICAST_ADDRESS_LH*>(unicast);
             const int prefixLen = static_cast<int>(lh->OnLinkPrefixLength);
@@ -225,7 +225,7 @@ std::vector<LocalAddress> EnumerateLocalCandidates() {
             const unsigned int idx = if_nametoindex(ifa->ifa_name);
             ifaceKey = (idx != 0) ? std::to_string(idx) : std::string(ifa->ifa_name);
         }
-        // Best-effort on-link prefix length from the netmask (§4.3); 0 when unavailable.
+        // Best-effort on-link prefix length from the netmask (section 4.3); 0 when unavailable.
         int prefixLen = 0;
         if (ifa->ifa_netmask != nullptr) {
             if (family == AF_INET) {
@@ -637,7 +637,7 @@ ReachabilityMatrix ProbeReachability(const std::vector<std::string>& localAddrsI
                                      int timeoutMs) {
     // Legacy flat view: each row's interface key is the address literal itself, so dedup
     // stays IP-granular (no physical-NIC identity available from a bare IP list). Prefix
-    // lengths are unknown (0), so same-subnet scoring uses the family default (§4.5).
+    // lengths are unknown (0), so same-subnet scoring uses the family default (section 4.5).
     return ProbeReachabilityCore(localAddrsIn, localAddrsIn, std::vector<int>(),
                                  serverEndpoints, timeoutMs);
 }
@@ -844,13 +844,13 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     };
     // Server physical-NIC identity for column j: the advertised group when known, else the
     // endpoint key itself (each unknown endpoint is its own unique "NIC" => per-endpoint
-    // dedup, never weaker than the legacy host:port dedup, §4.5).
+    // dedup, never weaker than the legacy host:port dedup, section 4.5).
     auto groupOf = [&](size_t j) -> std::string {
         const ServerEndpoint& ep = matrix.serverEndpoints[j];
         return !ep.nicGroup.empty() ? ep.nicGroup : serverKey(ep);
     };
     // Per-row client physical-NIC key; fall back to the address literal for the legacy flat
-    // matrix that carries no NIC identity (degrades to IP-granular dedup, §4.5).
+    // matrix that carries no NIC identity (degrades to IP-granular dedup, section 4.5).
     auto ifaceKeyOf = [&](size_t i) -> std::string {
         if (i < matrix.localIfaces.size() && !matrix.localIfaces[i].empty()) {
             return matrix.localIfaces[i];
@@ -861,7 +861,7 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
         return i < matrix.localPrefixLens.size() ? matrix.localPrefixLens[i] : 0;
     };
 
-    // Seed dedup with the primary lane on BOTH sides (§4.4). Client NIC = primaryInterface.
+    // Seed dedup with the primary lane on BOTH sides (section 4.4). Client NIC = primaryInterface.
     // Server NIC = the group of the column whose endpoint matches primaryServerKey; when no
     // column matches (or it has no group) fall back to primaryServerKey as a synthetic group
     // so the primary's server endpoint is still blocked.
@@ -884,7 +884,7 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
         hasPrimary = true;
     }
 
-    // Total lanes including the primary must not exceed maxConnections (§4.2); the primary,
+    // Total lanes including the primary must not exceed maxConnections (section 4.2); the primary,
     // when present, already consumes one slot.
     const size_t reserved = hasPrimary ? 1u : 0u;
     if (maxConnections <= reserved) {
@@ -894,7 +894,7 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
 
     // Score tuple (familyRank, subnetRank, rttMs), compared lexicographically; lower is
     // better. familyRank (IPv4 first) leads so the IPv6 full-mesh "false reachability" is
-    // demoted as a whole before same-subnet/RTT refine within a family (§4.3).
+    // demoted as a whole before same-subnet/RTT refine within a family (section 4.3).
     struct Edge {
         int family = 0;
         int subnet = 1;
@@ -916,7 +916,7 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     };
 
     // Keep the single best edge per (clientNIC, serverNIC) pair (e.g. an IPv4 row beats the
-    // IPv6 row to the same server NIC ��� the L-r6-02 landing spot).
+    // IPv6 row to the same server NIC -- the L-r6-02 landing spot).
     std::map<std::pair<std::string, std::string>, Edge> bestEdge;
     for (size_t i = 0; i < matrix.localAddrs.size(); ++i) {
         const std::string cN = ifaceKeyOf(i);
@@ -954,10 +954,10 @@ std::vector<LinkPlan> SelectAutoLinks(const ReachabilityMatrix& matrix, size_t m
     // refinement (greedy + cardinality-protection guard). Unlike the old plain greedy, a
     // best-scored edge that would shrink the achievable channel count is skipped, so the
     // result is a maximum-cardinality matching whose edge-cost vector is lexicographically
-    // minimal (design §3.2/§3.3).
+    // minimal (design section 3.2/section 3.3).
 
     // Collect the per-pair best edges and order them best-first by `better`. The ordering is
-    // a strict total order independent of row/column enumeration (design §3.5/D-03).
+    // a strict total order independent of row/column enumeration (design section 3.5/D-03).
     std::vector<Edge> edges;
     edges.reserve(bestEdge.size());
     for (auto& kv : bestEdge) {
