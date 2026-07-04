@@ -224,6 +224,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - C++20 编译器
 - CMake 3.16+
 - xxhash 开发包（不同发行版包名不同）
+- 可选（仅 Linux）：liburing 开发包 —— 用于启用 io_uring 磁盘 IO 后端。不装也能正常构建，此时 Linux 磁盘 IO 会透明回退到有界的 pread/pwrite 线程池（结果一致，只是不走 io_uring）。macOS 与 Windows 不使用它。
 
 macOS 安装依赖：
 
@@ -273,6 +274,37 @@ sudo zypper install -y xxhash-devel
 pkg-config --modversion libxxhash
 pkg-config --cflags --libs libxxhash
 ```
+
+可选的 io_uring 后端（仅 Linux）：在 configure 之前安装 liburing 即可启用 io_uring 磁盘 IO 后端。这一步完全可选 —— 如果没有，CMake 会打印 `liburing not found; Linux disk IO uses the pread/pwrite pool`，构建照常进行并使用线程池回退。
+
+- Debian / Ubuntu
+
+```bash
+sudo apt install -y liburing-dev
+```
+
+- Fedora / RHEL / Rocky / Alma / CentOS Stream / TencentOS
+
+```bash
+sudo dnf install -y liburing-devel
+```
+
+- Arch / Manjaro
+
+```bash
+sudo pacman -S --needed liburing
+```
+
+- openSUSE
+
+```bash
+sudo zypper install -y liburing-devel
+```
+
+configure 阶段 CMake 会打印当前启用的后端：
+
+- `FastClone: io_uring backend enabled (liburing found)` —— 已编入 io_uring 后端。
+- `FastClone: liburing not found; Linux disk IO uses the pread/pwrite pool` —— 使用线程池回退。
 
 构建：
 

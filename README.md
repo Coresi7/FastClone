@@ -224,6 +224,7 @@ Dependencies:
 - C++20 compiler
 - CMake 3.16+
 - xxhash development package
+- Optional (Linux only): liburing development package — enables the io_uring disk-IO backend. Without it the build still succeeds and Linux disk IO transparently uses a bounded pread/pwrite thread pool (same results, just without io_uring). macOS and Windows never use it.
 
 Install dependencies on macOS:
 
@@ -273,6 +274,40 @@ Optional sanity checks:
 pkg-config --modversion libxxhash
 pkg-config --cflags --libs libxxhash
 ```
+
+Optional io_uring backend (Linux only): install liburing before configuring to enable the io_uring
+disk-IO backend. This is purely optional — if it is absent, CMake prints
+`liburing not found; Linux disk IO uses the pread/pwrite pool` and the build proceeds with the
+thread-pool fallback.
+
+- Debian / Ubuntu
+
+```bash
+sudo apt install -y liburing-dev
+```
+
+- Fedora / RHEL / Rocky / Alma / CentOS Stream / TencentOS
+
+```bash
+sudo dnf install -y liburing-devel
+```
+
+- Arch / Manjaro
+
+```bash
+sudo pacman -S --needed liburing
+```
+
+- openSUSE
+
+```bash
+sudo zypper install -y liburing-devel
+```
+
+At configure time CMake reports which backend is active:
+
+- `FastClone: io_uring backend enabled (liburing found)` — the io_uring backend is compiled in.
+- `FastClone: liburing not found; Linux disk IO uses the pread/pwrite pool` — the thread-pool fallback is used.
 
 Build:
 
