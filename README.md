@@ -44,6 +44,8 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 - `--wait-connect-timeout`: first-connect wait window for `--once` / `--once-multi` (default `300s`, suffixes `s`/`m`/`h`, must be `> 0`); if no valid client connection is established before it elapses, the server exits with code `6`. Once the first valid connection arrives the timer is permanently disabled. Valid only together with `--once` or `--once-multi`
 - `--password`: pre-shared password (required)
 
+At startup the server prints its configuration banner followed by the list of advertised endpoints (`[mp]   <ip>:<port>` per line, one per local NIC address) so the operator can copy one to pass to the client. If the requested port is already in use by another process, the server prints a clear `cannot listen on port ...` error and exits with code `7` instead of silently appearing to listen.
+
 
 
 ### Client
@@ -151,6 +153,7 @@ For large files that already exist locally and changed only partially, FastClone
 - The client matches the server's new file against its local old copy with an rsync-style rolling checksum + XXH3-128 block hashes (independent implementation — no rsync code, MIT-clean), downloads only the missing ranges (across the multipath links), and reconstructs locally. The result is XXH3-128 verified against the server; a hash mismatch or a low-benefit match (would download most of the file anyway) falls back to a full transfer automatically.
 - **Protocol FC7**: delta requires protocol version FC7. FC7 and the older FC6 do **not** interoperate, so client and server must be upgraded together.
 - Disabled by default: it trades local disk reads + CPU for fewer network bytes — a net win on bandwidth-constrained / WAN links, but often not worth it on high-bandwidth LANs.
+- Large-file delta is fully **streamed** (no whole-file buffering) and uses **unbuffered direct I/O** (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux, `F_NOCACHE` on macOS) for both server-side signature generation and the client-side old-file scan. Delta therefore works on multi-GB files without inflating memory, and bulk reads/writes bypass the OS file cache (robocopy-style) for predictable throughput. Small files and sub-sector tails fall back to buffered I/O. Server-side file-read concurrency is capped to protect disk IOPS, and the unified async disk-IO driver overlaps IO with hashing.
 
 
 
@@ -210,6 +213,7 @@ If the connection drops before the manifest is fully received, the client automa
 - `1`: argument/usage error (e.g. `--once` with `--enable-hash-memcache`, `--once` together with `--once-multi`, `--once-idle-grace` without `--once-multi`, `--wait-connect-timeout` without `--once`/`--once-multi`, or any of these on the client)
 - `5`: a served session failed or was aborted (any lane error; `--once-multi` aggregates: `5` if any session failed) — distinct from the client's `2` so every exit code has one unambiguous meaning
 - `6`: no valid client connection was established before `--wait-connect-timeout` elapsed (server first-connect wait timeout); see [First-Connect Wait Timeout](#first-connect-wait-timeout---wait-connect-timeout)
+- `7`: the server could not bind/listen on the requested port (e.g., port already in use by another process)
 
 
 

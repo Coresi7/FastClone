@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,13 @@ Hash256 ComputeFileHash(const std::filesystem::path& path);
 // Lets callers that already hold the file bytes (e.g. the delta block-signature path) avoid a
 // second full-file read while producing a value the client's ComputeFileHash verify matches.
 Hash256 ComputeBufferHash(const uint8_t* data, size_t len);
+// Streaming XXH3-128 over a sequential byte source (fills dst up to maxLen, returns the count
+// written; 0 means EOF). Produces the exact same Hash256 as ComputeFileHash over the same byte
+// sequence -- XXH3 streaming is chunking-independent -- so the unified disk IO driver can supply
+// the file content instead of an inline file read (unified-disk-io-driver C9/C10). Read errors are
+// surfaced by the caller's source (it returns short/0 and sets its own flag); this function never
+// throws on a short source, only on XXH3 state failures.
+Hash256 ComputeHashFromSource(const std::function<size_t(uint8_t*, size_t)>& source);
 bool HashEquals(const Hash256& a, const Hash256& b);
 std::string NormalizeRelativePath(const std::filesystem::path& relativePath);
 int64_t ToUnixNs(const std::filesystem::file_time_type& value);

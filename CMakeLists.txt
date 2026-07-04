@@ -7,6 +7,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Unified disk IO driver sources (unified-disk-io-driver). The platform backend .cpp files are
+# each guarded by their platform macro so exactly one compiles to real code per OS; the others
+# compile to an empty translation unit (design D-04, strong isolation).
+set(FASTCLONE_DISK_IO_SOURCES
+    FastClone/disk_io_align.cpp
+    FastClone/disk_io_driver.cpp
+    FastClone/disk_io_backend_win.cpp
+    FastClone/disk_io_backend_posix.cpp
+    FastClone/disk_io_backend_uring.cpp
+)
+
 add_executable(FastClone
     FastClone/cli.cpp
     FastClone/client_handshake.cpp
@@ -23,6 +34,7 @@ add_executable(FastClone
     FastClone/sync_util.cpp
     FastClone/transfer_tuning.cpp
     FastClone/win_socket.cpp
+    ${FASTCLONE_DISK_IO_SOURCES}
 )
 
 target_include_directories(FastClone PRIVATE FastClone)
@@ -71,9 +83,13 @@ add_executable(FastCloneTests
     FastClone/sync_util.cpp
     FastClone/transfer_tuning.cpp
     FastClone/win_socket.cpp
+    ${FASTCLONE_DISK_IO_SOURCES}
     tests/test_main.cpp
     tests/test_cli.cpp
     tests/test_delta.cpp
+    tests/test_streaming_buildplan.cpp
+    tests/test_disk_io_align.cpp
+    tests/test_disk_io_driver.cpp
     tests/test_read_gate.cpp
     tests/test_file_index.cpp
     tests/test_hash_memcache.cpp
@@ -106,6 +122,23 @@ if(WIN32)
     target_link_libraries(FastCloneTests PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
 add_test(NAME FastCloneTests COMMAND FastCloneTests)
+
+# Optional io_uring (Linux only). When liburing is present the io_uring backend compiles and links
+# against it; when absent, disk_io_backend_uring.cpp's __has_include guard leaves only the bounded
+# pread/pwrite pool fallback (design §7.3). macOS/Windows never look for liburing.
+if(UNIX AND NOT APPLE)
+    find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+    find_library(LIBURING_LIBRARY NAMES uring)
+    if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+        foreach(tgt FastClone FastCloneTests)
+            target_include_directories(${tgt} PRIVATE ${LIBURING_INCLUDE_DIR})
+            target_link_libraries(${tgt} PRIVATE ${LIBURING_LIBRARY})
+        endforeach()
+        message(STATUS "FastClone: io_uring backend enabled (liburing found)")
+    else()
+        message(STATUS "FastClone: liburing not found; Linux disk IO uses the pread/pwrite pool")
+    endif()
+endif()
 
 install(TARGETS FastClone
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

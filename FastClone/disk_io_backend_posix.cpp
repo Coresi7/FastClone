@@ -1,0 +1,353 @@
+// Bounded pread/pwrite thread-pool backend (unified-disk-io-driver design §3.4.3 / §7.3 / §7.4).
+//
+// This translation unit compiles ONLY on macOS and Linux and is empty everywhere else.
+//
+// macOS (design §7.4, FR-06, AC-13/N9): unbuffered intent is expressed with fcntl(F_NOCACHE, 1).
+//   This file MUST NOT reference O_DIRECT and MUST NOT reference POSIX aio (aio_read/aio_write) on
+//   the macOS path — both are compile-time absent there so the AC-13 source scan stays clean.
+// Linux (design §7.3, FR-04/05/10, AC-11/12): the fd is opened O_DIRECT for the unbuffered path;
+//   if O_DIRECT open fails or a direct IO returns EINVAL the op silently falls back to a buffered
+//   fd (opened from the path, no O_DIRECT) with posix_fadvise(POSIX_FADV_SEQUENTIAL) — no error
+//   surfaces and the resulting bytes are unchanged (AC-12).
+//
+// Multiple ops are in flight via N worker threads executing synchronous pread/pwrite (FR-12); the
+// driver above enforces fairness / backpressure / cancellation.
+
+#if defined(__APPLE__) || defined(__linux__)
+
+#include "disk_io_backend_pool.h"
+
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace fc::io {
+namespace {
+
+struct PoolFile {
+    std::string path;
+    int fd = -1;
+    OpKind mode = OpKind::Read;
+    bool unbuffered = false;
+    uint64_t expectedSize = 0;
+    AlignInfo align;
+};
+
+class PosixPoolBackend : public PlatformIoBackend {
+public:
+    explicit PosixPoolBackend(const IoDriverConfig& cfg, bool ioUringFallback = false) : cfg_(cfg) {
+        if (ioUringFallback) {
+            counters_.ioUringFallback.store(1);  // pool used because io_uring unavailable (AC-11)
+        }
+        const uint32_t n = cfg.backendConcurrency == 0 ? 1u : cfg.backendConcurrency;
+        for (uint32_t i = 0; i < n; ++i) {
+            workers_.emplace_back([this] { WorkerLoop(); });
+        }
+    }
+    ~PosixPoolBackend() override { shutdown(); }
+
+    BackendKind kind() const override { return BackendKind::PosixThreadPool; }
+    AlignInfo queryAlign(const std::string& path) override { return QueryAlign(path); }
+
+    uint64_t openFile(const std::string& path, OpKind mode, bool unbuffered,
+                      uint64_t expectedSize) override {
+        PoolFile pf;
+        pf.path = path;
+        pf.mode = mode;
+        pf.expectedSize = expectedSize;
+        pf.align = QueryAlign(path);
+
+        const bool wantUnbuffered =
+            unbuffered && !cfg_.forceBuffered && expectedSize >= kSmallFileBufferedMax;
+        if (unbuffered && !wantUnbuffered) {
+            counters_.smallFileFallback.fetch_add(1);  // downgraded because file is small (FR-11)
+        }
+
+        const int base = (mode == OpKind::Write) ? (O_WRONLY | O_CREAT) : O_RDONLY;
+        int fd = -1;
+#if defined(__linux__)
+        if (wantUnbuffered) {
+            fd = ::open(path.c_str(), base | O_DIRECT | O_CLOEXEC, 0644);
+            if (fd >= 0) {
+                pf.unbuffered = true;
+            } else {
+                counters_.bufferedFallback.fetch_add(1);  // O_DIRECT open EINVAL: silent fallback
+            }
+        }
+        if (fd < 0) {
+            fd = ::open(path.c_str(), base | O_CLOEXEC, 0644);
+            if (fd >= 0) {
+                ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            }
+        }
+#else  // __APPLE__ : NO O_DIRECT (AC-13). Express unbuffered intent with F_NOCACHE.
+        fd = ::open(path.c_str(), base | O_CLOEXEC, 0644);
+        if (fd >= 0 && wantUnbuffered) {
+            ::fcntl(fd, F_NOCACHE, 1);
+            pf.unbuffered = true;
+        }
+#endif
+        if (fd < 0) {
+            return 0;
+        }
+        pf.fd = fd;
+        std::lock_guard<std::mutex> lk(mu_);
+        const uint64_t id = nextId_++;
+        files_.emplace(id, std::move(pf));
+        return id;
+    }
+
+    void closeFile(uint64_t fileId) override {
+        PoolFile pf;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = files_.find(fileId);
+            if (it == files_.end()) {
+                return;
+            }
+            pf = std::move(it->second);
+            files_.erase(it);
+        }
+        if (pf.mode == OpKind::Write && pf.expectedSize > 0 && pf.fd >= 0) {
+            ::ftruncate(pf.fd, static_cast<off_t>(pf.expectedSize));  // exact final size (FR-11)
+        }
+        if (pf.fd >= 0) {
+            ::close(pf.fd);
+        }
+    }
+
+    bool submit(IoRequest&& req) override {
+        {
+            std::lock_guard<std::mutex> lk(qmu_);
+            queue_.push_back(std::move(req));
+        }
+        qcv_.notify_one();
+        return true;
+    }
+
+    size_t reap(std::vector<IoCompletion>& out, size_t max, int timeoutMs) override {
+        std::unique_lock<std::mutex> lk(cmu_);
+        if (completions_.empty() && timeoutMs != 0) {
+            ccv_.wait_for(lk, std::chrono::milliseconds(timeoutMs < 0 ? 1000 : timeoutMs),
+                          [this] { return !completions_.empty(); });
+        }
+        size_t n = 0;
+        while (!completions_.empty() && n < max) {
+            out.push_back(std::move(completions_.front()));
+            completions_.pop_front();
+            ++n;
+        }
+        return n;
+    }
+
+    void shutdown() override {
+        {
+            std::lock_guard<std::mutex> lk(qmu_);
+            if (stop_) {
+                return;
+            }
+            stop_ = true;
+        }
+        qcv_.notify_all();
+        for (auto& t : workers_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        workers_.clear();
+    }
+
+    BackendCounters counters() const override { return counters_.snapshot(); }
+
+private:
+    void WorkerLoop() {
+        for (;;) {
+            IoRequest req;
+            {
+                std::unique_lock<std::mutex> lk(qmu_);
+                qcv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) {
+                    return;
+                }
+                req = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            Execute(std::move(req));
+        }
+    }
+
+    void Execute(IoRequest&& req) {
+        IoCompletion c;
+        c.kind = req.kind;
+        c.fileId = req.fileId;
+        c.offset = req.offset;
+        c.requested = req.length;
+        c.userTag = req.userTag;
+
+        PoolFile pf;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = files_.find(req.fileId);
+            if (it == files_.end()) {
+                c.status = IoStatus::Error;
+                PushCompletion(std::move(c));
+                return;
+            }
+            pf = it->second;  // shallow copy: path + fd + align (fd is a shared int, read-only use)
+        }
+
+        if (pf.unbuffered) {
+            counters_.directIo.fetch_add(1);
+        } else {
+            counters_.bufferedFallback.fetch_add(1);
+        }
+
+        if (req.kind == OpKind::Read) {
+            std::vector<uint8_t> buf(req.length);
+            const ssize_t got = DoPread(pf, buf.data(), req.length, req.offset);
+            if (got < 0) {
+                c.status = IoStatus::Error;
+            } else {
+                buf.resize(static_cast<size_t>(got));
+                c.transferred = static_cast<uint32_t>(got);
+                c.status = (static_cast<uint32_t>(got) < req.length) ? IoStatus::Eof : IoStatus::Ok;
+                c.data = std::move(buf);
+            }
+        } else {
+            const ssize_t put = DoPwrite(pf, req.data.data(),
+                                         static_cast<uint32_t>(req.data.size()), req.offset);
+            c.status = (put < 0) ? IoStatus::Error : IoStatus::Ok;
+            if (put >= 0) {
+                c.transferred = static_cast<uint32_t>(put);
+            }
+        }
+        PushCompletion(std::move(c));
+    }
+
+#if defined(__linux__)
+    // Open a transient buffered fd (no O_DIRECT) from the path for a sub-granularity tail or an
+    // unaligned segment; O_DIRECT cannot serve these, so this is the buffered fallback (AC-12/FR-11).
+    int OpenBufferedFd(const PoolFile& pf) {
+        const int base = (pf.mode == OpKind::Write) ? (O_WRONLY | O_CREAT) : O_RDONLY;
+        int fd = ::open(pf.path.c_str(), base | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        }
+        return fd;
+    }
+#endif
+
+    ssize_t DoPread(const PoolFile& pf, uint8_t* dst, uint32_t len, uint64_t off) {
+#if defined(__linux__)
+        if (pf.unbuffered) {
+            const uint32_t g = pf.align.ioGranularity;
+            // F1: direct IO uses an internal bounce buffer (AlignedAlloc below), so the caller's
+            // dst address alignment is irrelevant; only off/len must meet the IO granularity.
+            const bool aligned = IsAligned(off, g) && IsAligned(len, g);
+            if (aligned) {
+                void* abuf = AlignedAlloc(g, len);
+                if (abuf) {
+                    const ssize_t r = ::pread(pf.fd, abuf, len, static_cast<off_t>(off));
+                    if (!(r < 0 && errno == EINVAL)) {
+                        if (r > 0) {
+                            std::memcpy(dst, abuf, static_cast<size_t>(r));
+                        }
+                        AlignedFree(abuf);
+                        return r;
+                    }
+                    AlignedFree(abuf);  // EINVAL -> silent buffered fallback below
+                }
+            }
+            counters_.tailZeroFallback.fetch_add(1);
+            const int bfd = OpenBufferedFd(pf);
+            if (bfd < 0) {
+                return -1;
+            }
+            const ssize_t r = ::pread(bfd, dst, len, static_cast<off_t>(off));
+            ::close(bfd);
+            return r;
+        }
+#endif
+        return ::pread(pf.fd, dst, len, static_cast<off_t>(off));
+    }
+
+    ssize_t DoPwrite(const PoolFile& pf, const uint8_t* src, uint32_t len, uint64_t off) {
+#if defined(__linux__)
+        if (pf.unbuffered) {
+            const uint32_t g = pf.align.ioGranularity;
+            // F1: direct IO uses an internal bounce buffer (AlignedAlloc below), so the caller's
+            // src address alignment is irrelevant; only off/len must meet the IO granularity.
+            const bool aligned = IsAligned(off, g) && IsAligned(len, g);
+            if (aligned) {
+                void* abuf = AlignedAlloc(g, len);
+                if (abuf) {
+                    std::memcpy(abuf, src, len);
+                    const ssize_t r = ::pwrite(pf.fd, abuf, len, static_cast<off_t>(off));
+                    AlignedFree(abuf);
+                    if (!(r < 0 && errno == EINVAL)) {
+                        return r;
+                    }
+                }
+            }
+            counters_.tailZeroFallback.fetch_add(1);
+            const int bfd = OpenBufferedFd(pf);
+            if (bfd < 0) {
+                return -1;
+            }
+            const ssize_t r = ::pwrite(bfd, src, len, static_cast<off_t>(off));
+            ::close(bfd);
+            return r;
+        }
+#endif
+        return ::pwrite(pf.fd, src, len, static_cast<off_t>(off));
+    }
+
+    void PushCompletion(IoCompletion&& c) {
+        {
+            std::lock_guard<std::mutex> lk(cmu_);
+            completions_.push_back(std::move(c));
+        }
+        ccv_.notify_all();
+    }
+
+    IoDriverConfig cfg_;
+    std::vector<std::thread> workers_;
+
+    std::mutex mu_;
+    std::unordered_map<uint64_t, PoolFile> files_;
+    uint64_t nextId_ = 1;
+
+    std::mutex qmu_;
+    std::condition_variable qcv_;
+    std::deque<IoRequest> queue_;
+    bool stop_ = false;
+
+    std::mutex cmu_;
+    std::condition_variable ccv_;
+    std::deque<IoCompletion> completions_;
+
+    PoolCounters counters_;
+};
+
+}  // namespace
+
+std::unique_ptr<PlatformIoBackend> CreatePosixPoolBackend(const IoDriverConfig& cfg,
+                                                          bool ioUringFallback) {
+    return std::make_unique<PosixPoolBackend>(cfg, ioUringFallback);
+}
+
+}  // namespace fc::io
+
+#endif  // __APPLE__ || __linux__

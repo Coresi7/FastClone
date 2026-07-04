@@ -954,6 +954,14 @@ int RunClient(const CliOptions& options) {
     // writes are still pending.
     size_t ioOutstanding = 0;
 
+    // Unified async disk IO driver (unified-disk-io-driver C7/C8/C10): the single client-side
+    // locus for old-file reads (streaming delta plan), download/temp writes, and the finalize
+    // verify read. Declared before the worker pools so it outlives every thread that submits to
+    // it (all pools are joined before RunClient returns / rethrows). Read/write share one driver
+    // so fairness + backpressure apply across the whole client (design §3.2/§5.4).
+    fc::io::IoDriverConfig clientIoCfg;
+    fc::io::DiskIoDriver clientDriver(clientIoCfg);
+
     // Directory creation is offloaded to a small worker pool. With deep trees the
     // manifest can carry millions of directory entries; calling fs::create_directories
     // for each one inline on the single main loop serialised millions of filesystem
@@ -1643,6 +1651,62 @@ int RunClient(const CliOptions& options) {
         });
     }
 
+    // C8: write a whole file through the unified driver (design §5.4). Sequential 1 MiB write ops
+    // with a bounded in-flight window overlap the writes; the driver's win backend pads the final
+    // sub-sector tail and restores the exact size with SetEndOfFile, and OPEN_ALWAYS + a full
+    // [0,size) overwrite + SetEndOfFile is byte-identical to the former ofstream trunc+write. Blocks
+    // until the file is fully written so the surrounding pool's completion accounting is unchanged.
+    auto driverWriteWholeFile = [&](const std::string& path,
+                                    const std::vector<uint8_t>& data) -> bool {
+        const uint64_t sz = data.size();
+        const uint64_t fid =
+            clientDriver.openFile(path, fc::io::OpKind::Write, /*unbuffered=*/true, sz);
+        if (fid == 0) {
+            return false;
+        }
+        const uint32_t chunk =
+            clientDriver.config().chunkBytes == 0 ? (1u << 20) : clientDriver.config().chunkBytes;
+        constexpr uint32_t kWindow = 8;  // in-flight write ops per file (bounds resident buffers)
+        bool ok = true;
+        uint64_t off = 0;
+        uint32_t inflight = 0;
+        std::vector<fc::io::IoCompletion> comps;
+        while (ok && (off < sz || inflight > 0)) {
+            while (off < sz && inflight < kWindow) {
+                const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(chunk, sz - off));
+                std::vector<fc::io::IoRequest> one(1);
+                one[0].kind = fc::io::OpKind::Write;
+                one[0].fileId = fid;
+                one[0].offset = off;
+                one[0].length = len;
+                one[0].userTag = off;
+                one[0].data.assign(data.begin() + static_cast<std::ptrdiff_t>(off),
+                                   data.begin() + static_cast<std::ptrdiff_t>(off + len));
+                if (clientDriver.submit(one) == 0) {
+                    break;  // write queue full; drain in-flight below then retry
+                }
+                off += len;
+                ++inflight;
+            }
+            comps.clear();
+            clientDriver.drainCompletionsForFile(fid, comps);
+            if (comps.empty()) {
+                clientDriver.waitForFile(fid, 1000);
+                clientDriver.drainCompletionsForFile(fid, comps);
+            }
+            for (const fc::io::IoCompletion& c : comps) {
+                if (inflight > 0) {
+                    --inflight;
+                }
+                if (c.status == fc::io::IoStatus::Error || c.transferred != c.requested) {
+                    ok = false;
+                }
+            }
+        }
+        clientDriver.closeFile(fid);
+        return ok;
+    };
+
     // Async file-write worker pool (see IoWriteTask declaration). I/O-bound, so size it
     // a bit above core count to keep the disk queue full of concurrent small-file
     // create/write/close/set-mtime operations.
@@ -1672,24 +1736,13 @@ int RunClient(const CliOptions& options) {
                 }
                 results.clear();
                 for (IoWriteTask& t : batch) {
-                    bool ok = false;
+                    // C8: the file payload write is now issued through the unified disk IO driver
+                    // (design §5.4) instead of an inline ofstream, so all client file-content IO
+                    // shares one locus with read/write fairness + backpressure. Bytes and final
+                    // size are identical to the former trunc+write path.
                     const fs::path abs = JoinRel(options.rootDir, t.relPath);
                     EnsureParentDir(abs);
-                    {
-                        std::ofstream out(abs, std::ios::binary | std::ios::trunc);
-                        if (out) {
-                            if (!t.data.empty()) {
-                                out.write(reinterpret_cast<const char*>(t.data.data()),
-                                          static_cast<std::streamsize>(t.data.size()));
-                            }
-                            out.flush();
-                            ok = out.good();
-                            out.close();
-                            if (ok && !out.good()) {
-                                ok = false;
-                            }
-                        }
-                    }
+                    const bool ok = driverWriteWholeFile(abs.string(), t.data);
                     if (ok) {
                         SetFileModifyTime(abs, t.mtimeNs);
                     }
@@ -2241,9 +2294,56 @@ int RunClient(const CliOptions& options) {
         }
         const fs::path target = JoinRel(options.rootDir, rel);
         bool verifyOk = false;
+        // C10: stream the reconstructed temp through the unified driver into XXH3 for the verify
+        // read, instead of ComputeFileHash's inline read. Same bytes -> identical Hash256, so the
+        // verify decision is bit-identical (AC-25).
         try {
-            const Hash256 got = ComputeFileHash(st.tempPath);
-            verifyOk = HashEquals(got, st.verifyHash);
+            std::error_code szEc;
+            const uint64_t verifySize =
+                static_cast<uint64_t>(fs::file_size(st.tempPath, szEc));
+            if (szEc) {
+                verifyOk = false;
+            } else {
+                const uint64_t fid = clientDriver.openFile(
+                    st.tempPath.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+                if (fid == 0) {
+                    verifyOk = false;
+                } else {
+                    bool rerr = false;
+                    fc::io::SequentialReader reader(clientDriver, fid, verifySize,
+                                                    clientDriver.config().chunkBytes, 4);
+                    std::vector<uint8_t> cbuf;
+                    size_t cpos = 0;
+                    auto src = [&](uint8_t* dst, size_t maxLen) -> size_t {
+                        size_t written = 0;
+                        while (written < maxLen) {
+                            if (cpos < cbuf.size()) {
+                                const size_t take =
+                                    std::min<size_t>(cbuf.size() - cpos, maxLen - written);
+                                std::memcpy(dst + written, cbuf.data() + cpos, take);
+                                cpos += take;
+                                written += take;
+                                continue;
+                            }
+                            bool okr = true;
+                            cbuf.clear();
+                            cpos = 0;
+                            const uint32_t n = reader.next(cbuf, okr);
+                            if (!okr) {
+                                rerr = true;
+                                break;
+                            }
+                            if (n == 0) {
+                                break;
+                            }
+                        }
+                        return written;
+                    };
+                    const Hash256 got = ComputeHashFromSource(src);
+                    clientDriver.closeFile(fid);
+                    verifyOk = !rerr && HashEquals(got, st.verifyHash);
+                }
+            }
         } catch (...) {
             verifyOk = false;
         }
@@ -2303,48 +2403,115 @@ int RunClient(const CliOptions& options) {
         res.verifyHash = task.fileHash;
         res.newFileBytes = task.sig.fileSize;
         const fs::path abs = JoinRel(options.rootDir, task.rel);
-        std::vector<uint8_t> oldData;
-        if (!ReadWholeFile(abs, oldData)) {
+
+        // Old-file size is metadata (not driver IO, design §6) and bounds the streaming window so
+        // it never allocates a whole-file buffer (AC-04).
+        std::error_code sizeEc;
+        const uint64_t oldLen = static_cast<uint64_t>(fs::file_size(abs, sizeEc));
+        if (sizeEc) {
             res.ok = false;
             res.fallbackReason = "old_unreadable";
             res.downloadBytes = 0;
             return res;
         }
-        const delta::DeltaPlan plan = delta::BuildPlan(task.sig, oldData.data(), oldData.size());
-        res.stats = plan.stats;
-        res.downloadBytes = plan.downloadBytes;
-        res.newFileBytes = plan.newFileBytes;
-        if (delta::BenefitRejected(plan.downloadBytes, plan.newFileBytes)) {
+        // C7: read the old file sequentially through the unified driver instead of ReadWholeFile
+        // (AC-01). Driver read-ahead overlaps disk IO with the rolling scan; no whole-file buffer.
+        const uint64_t oldFileId =
+            clientDriver.openFile(abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+        if (oldFileId == 0) {
             res.ok = false;
-            res.fallbackReason = "benefit";  // FR-19 / AC-07
-            res.benefitRejected = true;
+            res.fallbackReason = "old_unreadable";
+            res.downloadBytes = 0;
             return res;
         }
+
+        // Preallocate the temp up front so copy captures ("命中即捕获", design D-01 A) can seek and
+        // write into it during the SAME scan pass -- no second read, no whole-file buffer.
         EnsureParentDir(abs);
         const fs::path tmp = makeDeltaTempPath(abs);
         std::ofstream out(tmp, std::ios::binary | std::ios::out | std::ios::trunc);
         bool ioOk = static_cast<bool>(out);
-        if (ioOk && plan.newFileBytes > 0) {
+        if (ioOk && task.sig.fileSize > 0) {
             // Preallocate to the final size so out-of-order range writes land correctly.
-            out.seekp(static_cast<std::streamoff>(plan.newFileBytes - 1), std::ios::beg);
+            out.seekp(static_cast<std::streamoff>(task.sig.fileSize - 1), std::ios::beg);
             out.put('\0');
             ioOk = static_cast<bool>(out);
         }
-        for (const delta::CopyOp& c : plan.copies) {
-            if (!ioOk) {
-                break;
+
+        bool readErr = false;
+        fc::io::SequentialReader reader(clientDriver, oldFileId, oldLen,
+                                        clientDriver.config().chunkBytes, 4);
+        std::vector<uint8_t> chunkBuf;
+        size_t chunkPos = 0;
+        delta::ByteSource src = [&](uint8_t* dst, size_t maxLen) -> size_t {
+            size_t written = 0;
+            while (written < maxLen) {
+                if (chunkPos < chunkBuf.size()) {
+                    const size_t take =
+                        std::min<size_t>(chunkBuf.size() - chunkPos, maxLen - written);
+                    std::memcpy(dst + written, chunkBuf.data() + chunkPos, take);
+                    chunkPos += take;
+                    written += take;
+                    continue;
+                }
+                bool ok = true;
+                chunkBuf.clear();
+                chunkPos = 0;
+                const uint32_t n = reader.next(chunkBuf, ok);
+                if (!ok) {
+                    readErr = true;  // genuine read error -> treat as unreadable (bit-identical to
+                    break;           // the old ReadWholeFile==false path)
+                }
+                if (n == 0) {
+                    break;  // clean EOF
+                }
             }
-            out.seekp(static_cast<std::streamoff>(c.destOffsetNew), std::ios::beg);
-            out.write(reinterpret_cast<const char*>(oldData.data() + c.srcOffsetOld),
-                      static_cast<std::streamsize>(c.len));
+            return written;
+        };
+        // Capture each matched full block's live window bytes and write the copy straight to temp
+        // (design D-01 A). The bytes are identical to oldData[srcOffsetOld .. +len), so the temp
+        // content stays bit-identical to the former ReadWholeFile+BuildPlan path.
+        delta::CopyCapturedFn onCopy = [&](uint64_t /*srcOffsetOld*/, uint64_t destOffsetNew,
+                                           uint32_t len, const uint8_t* windowBytes) {
+            if (!ioOk) {
+                return;
+            }
+            out.seekp(static_cast<std::streamoff>(destOffsetNew), std::ios::beg);
+            out.write(reinterpret_cast<const char*>(windowBytes),
+                      static_cast<std::streamsize>(len));
             ioOk = static_cast<bool>(out);
-        }
-        if (!ioOk) {
+        };
+
+        const delta::DeltaPlan plan =
+            delta::BuildPlanStreaming(task.sig, oldLen, src, {}, onCopy);
+        res.stats = plan.stats;
+        res.downloadBytes = plan.downloadBytes;
+        res.newFileBytes = plan.newFileBytes;
+        clientDriver.closeFile(oldFileId);
+
+        auto discardTemp = [&]() {
             if (out.is_open()) {
                 out.close();
             }
             std::error_code rec;
             fs::remove(tmp, rec);
+        };
+        if (readErr) {
+            discardTemp();
+            res.ok = false;
+            res.fallbackReason = "old_unreadable";
+            res.downloadBytes = 0;
+            return res;
+        }
+        if (delta::BenefitRejected(plan.downloadBytes, plan.newFileBytes)) {
+            discardTemp();
+            res.ok = false;
+            res.fallbackReason = "benefit";  // FR-19 / AC-07
+            res.benefitRejected = true;
+            return res;
+        }
+        if (!ioOk) {
+            discardTemp();
             res.ok = false;
             res.fallbackReason = "reconstruct_io";
             return res;

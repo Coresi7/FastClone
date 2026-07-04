@@ -292,6 +292,38 @@ Hash256 ComputeFileHash(const fs::path& path) {
     return output;
 }
 
+Hash256 ComputeHashFromSource(const std::function<size_t(uint8_t*, size_t)>& source) {
+    XXH3_state_t* state = XXH3_createState();
+    if (state == nullptr) {
+        throw std::runtime_error("XXH3_createState failed");
+    }
+    if (XXH3_128bits_reset(state) == XXH_ERROR) {
+        XXH3_freeState(state);
+        throw std::runtime_error("XXH3_128bits_reset failed");
+    }
+    // Same 256 KiB pull granularity as ComputeFileHash; XXH3 streaming is chunk-size independent so
+    // the digest is identical regardless of how the driver delivers the bytes.
+    thread_local std::vector<uint8_t> readBuf;
+    if (readBuf.size() != 256 * 1024) {
+        readBuf.resize(256 * 1024);
+    }
+    for (;;) {
+        const size_t got = source(readBuf.data(), readBuf.size());
+        if (got == 0) {
+            break;
+        }
+        if (XXH3_128bits_update(state, readBuf.data(), got) == XXH_ERROR) {
+            XXH3_freeState(state);
+            throw std::runtime_error("XXH3_128bits_update failed");
+        }
+    }
+    const XXH128_hash_t digest = XXH3_128bits_digest(state);
+    XXH3_freeState(state);
+    Hash256 output{};
+    std::memcpy(output.data(), &digest, output.size());
+    return output;
+}
+
 Hash256 ComputeBufferHash(const uint8_t* data, size_t len) {
     // XXH3_128bits one-shot is bit-identical to the streaming path in ComputeFileHash for the
     // same bytes; the raw memcpy of XXH128_hash_t reproduces the exact same Hash256 layout, so
