@@ -11,9 +11,28 @@
 #include "protocol.h"
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 
 namespace fc::check {
+
+// AIMD step rules for the two independent concurrency dimensions (fastcheck-parallel-hash M8/FR-12/
+// FR-13). Extracted as pure functions so the increase/decrease behavior is unit-testable (AC-10/AC-11)
+// without spinning up the worker pool.
+
+// Local hash worker cap (--hash-workers dimension). Multiplicative decrease on any read-fail signal;
+// additive increase when the task backlog is non-empty and all active workers are busy (localInFlight
+// has caught up to the cap) and no failures occurred in the sample. Bounded to [1, maxCap].
+std::size_t NextLocalWorkerCap(std::size_t currentCap, std::size_t maxCap, std::size_t taskQueueLen,
+                               std::size_t localInFlight, std::uint64_t readFailDelta);
+
+// Network in-flight window (--checkers dimension). Additive increase when the RTT sample is at or
+// below the EWMA * stable factor; multiplicative decrease when it exceeds the EWMA * spike factor.
+// A non-positive ewma means "not enough samples yet" and leaves the window unchanged. Bounded to
+// [windowMin, windowMax].
+std::size_t NextNetWindow(std::size_t currentWindow, double rttSampleUs, double rttEwmaUs,
+                          std::size_t windowMin, std::size_t windowMax);
 
 // Frame send/receive abstraction. send sends one frame; recv blocks reading one frame and throws on disconnect (engine uses this to decide partial + exit code 2).
 struct FrameChannel {

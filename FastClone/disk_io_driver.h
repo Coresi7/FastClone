@@ -88,12 +88,19 @@ public:
     std::vector<OpKind> scheduleLog() const;
 
 private:
+    struct FileWaitState {
+        std::condition_variable cv;
+    };
+
     void SchedulerLoop();
     bool PickAndSubmit();  // returns true if an op was submitted this step
+    void EnqueueCompletion(IoCompletion completion);
 
     IoDriverConfig cfg_;
     std::unique_ptr<PlatformIoBackend> backend_;
 
+    // Lock ordering: qmu_ and cmu_ are never held together; countMu_ may be taken briefly under
+    // either for counter updates. waitForFile blocks only on cmu_ (never while holding qmu_).
     mutable std::mutex qmu_;
     std::condition_variable qcv_;
     std::deque<IoRequest> readQ_;
@@ -105,8 +112,8 @@ private:
     uint64_t inFlight_ = 0;
 
     std::mutex cmu_;
-    std::condition_variable ccv_;
     std::unordered_map<uint64_t, std::deque<IoCompletion>> completionsByFile_;
+    std::unordered_map<uint64_t, FileWaitState> fileWait_;
     std::deque<uint64_t> completionOrder_;  // fileIds in completion order for the global drain
 
     mutable std::mutex countMu_;

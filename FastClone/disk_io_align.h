@@ -45,6 +45,11 @@ AlignInfo QueryAlign(const std::string& path);
 // Runtime process page size. Exposed for callers/tests that only need the page size.
 uint32_t QueryPageSize();
 
+// Test-only observability probe (Change 2 / AC-20): current entry count of the process-wide
+// per-volume QueryAlign cache. Lets the bounded-cache test assert the entry count does not grow
+// with file count. Not part of the production API and never called on any hot path (N7/N8 safe).
+size_t AlignCacheSizeForTest();
+
 // --- Pure alignment helpers (a must be a power of two; page/block/sector sizes always are). ---
 uint64_t AlignDown(uint64_t value, uint32_t alignment);
 uint64_t AlignUp(uint64_t value, uint32_t alignment);

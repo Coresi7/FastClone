@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -15,6 +17,7 @@
 #else
 #include <unistd.h>
 #include <cstdlib>  // posix_memalign / free
+#include <sys/stat.h>  // ::stat / st_dev (QueryAlign volume-cache key, FR-13)
 #if defined(__linux__)
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
@@ -118,12 +121,72 @@ uint32_t QueryDeviceBlockSize(const std::string& path) {
 }
 #endif
 
+// Resolve a stable per-volume/per-device cache key for `path` (FR-10/FR-13). Returns false when the
+// key cannot be resolved so the caller falls back to an uncached query without polluting the cache
+// (FR-14 / edge case "volume-root resolution failure must not pollute other volumes' entries").
+//   Windows : the volume root ("D:\") from GetVolumePathNameW. The UTF-8 path is converted to UTF-16
+//             via MultiByteToWideChar(CP_UTF8) so non-ASCII paths resolve (FR-10 / AC-21).
+//   POSIX   : the device id (st_dev) from ::stat, so one filesystem => one entry (FR-13 / NFR-05).
+bool ResolveVolumeKey(const std::string& path, std::string& key) {
+#if defined(_WIN32)
+    std::wstring wpath;
+    if (!path.empty()) {
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                                            static_cast<int>(path.size()), nullptr, 0);
+        if (n > 0) {
+            wpath.resize(static_cast<size_t>(n));
+            ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                                  static_cast<int>(path.size()), wpath.data(), n);
+        }
+    }
+    wchar_t root[MAX_PATH] = {0};
+    if (GetVolumePathNameW(wpath.c_str(), root, MAX_PATH) == 0) {
+        return false;
+    }
+    // The key only needs to be unique per volume root; store the raw UTF-16 code units as bytes.
+    const std::wstring rootStr(root);
+    key.assign(reinterpret_cast<const char*>(rootStr.data()),
+               rootStr.size() * sizeof(wchar_t));
+    return true;
+#else
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    key = std::to_string(static_cast<unsigned long long>(st.st_dev));
+    return true;
+#endif
+}
+
+// Process-wide per-volume alignment cache (Change 2, fastcheck-redundant-syscall-elim FR-10..FR-14).
+// A single mutex guards check-then-insert so concurrent first queries of the same volume serialize
+// and no data race / partial read / lost update can occur (FR-12/NFR-04). Bounded by the number of
+// distinct resolved volume roots / devices, never by file count (FR-13/NFR-05).
+std::mutex g_alignCacheMu;
+std::unordered_map<std::string, AlignInfo> g_alignCache;
+
 }  // namespace
 
 AlignInfo QueryAlign(const std::string& path) {
-    const uint32_t page = QueryPageSize();
-    const uint32_t block = QueryDeviceBlockSize(path);
-    return MakeAlignInfo(page, block);
+    std::string key;
+    if (ResolveVolumeKey(path, key)) {
+        std::lock_guard<std::mutex> lk(g_alignCacheMu);
+        auto it = g_alignCache.find(key);
+        if (it != g_alignCache.end()) {
+            return it->second;  // cache hit: reuse the per-volume AlignInfo (M9/FR-11)
+        }
+        const AlignInfo info = MakeAlignInfo(QueryPageSize(), QueryDeviceBlockSize(path));
+        g_alignCache.emplace(key, info);  // idempotent first-query insert under the lock
+        return info;
+    }
+    // Key resolution failed (FR-14): do not cache, fall back to the original uncached query so a
+    // bad path can never be escalated into an open/read failure or pollute another volume's entry.
+    return MakeAlignInfo(QueryPageSize(), QueryDeviceBlockSize(path));
+}
+
+size_t AlignCacheSizeForTest() {
+    std::lock_guard<std::mutex> lk(g_alignCacheMu);
+    return g_alignCache.size();
 }
 
 uint64_t AlignDown(uint64_t value, uint32_t alignment) {

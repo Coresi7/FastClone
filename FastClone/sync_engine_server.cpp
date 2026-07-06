@@ -907,59 +907,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             // C9: read the file content through the unified driver and stream it
                             // into XXH3, instead of ComputeFileHash's inline read. Same bytes ->
                             // identical Hash256 (AC-06). IO/CPU decoupled; concurrency bounded by
-                            // the driver, not per-worker (FR-19).
+                            // the driver, not per-worker (FR-19). The read+hash logic is the single
+                            // shared ComputeFileHashViaDriver (fastcheck-parallel-hash FR-02); any
+                            // failure throws and is caught here -> hash.fill(0xFF), byte-for-byte
+                            // equivalent to the previous inline block.
                             try {
-                                std::error_code ec;
-                                const uint64_t fileSize =
-                                    static_cast<uint64_t>(fs::file_size(abs, ec));
-                                if (ec) {
-                                    hashOk = false;
-                                } else {
-                                    const uint64_t fid = GetServerDiskIoDriver().openFile(
-                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
-                                    if (fid == 0) {
-                                        hashOk = false;
-                                    } else {
-                                        bool rerr = false;
-                                        fc::io::SequentialReader reader(GetServerDiskIoDriver(), fid,
-                                                                        fileSize,
-                                                                        kServerSigChunkBytes,
-                                                                        kServerReadAhead);
-                                        std::vector<uint8_t> cbuf;
-                                        size_t cpos = 0;
-                                        auto src = [&](uint8_t* dst, size_t maxLen) -> size_t {
-                                            size_t written = 0;
-                                            while (written < maxLen) {
-                                                if (cpos < cbuf.size()) {
-                                                    const size_t take = std::min<size_t>(
-                                                        cbuf.size() - cpos, maxLen - written);
-                                                    std::memcpy(dst + written, cbuf.data() + cpos,
-                                                                take);
-                                                    cpos += take;
-                                                    written += take;
-                                                    continue;
-                                                }
-                                                bool okr = true;
-                                                cbuf.clear();
-                                                cpos = 0;
-                                                const uint32_t n = reader.next(cbuf, okr);
-                                                if (!okr) {
-                                                    rerr = true;
-                                                    break;
-                                                }
-                                                if (n == 0) {
-                                                    break;
-                                                }
-                                            }
-                                            return written;
-                                        };
-                                        hash = ComputeHashFromSource(src);
-                                        GetServerDiskIoDriver().closeFile(fid);
-                                        if (rerr) {
-                                            hashOk = false;
-                                        }
-                                    }
-                                }
+                                hash = ComputeFileHashViaDriver(GetServerDiskIoDriver(), abs);
                             } catch (...) {
                                 hashOk = false;
                             }
@@ -1138,8 +1091,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                                 if (ec) {
                                     ok = false;
                                 } else {
+                                    // Change 3b (fastcheck-redundant-syscall-elim, FR-21): reuse the
+                                    // fileSize just read above so the read open skips the redundant
+                                    // Windows FileSizeOnDisk query. Signing bytes are unchanged.
                                     const uint64_t fid = GetServerDiskIoDriver().openFile(
-                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true,
+                                        fileSize);
                                     if (fid == 0) {
                                         ok = false;
                                     } else {
@@ -1228,12 +1185,22 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     // bytes via the driver lock-free. Open failure -> DeltaError.
                     const DeltaRangeRequest req = DecodeDeltaRangeOpen(frame.payload);
                     const fs::path abs = JoinRel(options.rootDir, req.relPath);
+                    // Change 3c (fastcheck-redundant-syscall-elim, FR-22 / edge case): a zero-length
+                    // or offset+length overflow range must NOT open a driver fileId; enter the
+                    // existing DeltaError path instead. Otherwise pass the known read bound
+                    // (offset+length) as expectedSize so the read open skips the redundant Windows
+                    // FileSizeOnDisk query; the streamed DeltaRangeChunk bytes are unchanged.
+                    if (req.length == 0 || req.offset > UINT64_MAX - req.length) {
+                        enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
+                        continue;
+                    }
+                    const uint64_t readBound = req.offset + req.length;
                     ServerRangeStream rs;
                     rs.relativePath = req.relPath;
                     rs.remaining = req.length;
                     rs.nextReadOffset = req.offset;
                     rs.fileId = GetServerDiskIoDriver().openFile(abs.string(), fc::io::OpKind::Read,
-                                                                /*unbuffered=*/true, 0);
+                                                                /*unbuffered=*/true, readBound);
                     if (rs.fileId == 0) {
                         enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
                         continue;

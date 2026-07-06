@@ -9,6 +9,13 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward declaration only: callers that just need the ComputeFileHashViaDriver signature must not
+// be forced to pull in disk_io_backend.h. The definition lives in file_index.cpp, which includes
+// disk_io_driver.h.
+namespace fc::io {
+class DiskIoDriver;
+}
+
 namespace fc {
 
 struct FileEntry {
@@ -23,6 +30,28 @@ using Hash256 = std::array<uint8_t, 16>;
 
 std::vector<FileEntry> BuildIndex(const std::filesystem::path& root, const std::optional<std::filesystem::path>& excludeAbsPath);
 Hash256 ComputeFileHash(const std::filesystem::path& path);
+// Same XXH3-128 digest + raw byte layout as ComputeFileHash, but reads the file content through the
+// unified disk IO driver: files <= 256 KiB use one direct driver read + ComputeBufferHash, larger
+// files keep the SequentialReader streaming path. Single source of truth shared by the FastClone
+// server hash-miss path and the FastCheck client local-hash worker (fastcheck-parallel-hash M1/M3/
+// FR-01). Throws std::runtime_error on any open/read failure, matching ComputeFileHash's failure
+// contract so callers can keep their existing try/catch handling.
+Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const std::filesystem::path& path);
+// Diagnostics: cumulative per-phase wall-clock time spent inside ComputeFileHashViaDriver
+// (microseconds, relaxed atomics). Only meaningful in a process that actually calls the function
+// (FastCheck client / FastClone server). Intended for the FastCheck progress line to locate where
+// the per-file hash time goes (file_size query / openFile / read / XXH3 / closeFile). Zero cost on
+// callers that never read it; the atomic adds inside the hot path are ~nanoseconds.
+struct HashPhaseTimings {
+    uint64_t count = 0;       // number of ComputeFileHashViaDriver calls
+    uint64_t totalUs = 0;     // whole-function wall time
+    uint64_t fileSizeUs = 0;  // fs::file_size query
+    uint64_t openUs = 0;      // driver.openFile
+    uint64_t readUs = 0;      // submit+wait+drain (fast path) or SequentialReader loop (slow path)
+    uint64_t xxhUs = 0;       // ComputeBufferHash / ComputeHashFromSource
+    uint64_t closeUs = 0;     // driver.closeFile
+};
+HashPhaseTimings GetHashPhaseTimings();
 // Same XXH3-128 digest + raw byte layout as ComputeFileHash, but over an in-memory buffer.
 // Lets callers that already hold the file bytes (e.g. the delta block-signature path) avoid a
 // second full-file read while producing a value the client's ComputeFileHash verify matches.

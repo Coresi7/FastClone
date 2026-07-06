@@ -61,14 +61,19 @@ struct BackendCounters {
 };
 
 // Config shared by the driver and backends.
+// Default memory upper bounds (chunkBytes defaults to 1 MiB):
+//   read in-flight payload <= maxInFlight * chunkBytes        = 64 MiB
+//   backend scratch       <= backendConcurrency * chunkBytes  = 8 MiB
+//   queued write payload  <= maxWriteQueue * chunkBytes       (unchanged cap)
+// These are per-driver-process bounds and never scale with a single file's total size.
 struct IoDriverConfig {
-    uint32_t backendConcurrency = 4;  // in-flight ops / worker threads for the pool backends
+    uint32_t backendConcurrency = 8;  // in-flight ops / worker threads for the pool backends
     uint32_t maxReadQueue = 256;
     uint32_t maxWriteQueue = 256;
     uint32_t readWeight = 1;          // fair-share credits (design section 3.2 / D-03)
     uint32_t writeWeight = 1;
     uint32_t chunkBytes = 1u << 20;   // 1 MiB read-ahead / write chunk granularity
-    uint32_t maxInFlight = 16;        // cap on submitted-not-completed ops (bounds memory, FR-12)
+    uint32_t maxInFlight = 64;        // cap on submitted-not-completed ops (bounds memory, FR-12)
     bool forceBuffered = false;       // tests: force the buffered path regardless of size
     bool recordSchedule = false;      // tests: record submitted-op direction order (AC-19/20)
 };
@@ -82,10 +87,17 @@ public:
     // Runtime alignment for the volume hosting `path` (metadata query, not driver IO).
     virtual AlignInfo queryAlign(const std::string& path) = 0;
 
-    // Open a file for read or write. `expectedSize` (write path) lets the backend set the final
-    // size exactly when using an unbuffered/truncate tail strategy. Returns 0 on failure else a
-    // nonzero file id. `unbuffered` is a hint; the backend may silently fall back to buffered
-    // (small files, unsupported FS, O_DIRECT EINVAL) without changing observable results.
+    // Open a file for read or write.
+    //   Write mode: `expectedSize` lets the backend set the final size exactly when using an
+    //               unbuffered/truncate tail strategy (final SetEndOfFile/ftruncate size).
+    //   Read mode : a positive `expectedSize` is the caller's already-known read size/bound; it
+    //               lets the backend skip a redundant file-size query (Windows FileSizeOnDisk) and
+    //               serve as both the read-policy size and the tail (EOF) bound. `expectedSize == 0`
+    //               means "unknown size" / legacy behaviour (Windows queries FileSizeOnDisk, 0 stays
+    //               the unknown/failure sentinel and drives small-file buffered fallback + tail
+    //               clamp). POSIX/uring reads stay buffered regardless (see those backends).
+    // Returns 0 on failure else a nonzero file id. `unbuffered` is a hint; the backend may silently
+    // fall back to buffered (small files, unsupported FS, O_DIRECT EINVAL) without changing results.
     virtual uint64_t openFile(const std::string& path, OpKind mode, bool unbuffered,
                               uint64_t expectedSize) = 0;
     virtual void closeFile(uint64_t fileId) = 0;

@@ -128,7 +128,9 @@ void PrintUsage() {
         << "  --target        local directory to compare, required\n"
         << "  --password      session password, required\n"
         << "  --mode          compare mode: fast (default), strict, size-only\n"
-        << "  --checkers      max concurrent in-flight hash requests (positive integer, default 8)\n"
+        << "  --checkers      initial in-flight hash request network window, AIMD-tuned (1..4096, default 32)\n"
+        << "  --hash-workers  initial local hash worker count: 0=auto (default), or positive (1..4096)\n"
+        << "  --no-diskio-driver  keep parallel hashing but read local files without the disk IO driver\n"
         << "  --output        write full report to file (default: terminal only)\n"
         << "  --format        report format: text (default), json\n"
         << "  --summary-only  emit only the final summary (no per-file lines)\n"
@@ -158,6 +160,16 @@ CheckOptions ParseCheckArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --checkers (range: 1..4096)");
             }
             options.checkers = static_cast<uint32_t>(n);
+        } else if (arg == "--hash-workers") {
+            // 0 = auto (hardware_concurrency); positive = fixed initial worker count. Negative,
+            // non-integer, or missing value fails here, before connecting to the server (AC-08).
+            const long n = ParseLongStrict(ArgAt(args, ++i), "--hash-workers");
+            if (n < 0 || n > 4096) {
+                throw std::runtime_error("Invalid --hash-workers (range: 0..4096, 0=auto)");
+            }
+            options.hashWorkers = static_cast<uint32_t>(n);
+        } else if (arg == "--no-diskio-driver") {
+            options.noDiskioDriver = true;
         } else if (arg == "--output") {
             options.output = ArgAt(args, ++i);
         } else if (arg == "--format") {

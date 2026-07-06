@@ -6,12 +6,25 @@
 
 #include "disk_io_align.h"
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -104,6 +117,130 @@ void TestQueryAlignAscii() {
     fs::remove(tmp, ec);
 }
 
+bool AlignEq(const fc::io::AlignInfo& a, const fc::io::AlignInfo& b) {
+    return a.pageSize == b.pageSize && a.deviceBlockSize == b.deviceBlockSize &&
+           a.ioGranularity == b.ioGranularity;
+}
+
+// V-08 (AC-17): querying multiple different file paths on the SAME volume returns identical AlignInfo
+// (per-volume cache reuse), consistent with the very first (uncached) query result.
+void TestQueryAlignSameVolumeReuse() {
+    using namespace fc::io;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "fc_align_reuse";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    // First query establishes/uses the cache entry for this volume.
+    { std::ofstream f(dir / "f0.bin"); f << 'x'; }
+    const AlignInfo first = QueryAlign((dir / "f0.bin").string());
+    Require(first.ioGranularity > 0, "reuse: first query granularity > 0");
+    for (int i = 1; i < 8; ++i) {
+        const fs::path p = dir / ("f" + std::to_string(i) + ".bin");
+        { std::ofstream f(p); f << 'y'; }
+        const AlignInfo info = QueryAlign(p.string());
+        Require(AlignEq(info, first), "reuse: same-volume path returns identical AlignInfo (AC-17)");
+    }
+    fs::remove_all(dir, ec);
+}
+
+// V-11 (AC-20): the cache is bounded by volume count, never file count. After warming the volume
+// entry, querying K more distinct files on the same volume must not grow the cache entry count.
+void TestQueryAlignBounded() {
+    using namespace fc::io;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "fc_align_bounded";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream f(dir / "warm.bin"); f << 'x'; }
+    (void)QueryAlign((dir / "warm.bin").string());  // ensure this volume is cached
+    const size_t before = AlignCacheSizeForTest();
+    for (int i = 0; i < 32; ++i) {
+        const fs::path p = dir / ("b" + std::to_string(i) + ".bin");
+        { std::ofstream f(p); f << 'z'; }
+        (void)QueryAlign(p.string());
+    }
+    const size_t after = AlignCacheSizeForTest();
+    Require(after == before, "bounded: same-volume multi-file query does not grow cache (AC-20)");
+    fs::remove_all(dir, ec);
+}
+
+// V-10 (AC-19): concurrent QueryAlign on the same volume never crashes / races and every thread
+// observes the same AlignInfo (indirect proof of no data race / no partial read).
+void TestQueryAlignConcurrent() {
+    using namespace fc::io;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "fc_align_concurrent";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    for (int i = 0; i < 16; ++i) {
+        std::ofstream f(dir / ("c" + std::to_string(i) + ".bin"));
+        f << 'x';
+    }
+    const AlignInfo expected = QueryAlign((dir / "c0.bin").string());
+    constexpr int kThreads = 8;
+    std::vector<std::thread> threads;
+    std::atomic<int> mismatches{0};
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < 200; ++i) {
+                const fs::path p = dir / ("c" + std::to_string((t + i) % 16) + ".bin");
+                const AlignInfo info = QueryAlign(p.string());
+                if (!AlignEq(info, expected)) {
+                    mismatches.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    Require(mismatches.load() == 0, "concurrent: all threads see identical AlignInfo (AC-19)");
+    fs::remove_all(dir, ec);
+}
+
+#if defined(_WIN32)
+// V-09 (AC-18): distinct volume roots keep independent cache entries and coexist. Environment-gated:
+// enumerates fixed drives and requires >= 2 distinct volume roots; otherwise skips (design R-05).
+void TestQueryAlignMultiVolumeWindows() {
+    using namespace fc::io;
+    std::vector<std::string> roots;
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (1u << i)) == 0) {
+            continue;
+        }
+        const char letter = static_cast<char>('A' + i);
+        std::string root;
+        root += letter;
+        root += ":\\";
+        std::wstring wroot;
+        wroot += static_cast<wchar_t>(letter);
+        wroot += L":\\";
+        if (GetDriveTypeW(wroot.c_str()) != DRIVE_FIXED) {
+            continue;  // only fixed volumes give a stable runtime alignment
+        }
+        roots.push_back(root);
+    }
+    if (roots.size() < 2) {
+        return;  // environment gate: need >= 2 fixed volumes to prove independent entries
+    }
+    // Warm every root, then a second pass must add no new entries (each distinct volume already has
+    // exactly one coexisting entry, FR-13). AlignInfo per root stays self-consistent across passes.
+    std::vector<AlignInfo> firstPass;
+    for (const std::string& r : roots) {
+        firstPass.push_back(QueryAlign(r));
+    }
+    const size_t afterWarm = AlignCacheSizeForTest();
+    for (size_t idx = 0; idx < roots.size(); ++idx) {
+        const AlignInfo again = QueryAlign(roots[idx]);
+        Require(AlignEq(again, firstPass[idx]),
+                "multi-volume: per-root AlignInfo stable across passes (AC-18)");
+    }
+    Require(AlignCacheSizeForTest() == afterWarm,
+            "multi-volume: re-querying cached roots adds no entries (AC-18)");
+}
+#endif
+
 #if defined(_WIN32)
 // F5 (AC-15): a file under a non-ASCII UTF-8 path must resolve (deviceBlockSize > 0), proving the
 // MultiByteToWideChar(CP_UTF8) conversion, not the byte-wise widen which fails for such paths.
@@ -136,7 +273,11 @@ void RunDiskIoAlignTests() {
     TestRuntimeQuery();
     TestAlignedAlloc();
     TestQueryAlignAscii();
+    TestQueryAlignSameVolumeReuse();
+    TestQueryAlignBounded();
+    TestQueryAlignConcurrent();
 #if defined(_WIN32)
+    TestQueryAlignMultiVolumeWindows();
     TestQueryAlignNonAsciiWindows();
 #endif
 }

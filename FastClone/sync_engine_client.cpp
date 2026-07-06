@@ -2443,8 +2443,11 @@ int RunClient(const CliOptions& options) {
             if (szEc) {
                 verifyOk = false;
             } else {
+                // Change 3d (fastcheck-redundant-syscall-elim, FR-23): reuse the verifySize just
+                // read above as the read-open expectedSize so the backend skips the redundant
+                // Windows FileSizeOnDisk query. The verify read bytes/decision are unchanged.
                 const uint64_t fid = clientDriver.openFile(
-                    st.tempPath.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+                    st.tempPath.string(), fc::io::OpKind::Read, /*unbuffered=*/true, verifySize);
                 if (fid == 0) {
                     verifyOk = false;
                 } else {
@@ -2555,8 +2558,10 @@ int RunClient(const CliOptions& options) {
         }
         // C7: read the old file sequentially through the unified driver instead of ReadWholeFile
         // (AC-01). Driver read-ahead overlaps disk IO with the rolling scan; no whole-file buffer.
+        // Change 3d (fastcheck-redundant-syscall-elim, FR-24): reuse oldLen (read above) as the
+        // read-open expectedSize so the backend skips the redundant Windows FileSizeOnDisk query.
         const uint64_t oldFileId =
-            clientDriver.openFile(abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+            clientDriver.openFile(abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, oldLen);
         if (oldFileId == 0) {
             res.ok = false;
             res.fallbackReason = "old_unreadable";

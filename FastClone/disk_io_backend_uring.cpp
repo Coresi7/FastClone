@@ -74,12 +74,15 @@ public:
         uf.mode = mode;
         uf.expectedSize = expectedSize;
         uf.align = QueryAlign(path);
-        // unbuffered-writes M4/FR-13/D-02: small-file whole-file downgrade kept for reads only
-        // (read opens pass expectedSize==0 -> stay buffered). Write opens with unbuffered intent
-        // stay unbuffered regardless of size; unaligned fragments fall back per-op in IssueOrInline.
+        // unbuffered-writes M4/FR-13/D-02: small-file whole-file downgrade kept for reads only.
+        // Write opens with unbuffered intent stay unbuffered regardless of size; unaligned fragments
+        // fall back per-op in IssueOrInline. Change 3 (fastcheck-redundant-syscall-elim §3.3.4/
+        // FR-25): the read direct-IO gate is decoupled from expectedSize so reads stay buffered even
+        // though callers began passing a positive expectedSize, preserving the current direct/
+        // buffered strategy and smallFileFallback count (reads were already buffered at expectedSize==0).
         const bool wantUnbuffered =
             unbuffered && !cfg_.forceBuffered &&
-            (mode == OpKind::Read ? expectedSize >= kSmallFileBufferedMax : true);
+            (mode == OpKind::Read ? false : true);
         if (unbuffered && !wantUnbuffered && mode == OpKind::Read) {
             counters_.smallFileFallback.fetch_add(1);
         }
