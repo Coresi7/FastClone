@@ -28,3 +28,17 @@ Win32/
 *.ipdb
 *.exe
 
+# Local CMake scratch build directories (verification builds, not for the repo)
+_bl_win32/
+_bl_x64/
+build_verify/
+
+# MSVC incremental-link / debug scratch
+Debug/
+*.idb
+
+# Local-only release build helper scripts (kept out of the repo)
+temp/buildWin.ps1
+temp/buildLinux.sh
+temp/buildMac.sh
+

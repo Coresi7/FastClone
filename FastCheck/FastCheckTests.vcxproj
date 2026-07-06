@@ -74,6 +74,15 @@
 
   <PropertyGroup Label="UserMacros" />
 
+  <!-- /MP: compile multiple .cpp in parallel within this project (uses all logical CPUs).
+       On HDD, if you see thrashing, cap it by switching this off and adding /MP4 to
+       AdditionalOptions instead. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
   <!-- Dedicated IntDir so shared .cpp objs never collide with FastCheck/FastClone IntDirs.
        Mirrors FastCheck.vcxproj; xxhash via vcpkg integrate (no machine-local paths). -->
   <PropertyGroup>
@@ -199,4 +208,14 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+
+  <!-- Run unit tests after build, relying solely on the test exe's exit code
+       (0 = all pass, 1 = failure). IgnoreStandardErrorWarningFormat=true stops MSBuild
+       scanning the test's stdout/stderr for "error" lines: the tests deliberately emit
+       "error : ..." diagnostics while exercising error paths, which would otherwise be
+       misclassified as build errors (MSB3077) even when the suite returns 0. -->
+  <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Message Text="Running FastCheck unit tests..." Importance="high" />
+    <Exec Command='"$(TargetPath)"' IgnoreStandardErrorWarningFormat="true" />
+  </Target>
 </Project>

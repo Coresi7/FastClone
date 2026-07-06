@@ -74,6 +74,15 @@
 
   <PropertyGroup Label="UserMacros" />
 
+  <!-- /MP: compile multiple .cpp in parallel within this project (uses all logical CPUs).
+       On HDD, if you see thrashing, cap it by switching this off and adding /MP4 to
+       AdditionalOptions instead. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
   <!-- Dedicated intermediate dir so the shared .cpp objs never collide with FastClone's
        or FastCloneTests' IntDir (mirrors FastCloneRouteProbe/FastCloneTests convention).
        xxhash headers/lib are resolved via vcpkg integrate (same as FastClone.vcxproj);
