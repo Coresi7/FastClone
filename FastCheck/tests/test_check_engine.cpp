@@ -999,6 +999,26 @@ void TestComputeFileHashViaDriverSmallReadFailures() {
     fs::remove_all(dir, ec);
 }
 
+// fastcheck-perf-tune Change 0 (AC-03/AC-04): the hash-worker pool cap policy. auto (--hash-workers 0)
+// pins the pool to the hardware thread count (no 4x-core overshoot); explicit --hash-workers N keeps
+// the historical max(N, 4*hardwareThreads) headroom.
+void TestResolveMaxHashWorkers() {
+    // auto mode (hashWorkers == 0): pinned to hardwareThreads for hw=1/2/8 (AC-03), incl. hw=1 boundary.
+    Expect(ResolveMaxHashWorkers(0, 1) == 1, "auto hash-workers pins to 1 core (AC-03)");
+    Expect(ResolveMaxHashWorkers(0, 2) == 2, "auto hash-workers pins to 2 cores (AC-03)");
+    Expect(ResolveMaxHashWorkers(0, 8) == 8, "auto hash-workers pins to 8 cores (AC-03)");
+    // auto never overshoots to 4x cores.
+    Expect(ResolveMaxHashWorkers(0, 20) == 20, "auto hash-workers pins to 20 cores, no 4x overshoot (AC-03)");
+
+    // Explicit --hash-workers N: keeps max(N, 4*hardwareThreads) headroom (AC-04).
+    Expect(ResolveMaxHashWorkers(1, 8) == 32, "explicit 1 -> max(1, 4*8)=32 (AC-04)");
+    Expect(ResolveMaxHashWorkers(4, 2) == 8, "explicit 4 -> max(4, 4*2)=8 (AC-04)");
+    Expect(ResolveMaxHashWorkers(100, 8) == 100, "explicit 100 -> max(100, 32)=100 (AC-04)");
+    // Explicit path on a single-core machine still keeps the 4x floor (boundary).
+    Expect(ResolveMaxHashWorkers(1, 1) == 4, "explicit 1 on 1 core -> max(1, 4*1)=4 (AC-04)");
+    Expect(ResolveMaxHashWorkers(2, 1) == 4, "explicit 2 on 1 core -> max(2, 4)=4 (AC-04)");
+}
+
 // V-09 (AC-10): local worker cap AIMD pure rule -- growing backlog + no read failures increases the
 // cap; a read-fail signal halves it.
 void TestLocalWorkerCapAimd() {
@@ -1367,6 +1387,7 @@ void RunCheckEngineTests() {
     TestComputeFileHashViaDriverSmallFileSingleRead();
     TestComputeFileHashViaDriverAlignedHash();
     TestComputeFileHashViaDriverSmallReadFailures();
+    TestResolveMaxHashWorkers();
     TestLocalWorkerCapAimd();
     TestNetWindowAimd();
 }

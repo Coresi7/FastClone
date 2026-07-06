@@ -159,6 +159,19 @@ std::size_t NextNetWindow(std::size_t currentWindow, double rttSampleUs, double 
     return currentWindow;
 }
 
+std::size_t ResolveMaxHashWorkers(std::size_t hashWorkers, std::size_t hardwareThreads) {
+    // auto (--hash-workers 0): pin the pool to the core count. The AIMD growth to 4x cores that
+    // helped IO-bound big-file workloads overshoots on small-file workloads -- 80 threads on 20
+    // cores thrash the NTFS/cache-manager kernel locks (CreateFileW serializes on the MFT lock) and
+    // starve the single DiskIoDriver scheduler thread, so per-file open+read latency rises faster
+    // than concurrency, netting WORSE throughput. Explicit --hash-workers keeps the 4x headroom
+    // (the user opted into tuning for a known IO-bound workload).
+    if (hashWorkers == 0) {
+        return hardwareThreads;
+    }
+    return std::max<std::size_t>(hashWorkers, static_cast<std::size_t>(4) * hardwareThreads);
+}
+
 EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                        const std::atomic<bool>& interrupted) {
     const auto startTime = std::chrono::steady_clock::now();
@@ -260,7 +273,9 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     // Two independent dynamic-concurrency dimensions (FR-12/FR-13/FR-14).
     const uint32_t hardwareThreads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
     const size_t initialWorkers = (o.hashWorkers == 0) ? hardwareThreads : o.hashWorkers;
-    const size_t maxWorkers = std::max<size_t>(initialWorkers, static_cast<size_t>(4) * hardwareThreads);
+    // Pool cap policy lives in ResolveMaxHashWorkers (pure, unit-tested): auto pins to hardwareThreads,
+    // explicit --hash-workers keeps the 4x-core headroom. Value is identical to the former inline form.
+    const size_t maxWorkers = ResolveMaxHashWorkers(o.hashWorkers, hardwareThreads);
     std::atomic<size_t> hashWorkerCap{initialWorkers};   // local hash dimension (--hash-workers)
     size_t hashWindow = o.checkers;                      // network window dimension (--checkers)
     constexpr size_t kNetWindowMin = 1;

@@ -34,6 +34,13 @@ std::size_t NextLocalWorkerCap(std::size_t currentCap, std::size_t maxCap, std::
 std::size_t NextNetWindow(std::size_t currentWindow, double rttSampleUs, double rttEwmaUs,
                           std::size_t windowMin, std::size_t windowMax);
 
+// Resolve the maximum hash-worker pool size from the requested --hash-workers value and the machine's
+// hardware thread count. auto (hashWorkers == 0) pins the pool to hardwareThreads so small-file
+// workloads do not thrash the NTFS/cache-manager kernel locks with 4x-core overshoot; an explicit
+// --hash-workers N keeps the historical 4x headroom (max(N, 4*hardwareThreads)) for IO-bound tuning.
+// Pure function so the cap policy is unit-testable without spinning up the worker pool (AC-03/AC-04).
+std::size_t ResolveMaxHashWorkers(std::size_t hashWorkers, std::size_t hardwareThreads);
+
 // Frame send/receive abstraction. send sends one frame; recv blocks reading one frame and throws on disconnect (engine uses this to decide partial + exit code 2).
 struct FrameChannel {
     std::function<void(const Frame&)> send;
