@@ -1815,6 +1815,9 @@ int RunClient(const CliOptions& options) {
             batch.reserve(kIoBatchPop);
             std::vector<IoWriteResult> results;
             results.reserve(kIoBatchPop);
+            // Change 2 (fastcheck-perf-tune, FR-09/FR-13): one per-worker directory cache, reused
+            // across batches so repeated writes into the same subtree skip the parent-dir syscalls.
+            PerWorkerDirCache dirCache;
             while (true) {
                 batch.clear();
                 {
@@ -1836,7 +1839,7 @@ int RunClient(const CliOptions& options) {
                     // shares one locus with read/write fairness + backpressure. Bytes and final
                     // size are identical to the former trunc+write path.
                     const fs::path abs = JoinRel(options.rootDir, t.relPath);
-                    EnsureParentDir(abs);
+                    EnsureParentDir(abs, dirCache);
                     const bool ok = driverWriteWholeFile(abs.string(), t.data);
                     if (ok) {
                         SetFileModifyTime(abs, t.mtimeNs);
@@ -1996,6 +1999,12 @@ int RunClient(const CliOptions& options) {
         return n;
     };
 
+    // Change 2 (fastcheck-perf-tune, FR-13): directory cache for the two EnsureParentDir call sites
+    // that run on the MAIN loop thread only -- tryStartTransfers (single-file download open) and
+    // processIncomingFrame (batch zero-byte finalize). Both run exclusively on this thread, so a
+    // single shared instance is thread-private (FR-14: no cross-worker sharing, no global lock).
+    PerWorkerDirCache mainThreadDirCache;
+
     auto tryStartTransfers = [&]() {
         auto totalActiveSlots = [&]() -> size_t {
             return activeDownloads.size() + activeBatchDownloads.size();
@@ -2110,7 +2119,7 @@ int RunClient(const CliOptions& options) {
                 }
                 regularQueue->pop_front();
                 const fs::path abs = JoinRel(options.rootDir, rel);
-                EnsureParentDir(abs);
+                EnsureParentDir(abs, mainThreadDirCache);
                 const uint64_t fileBytes =
                     (itMeta != remoteFiles.end()) ? itMeta->second.fileSize : 0;
                 DownloadState d;
@@ -2539,7 +2548,10 @@ int RunClient(const CliOptions& options) {
     // all copy ops to a temp file, and slice the miss ranges. Touches NO shared state -- it
     // only fills a DeltaPlanResult the main loop later applies. Pure plan inputs/outputs are
     // identical to the former synchronous path (FR-08 / NFR-05).
-    auto buildDeltaPlanOffloaded = [&](DeltaPlanTask&& task) -> DeltaPlanResult {
+    // Change 2 (fastcheck-perf-tune, FR-13): dirCache is the calling plan worker's per-worker
+    // directory cache, threaded in so the delta reconstruction temp-file open reuses it across the
+    // many files one worker rebuilds (thread-private; each deltaPlanWorker owns its own instance).
+    auto buildDeltaPlanOffloaded = [&](DeltaPlanTask&& task, PerWorkerDirCache& dirCache) -> DeltaPlanResult {
         DeltaPlanResult res;
         res.rel = task.rel;
         res.verifyHash = task.fileHash;
@@ -2575,7 +2587,7 @@ int RunClient(const CliOptions& options) {
         // closeFile truncates to expectedSize=fileSize (trimming any temp tail beyond the new file,
         // FR-14). copySubmitted/copyCompleted feed the plan worker's own copy-write gate below.
         //
-        EnsureParentDir(abs);
+        EnsureParentDir(abs, dirCache);
         const fs::path tmp = makeDeltaTempPath(abs);
         const uint64_t tempFileId = clientDriver.openFile(
             tmp.string(), fc::io::OpKind::Write, unbufferedWrites, task.sig.fileSize);
@@ -2945,7 +2957,7 @@ int RunClient(const CliOptions& options) {
                 entry.shouldWrite = entry.serverOk;
                 if (entry.serverOk && entry.fileSize == 0) {
                     const fs::path abs = JoinRel(options.rootDir, entry.relPath);
-                    EnsureParentDir(abs);
+                    EnsureParentDir(abs, mainThreadDirCache);
                     std::ofstream out(abs, std::ios::binary | std::ios::trunc);
                     entry.shouldWrite = out.good();
                 }
@@ -3503,6 +3515,9 @@ int RunClient(const CliOptions& options) {
     deltaPlanWorkers.reserve(workerCount);
     for (uint32_t i = 0; i < workerCount; ++i) {
         deltaPlanWorkers.emplace_back([&]() {
+            // Change 2 (fastcheck-perf-tune, FR-09/FR-13/FR-14): each plan worker owns its own
+            // directory cache, reused across every file it reconstructs; never shared across workers.
+            PerWorkerDirCache dirCache;
             while (true) {
                 DeltaPlanTask task;
                 {
@@ -3516,7 +3531,7 @@ int RunClient(const CliOptions& options) {
                     task = std::move(deltaPlanTaskQueue.front());
                     deltaPlanTaskQueue.pop_front();
                 }
-                DeltaPlanResult res = buildDeltaPlanOffloaded(std::move(task));
+                DeltaPlanResult res = buildDeltaPlanOffloaded(std::move(task), dirCache);
                 {
                     std::lock_guard<std::mutex> lock(deltaPlanResultMu);
                     deltaPlanResults.push_back(std::move(res));

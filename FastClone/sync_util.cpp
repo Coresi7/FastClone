@@ -269,6 +269,121 @@ void EnsureParentDir(const fs::path& filePath) {
 #endif
 }
 
+namespace {
+// True when dir currently exists as a directory. Used only on the EnsureParentDir cache MISS path
+// (never on a hit), so it does not add syscalls to the fast path.
+bool DirExists(const fs::path& dir) {
+#ifdef _WIN32
+    const DWORD attrs = GetFileAttributesW(dir.wstring().c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    std::error_code ec;
+    return fs::is_directory(dir, ec);
+#endif
+}
+}  // namespace
+
+std::optional<fs::path> PerWorkerDirCache::ParentDirOf(const fs::path& filePath) {
+#ifdef _WIN32
+    // Byte-for-byte the same parent computation as EnsureParentDir(filePath): strip trailing
+    // separators, take everything before the last separator. sep==0 / npos means no real parent.
+    std::wstring full = filePath.wstring();
+    while (!full.empty() && (full.back() == L'\\' || full.back() == L'/')) {
+        full.pop_back();
+    }
+    const size_t sep = full.find_last_of(L"\\/");
+    if (sep == std::wstring::npos || sep == 0) {
+        return std::nullopt;
+    }
+    return fs::path(full.substr(0, sep));
+#else
+    const fs::path parent = filePath.parent_path();
+    if (parent.empty()) {
+        return std::nullopt;
+    }
+    return parent;
+#endif
+}
+
+PerWorkerDirCache::Key PerWorkerDirCache::KeyOf(const fs::path& dir) {
+#ifdef _WIN32
+    std::wstring w = dir.wstring();
+    while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) {
+        w.pop_back();
+    }
+    return w;
+#else
+    std::string s = dir.string();
+    while (s.size() > 1 && s.back() == '/') {
+        s.pop_back();
+    }
+    return s;
+#endif
+}
+
+bool PerWorkerDirCache::contains(const fs::path& dir) const {
+    return known_.find(KeyOf(dir)) != known_.end();
+}
+
+void PerWorkerDirCache::addWithAncestors(const fs::path& dir) {
+#ifdef _WIN32
+    // Reuse CreateDirectoriesLong's volume-root/segment logic so every ancestor key is identical to
+    // what a later contains() query for a sibling/descendant path would produce.
+    std::wstring w = dir.wstring();
+    while (!w.empty() && (w.back() == L'\\' || w.back() == L'/')) {
+        w.pop_back();
+    }
+    if (w.empty()) {
+        return;
+    }
+    size_t start = 0;
+    auto afterShare = [&](size_t from) -> size_t {
+        const size_t server = w.find(L'\\', from);
+        if (server == std::wstring::npos) {
+            return w.size();
+        }
+        const size_t share = w.find(L'\\', server + 1);
+        return (share == std::wstring::npos) ? w.size() : share + 1;
+    };
+    if (w.compare(0, 8, L"\\\\?\\UNC\\") == 0) {
+        start = afterShare(8);
+    } else if (w.compare(0, 4, L"\\\\?\\") == 0) {
+        start = (w.size() >= 7) ? 7 : w.size();
+    } else if (w.size() >= 3 && w[1] == L':') {
+        start = 3;
+    } else if (w.size() >= 2 && w[0] == L'\\' && w[1] == L'\\') {
+        start = afterShare(2);
+    }
+    for (size_t i = start; i < w.size(); ++i) {
+        if (w[i] == L'\\') {
+            known_.insert(w.substr(0, i));
+        }
+    }
+    known_.insert(w);
+#else
+    fs::path cur = dir;
+    while (!cur.empty()) {
+        const std::string key = KeyOf(cur);
+        if (key.empty()) {
+            break;
+        }
+        known_.insert(key);
+        const fs::path parent = cur.parent_path();
+        if (parent == cur) {
+            break;  // reached the filesystem root
+        }
+        cur = parent;
+    }
+#endif
+}
+
+void EnsureParentDir(const fs::path& filePath, PerWorkerDirCache& cache) {
+    EnsureParentDirCached(filePath, cache, [](const fs::path& parent) -> bool {
+        CreateDirectoriesLong(parent);
+        return DirExists(parent);
+    });
+}
+
 std::optional<fs::path> CurrentExePath() {
 #ifdef _WIN32
     wchar_t pathBuf[MAX_PATH];
