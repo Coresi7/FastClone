@@ -20,6 +20,16 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace fc;
 using namespace fc::check;
@@ -1120,6 +1130,103 @@ void TestStrictMixed() {
     fs::remove_all(dir, ec);
 }
 
+// V-03 (AC-04): strict worker classifies a local DIRECTORY that shadows a manifest FILE as Missing.
+// fs::file_size on a directory returns an error_code, so the worker must conclude Missing without
+// hashing and without marking the run partial (edge case: directory / special file -> Missing).
+void TestStrictDirIsMissing() {
+    const fs::path dir = MakeTempDir();
+    fs::create_directories(dir / "d.txt");  // local directory named like the manifest file
+    Hash256 wrong{};
+    wrong[0] = 0x66;  // arbitrary remote hash; must be ignored for a Missing file
+
+    MockChannel mock;
+    mock.inbound.push_back(ManifestEntryFrame("d.txt", 10));
+    mock.inbound.push_back(ManifestEndFrame());
+    mock.inbound.push_back(HashResponseFrame("d.txt", wrong));
+
+    CheckOptions o = BaseOptions(dir, Mode::Strict);
+    FrameChannel ch = mock.Make();
+    std::atomic<bool> interrupted{false};
+    const EngineOutcome outcome = RunCheck(o, ch, interrupted);
+
+    Expect(outcome.result.counters.missing == 1, "strict dir-as-file missing=1 (AC-04)");
+    Expect(!outcome.result.partial, "strict dir-as-file must NOT be partial (AC-04)");
+    Expect(outcome.exit == kDiffFound, "missing present -> exit 1");
+    const DiffEntry* m = FindEntry(outcome.result, "d.txt");
+    Expect(m != nullptr, "d.txt MISSING entry present");
+    Expect(!m->localSize.has_value(), "dir-as-file MISSING localSize null (AC-04)");
+    Expect(!m->hashCompared, "dir-as-file MISSING hash_compared=false (AC-04)");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// V-04 (AC-06): strict size-diff where the LOCAL file is LARGER than the manifest size. The worker
+// concludes Diff without hashing; localSize/remoteSize reflect the two sizes, hashCompared=false.
+void TestStrictSizeDiffLocalGreater() {
+    const fs::path dir = MakeTempDir();
+    WriteFile(dir / "big.txt", "1234567890");  // 10 bytes local; manifest says 4 -> local > remote
+    Hash256 wrong{};
+    wrong[0] = 0x77;
+
+    MockChannel mock;
+    mock.inbound.push_back(ManifestEntryFrame("big.txt", 4));
+    mock.inbound.push_back(ManifestEndFrame());
+    mock.inbound.push_back(HashResponseFrame("big.txt", wrong));
+
+    CheckOptions o = BaseOptions(dir, Mode::Strict);
+    FrameChannel ch = mock.Make();
+    std::atomic<bool> interrupted{false};
+    const EngineOutcome outcome = RunCheck(o, ch, interrupted);
+
+    Expect(outcome.result.counters.diff == 1, "strict local>remote size-diff diff=1 (AC-06)");
+    const DiffEntry* d = FindEntry(outcome.result, "big.txt");
+    Expect(d != nullptr, "big.txt DIFF entry present");
+    Expect(d->localSize.has_value() && *d->localSize == 10, "DIFF localSize=10 (AC-06)");
+    Expect(d->remoteSize.has_value() && *d->remoteSize == 4, "DIFF remoteSize=4 (AC-06)");
+    Expect(!d->hashCompared, "local>remote size-diff hash_compared=false (AC-06)");
+    Expect(outcome.exit == kDiffFound, "diff present -> exit 1");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+#if defined(_WIN32)
+// V-01T (AC-09): TOCTOU. The strict worker's fs::file_size succeeds (size == manifest -> hashOne),
+// but the driver read open then fails because the file is held with an exclusive (no-share) handle,
+// so hashOne throws -> LocalResult::Failed -> localReadFailed -> partial + kLocalPrecondFailed.
+void TestStrictToctouFailed() {
+    const fs::path dir = MakeTempDir();
+    const fs::path f = dir / "locked.txt";
+    WriteFile(f, "hello");                     // 5 bytes; manifest 5 -> size-equal -> hashOne
+    const Hash256 h = ComputeFileHash(f);      // compute the hash BEFORE taking the exclusive lock
+
+    // No-share handle: fs::file_size (GetFileAttributesExW, a directory-metadata query) still
+    // succeeds, but the driver's CreateFileW(..., FILE_SHARE_READ, ...) read open hits a sharing
+    // violation and returns 0 -> ComputeFileHashViaDriver throws -> hashOne -> Failed.
+    HANDLE lock = CreateFileW(f.wstring().c_str(), GENERIC_READ, /*dwShareMode=*/0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Expect(lock != INVALID_HANDLE_VALUE, "toctou: exclusive lock handle opened");
+
+    MockChannel mock;
+    mock.inbound.push_back(ManifestEntryFrame("locked.txt", 5));
+    mock.inbound.push_back(ManifestEndFrame());
+    mock.inbound.push_back(HashResponseFrame("locked.txt", h));
+
+    CheckOptions o = BaseOptions(dir, Mode::Strict);
+    FrameChannel ch = mock.Make();
+    std::atomic<bool> interrupted{false};
+    const EngineOutcome outcome = RunCheck(o, ch, interrupted);
+    CloseHandle(lock);
+
+    Expect(outcome.result.partial, "toctou: local read failure -> partial (AC-09)");
+    Expect(outcome.exit == kLocalPrecondFailed, "toctou: exit=kLocalPrecondFailed (AC-09)");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+#endif
+
 }  // namespace
 
 void RunCheckEngineTests() {
@@ -1127,6 +1234,11 @@ void RunCheckEngineTests() {
     TestStrictHashSameAndDiff();
     TestStrictMissingViaWorker();
     TestStrictSizeDiffViaWorker();
+    TestStrictSizeDiffLocalGreater();
+    TestStrictDirIsMissing();
+#if defined(_WIN32)
+    TestStrictToctouFailed();
+#endif
     TestStrictOrderingMissingDiff();
     TestStrictNoDiskioMissingSizeDiff();
     TestStrictMixed();

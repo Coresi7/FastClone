@@ -87,10 +87,17 @@ public:
     // Runtime alignment for the volume hosting `path` (metadata query, not driver IO).
     virtual AlignInfo queryAlign(const std::string& path) = 0;
 
-    // Open a file for read or write. `expectedSize` (write path) lets the backend set the final
-    // size exactly when using an unbuffered/truncate tail strategy. Returns 0 on failure else a
-    // nonzero file id. `unbuffered` is a hint; the backend may silently fall back to buffered
-    // (small files, unsupported FS, O_DIRECT EINVAL) without changing observable results.
+    // Open a file for read or write.
+    //   Write mode: `expectedSize` lets the backend set the final size exactly when using an
+    //               unbuffered/truncate tail strategy (final SetEndOfFile/ftruncate size).
+    //   Read mode : a positive `expectedSize` is the caller's already-known read size/bound; it
+    //               lets the backend skip a redundant file-size query (Windows FileSizeOnDisk) and
+    //               serve as both the read-policy size and the tail (EOF) bound. `expectedSize == 0`
+    //               means "unknown size" / legacy behaviour (Windows queries FileSizeOnDisk, 0 stays
+    //               the unknown/failure sentinel and drives small-file buffered fallback + tail
+    //               clamp). POSIX/uring reads stay buffered regardless (see those backends).
+    // Returns 0 on failure else a nonzero file id. `unbuffered` is a hint; the backend may silently
+    // fall back to buffered (small files, unsupported FS, O_DIRECT EINVAL) without changing results.
     virtual uint64_t openFile(const std::string& path, OpKind mode, bool unbuffered,
                               uint64_t expectedSize) = 0;
     virtual void closeFile(uint64_t fileId) = 0;

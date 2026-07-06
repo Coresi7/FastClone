@@ -70,12 +70,15 @@ public:
         pf.align = QueryAlign(path);
 
         // unbuffered-writes M4/FR-13/D-02: keep the small-file (< kSmallFileBufferedMax) whole-file
-        // downgrade ONLY for reads (read opens pass expectedSize==0 so they stay buffered, zero
-        // regression). Write opens with unbuffered intent stay unbuffered regardless of size;
-        // sub-granularity / unaligned fragments already fall back per-op in DoPwrite (D-03).
+        // downgrade ONLY for reads. Write opens with unbuffered intent stay unbuffered regardless of
+        // size; sub-granularity / unaligned fragments already fall back per-op in DoPwrite (D-03).
+        // Change 3 (fastcheck-redundant-syscall-elim §3.3.4/FR-25): the read direct-IO gate is now
+        // decoupled from expectedSize so reads stay buffered even though callers began passing a
+        // positive expectedSize. This preserves the current direct/buffered strategy and the
+        // smallFileFallback count (reads were already always buffered when expectedSize==0).
         const bool wantUnbuffered =
             unbuffered && !cfg_.forceBuffered &&
-            (mode == OpKind::Read ? expectedSize >= kSmallFileBufferedMax : true);
+            (mode == OpKind::Read ? false : true);
         if (unbuffered && !wantUnbuffered && mode == OpKind::Read) {
             counters_.smallFileFallback.fetch_add(1);  // read small-file downgrade (FR-11)
         }

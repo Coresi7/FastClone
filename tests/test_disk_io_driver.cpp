@@ -769,6 +769,84 @@ void TestRealBackend() {
     RealBackendRoundTrip((2u << 20) + 12345, 14);  // 2 MiB + unaligned EOF tail (FR-11 tail)
 }
 
+// Read the whole file through the driver and return the bytes (helper for the read-open size test).
+std::vector<uint8_t> ReadAllViaDriver(DiskIoDriver& drv, const std::string& path, uint64_t size,
+                                      uint32_t chunkBytes, uint64_t expectedSize) {
+    // Change 3 (fastcheck-redundant-syscall-elim): a read open passes `expectedSize` = the caller's
+    // already-known read size (>0) so the Windows backend skips FileSizeOnDisk, or 0 to force the
+    // legacy FileSizeOnDisk query path.
+    const uint64_t rf = drv.openFile(path, OpKind::Read, /*unbuffered=*/true, expectedSize);
+    Require(rf != 0, "known-size read: open read");
+    SequentialReader reader(drv, rf, size, chunkBytes, 4);
+    std::vector<uint8_t> got;
+    for (;;) {
+        std::vector<uint8_t> chunk;
+        bool ok = true;
+        const uint32_t n = reader.next(chunk, ok);
+        Require(ok, "known-size read: sequential read error");
+        if (n == 0) break;
+        got.insert(got.end(), chunk.begin(), chunk.end());
+    }
+    drv.closeFile(rf);
+    return got;
+}
+
+// V-13c/V-14 (AC-24/AC-25): a read open with a positive expectedSize (known size, Windows skips
+// FileSizeOnDisk) returns byte-identical content to the same file read with expectedSize==0 (unknown
+// size, legacy FileSizeOnDisk path), across a <1 MiB buffered file and a >=1 MiB unbuffered file.
+void RealBackendReadKnownSize() {
+    namespace fs = std::filesystem;
+    for (uint64_t size : {uint64_t(300000), uint64_t((2u << 20) + 777)}) {
+        const fs::path tmp = fs::temp_directory_path() /
+                             ("fc_io_knownsz_" + std::to_string(size) + ".bin");
+        const std::string path = tmp.string();
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 71u);
+
+        IoDriverConfig cfg;
+        cfg.maxInFlight = 8;
+        cfg.chunkBytes = 1u << 20;
+        {
+            DiskIoDriver drv(cfg);
+            const uint64_t wf = drv.openFile(path, OpKind::Write, true, size);
+            Require(wf != 0, "known-size read: open write");
+            std::vector<IoRequest> batch;
+            for (uint64_t off = 0; off < size; off += cfg.chunkBytes) {
+                IoRequest r;
+                r.kind = OpKind::Write;
+                r.fileId = wf;
+                r.offset = off;
+                const uint64_t n = std::min<uint64_t>(cfg.chunkBytes, size - off);
+                r.data.assign(payload.begin() + static_cast<std::ptrdiff_t>(off),
+                              payload.begin() + static_cast<std::ptrdiff_t>(off + n));
+                r.length = static_cast<uint32_t>(n);
+                batch.push_back(std::move(r));
+            }
+            const size_t count = batch.size();
+            while (!batch.empty()) {
+                if (drv.submit(batch) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::vector<IoCompletion> comps;
+            Require(DrainUntil(drv, count, comps, 15000) == count, "known-size read: write comps");
+            drv.closeFile(wf);
+        }
+        Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == size, "known-size read: on-disk size");
+
+        DiskIoDriver drvKnown(cfg);
+        const std::vector<uint8_t> gotKnown =
+            ReadAllViaDriver(drvKnown, path, size, cfg.chunkBytes, /*expectedSize=*/size);
+        DiskIoDriver drvUnknown(cfg);
+        const std::vector<uint8_t> gotUnknown =
+            ReadAllViaDriver(drvUnknown, path, size, cfg.chunkBytes, /*expectedSize=*/0);
+
+        Require(gotKnown == payload, "known-size read (expectedSize>0) bytes match payload (AC-24)");
+        Require(gotUnknown == payload, "unknown-size read (expectedSize==0) bytes match payload (AC-25)");
+        Require(gotKnown == gotUnknown, "known vs unknown expectedSize read bytes identical (AC-24/25)");
+        fs::remove(tmp, ec);
+    }
+}
+
 // unbuffered-writes real-backend round-trip that exercises small-file write sizes AND unaligned
 // MIDDLE fragments (delta copy/range shape). Verifies byte-exactness and the D-02/D-03 counters.
 void RealBackendSmallSizes() {
@@ -1088,6 +1166,7 @@ void RunDiskIoDriverTests() {
     TestSequentialReaderEarlyEof();
     TestSequentialReaderCleanEof();
     TestRealBackend();
+    RealBackendReadKnownSize();
     RealBackendSmallSizes();
     TestUnbufferedRandomWriteNoPollution();
     TestUnbufferedOffAndReadGate();

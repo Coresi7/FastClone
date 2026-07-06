@@ -28,7 +28,9 @@ struct CheckOptions {
     std::string target;         // local directory, required (FR-04)
     std::string password;       // required (FR-04)
     Mode mode = Mode::Fast;
-    uint32_t checkers = 8;      // --checkers: in-flight HashRequest cap within a single connection, positive integer (FR-06)
+    uint32_t checkers = 32;     // --checkers: initial in-flight HashRequest network window (dynamically AIMD-tuned), positive integer (fastcheck-parallel-hash FR-11)
+    uint32_t hashWorkers = 0;   // --hash-workers: initial local-hash worker count; 0=auto (hardware_concurrency), positive=fixed initial (fastcheck-parallel-hash FR-10)
+    bool noDiskioDriver = false;  // --no-diskio-driver: keep the parallel hash pipeline but read local files without the DiskIoDriver (fastcheck-parallel-hash FR-16)
     std::string output;         // empty=terminal only (FR-08)
     Format format = Format::Text;
     bool summaryOnly = false;   // FR-09

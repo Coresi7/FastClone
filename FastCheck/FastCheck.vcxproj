@@ -170,6 +170,10 @@
     <ClInclude Include="..\FastClone\protocol.h" />
     <ClInclude Include="..\FastClone\protocol_codec.h" />
     <ClInclude Include="..\FastClone\win_socket.h" />
+    <ClInclude Include="..\FastClone\disk_io_align.h" />
+    <ClInclude Include="..\FastClone\disk_io_backend.h" />
+    <ClInclude Include="..\FastClone\disk_io_backend_pool.h" />
+    <ClInclude Include="..\FastClone\disk_io_driver.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="check_main.cpp" />
@@ -182,6 +186,12 @@
     <ClCompile Include="..\FastClone\protocol.cpp" />
     <ClCompile Include="..\FastClone\protocol_codec.cpp" />
     <ClCompile Include="..\FastClone\win_socket.cpp" />
+    <!-- disk_io five-piece set (mirrors CMake FASTCLONE_DISK_IO_SOURCES). posix/uring are platform-guarded -> empty TU on Windows. -->
+    <ClCompile Include="..\FastClone\disk_io_align.cpp" />
+    <ClCompile Include="..\FastClone\disk_io_driver.cpp" />
+    <ClCompile Include="..\FastClone\disk_io_backend_win.cpp" />
+    <ClCompile Include="..\FastClone\disk_io_backend_posix.cpp" />
+    <ClCompile Include="..\FastClone\disk_io_backend_uring.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

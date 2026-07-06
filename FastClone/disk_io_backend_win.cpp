@@ -82,8 +82,19 @@ public:
         wf.expectedSize = expectedSize;
         wf.align = QueryAlign(path);
 
+        // Change 3 (fastcheck-redundant-syscall-elim, FR-15/FR-16): on the read path, a positive
+        // expectedSize is the caller's already-known read size/bound, so use it directly and skip
+        // the redundant FileSizeOnDisk (GetFileAttributesExW) metadata syscall. expectedSize==0
+        // keeps the old behaviour (query FileSizeOnDisk; 0 stays the unknown/failure sentinel and
+        // still drives the small-file buffered fallback + tail clamp). Write mode is unchanged:
+        // expectedSize remains the final SetEndOfFile size (FR-17).
         const bool sizeKnown = (mode == OpKind::Read) || expectedSize > 0;
-        const uint64_t sizeForPolicy = (mode == OpKind::Read) ? FileSizeOnDisk(wf.wpath) : expectedSize;
+        uint64_t sizeForPolicy;
+        if (mode == OpKind::Read) {
+            sizeForPolicy = (expectedSize > 0) ? expectedSize : FileSizeOnDisk(wf.wpath);
+        } else {
+            sizeForPolicy = expectedSize;
+        }
         wf.fileSize = (mode == OpKind::Read) ? sizeForPolicy : 0;
         // unbuffered-writes M4/FR-13/D-02: the small-file (< kSmallFileBufferedMax) whole-file
         // downgrade is kept ONLY for the read path (no dirty-page concern, zero regression). Write

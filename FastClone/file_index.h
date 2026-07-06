@@ -37,6 +37,21 @@ Hash256 ComputeFileHash(const std::filesystem::path& path);
 // FR-01). Throws std::runtime_error on any open/read failure, matching ComputeFileHash's failure
 // contract so callers can keep their existing try/catch handling.
 Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const std::filesystem::path& path);
+// Diagnostics: cumulative per-phase wall-clock time spent inside ComputeFileHashViaDriver
+// (microseconds, relaxed atomics). Only meaningful in a process that actually calls the function
+// (FastCheck client / FastClone server). Intended for the FastCheck progress line to locate where
+// the per-file hash time goes (file_size query / openFile / read / XXH3 / closeFile). Zero cost on
+// callers that never read it; the atomic adds inside the hot path are ~nanoseconds.
+struct HashPhaseTimings {
+    uint64_t count = 0;       // number of ComputeFileHashViaDriver calls
+    uint64_t totalUs = 0;     // whole-function wall time
+    uint64_t fileSizeUs = 0;  // fs::file_size query
+    uint64_t openUs = 0;      // driver.openFile
+    uint64_t readUs = 0;      // submit+wait+drain (fast path) or SequentialReader loop (slow path)
+    uint64_t xxhUs = 0;       // ComputeBufferHash / ComputeHashFromSource
+    uint64_t closeUs = 0;     // driver.closeFile
+};
+HashPhaseTimings GetHashPhaseTimings();
 // Same XXH3-128 digest + raw byte layout as ComputeFileHash, but over an in-memory buffer.
 // Lets callers that already hold the file bytes (e.g. the delta block-signature path) avoid a
 // second full-file read while producing a value the client's ComputeFileHash verify matches.

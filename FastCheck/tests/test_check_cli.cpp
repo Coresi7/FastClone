@@ -46,7 +46,9 @@ void TestDefaults() {
     Expect(o.port == 27842, "default port 27842");
     Expect(o.mode == Mode::Fast, "default mode fast (AC-05)");
     Expect(o.format == Format::Text, "default format text (AC-09)");
-    Expect(o.checkers == 8, "default checkers 8");
+    Expect(o.checkers == 32, "default checkers 32 (AC-09)");
+    Expect(o.hashWorkers == 0, "default hash-workers 0 (auto)");
+    Expect(!o.noDiskioDriver, "default no-diskio-driver false");
     Expect(!o.summaryOnly, "default summary-only false");
     Expect(o.filter.diff && o.filter.missing && o.filter.extra && !o.filter.same,
            "default filter DIFF,MISSING,EXTRA (FR-10)");
@@ -87,6 +89,43 @@ void TestCheckersValidation() {
            "--checkers 0 rejected (AC-07)");
     Expect(ParseThrows({"--server", "h", "--target", t, "--password", "p", "--checkers", "abc"}),
            "--checkers abc rejected (AC-07)");
+}
+
+void TestHashWorkersValidation() {
+    const std::string t = "t";
+    // 0 = auto, accepted (AC-08).
+    CheckOptions o = ParseCheckArgs({"--server", "h", "--target", t, "--password", "p", "--hash-workers", "0"});
+    Expect(o.hashWorkers == 0, "--hash-workers 0 accepted -> auto (AC-08)");
+    // Positive accepted.
+    o = ParseCheckArgs({"--server", "h", "--target", t, "--password", "p", "--hash-workers", "4"});
+    Expect(o.hashWorkers == 4, "--hash-workers 4 accepted");
+    // Non-integer rejected before connecting (AC-08).
+    Expect(ParseThrows({"--server", "h", "--target", t, "--password", "p", "--hash-workers", "abc"}),
+           "--hash-workers abc rejected (AC-08)");
+    // Negative rejected (AC-08).
+    Expect(ParseThrows({"--server", "h", "--target", t, "--password", "p", "--hash-workers", "-1"}),
+           "--hash-workers -1 rejected (AC-08)");
+    // Missing value rejected (AC-08).
+    Expect(ParseThrows({"--server", "h", "--target", t, "--password", "p", "--hash-workers"}),
+           "--hash-workers missing value rejected (AC-08)");
+}
+
+void TestNoDiskioDriverFlag() {
+    const std::string t = "t";
+    const CheckOptions o =
+        ParseCheckArgs({"--server", "h", "--target", t, "--password", "p", "--no-diskio-driver"});
+    Expect(o.noDiskioDriver, "--no-diskio-driver sets flag");
+}
+
+void TestUsageMentionsNewOptions() {
+    std::ostringstream captured;
+    std::streambuf* old = std::cerr.rdbuf(captured.rdbuf());
+    PrintUsage();
+    std::cerr.rdbuf(old);
+    const std::string usage = captured.str();
+    Expect(usage.find("default 32") != std::string::npos, "usage shows --checkers default 32 (AC-09)");
+    Expect(usage.find("--hash-workers") != std::string::npos, "usage mentions --hash-workers");
+    Expect(usage.find("--no-diskio-driver") != std::string::npos, "usage mentions --no-diskio-driver");
 }
 
 void TestStreamsRejected() {
@@ -163,6 +202,9 @@ void RunCheckCliTests() {
     TestModeValidation();
     TestFormatValidation();
     TestCheckersValidation();
+    TestHashWorkersValidation();
+    TestNoDiskioDriverFlag();
+    TestUsageMentionsNewOptions();
     TestStreamsRejected();
     TestFilterParsing();
     TestServerPort();

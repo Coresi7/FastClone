@@ -127,23 +127,6 @@ if(WIN32)
 endif()
 add_test(NAME FastCloneTests COMMAND FastCloneTests)
 
-# Optional io_uring (Linux only). When liburing is present the io_uring backend compiles and links
-# against it; when absent, disk_io_backend_uring.cpp's __has_include guard leaves only the bounded
-# pread/pwrite pool fallback (design §7.3). macOS/Windows never look for liburing.
-if(UNIX AND NOT APPLE)
-    find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
-    find_library(LIBURING_LIBRARY NAMES uring)
-    if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
-        foreach(tgt FastClone FastCloneTests)
-            target_include_directories(${tgt} PRIVATE ${LIBURING_INCLUDE_DIR})
-            target_link_libraries(${tgt} PRIVATE ${LIBURING_LIBRARY})
-        endforeach()
-        message(STATUS "FastClone: io_uring backend enabled (liburing found)")
-    else()
-        message(STATUS "FastClone: liburing not found; Linux disk IO uses the pread/pwrite pool")
-    endif()
-endif()
-
 install(TARGETS FastClone
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
@@ -170,10 +153,12 @@ if(WIN32)
 endif()
 
 # --- FastCheck: 只读目录比对独立工具（fastcheck；additive，不触碰 FastClone/FastCloneTests） ---
-# 依赖闭包：check 源 + 共享 compare_phase + file_index(ComputeFileHash,+xxhash) +
+# 依赖闭包：check 源 + 共享 compare_phase + file_index(ComputeFileHash/ComputeFileHashViaDriver,+xxhash) +
 # client_handshake/protocol/protocol_codec/win_socket。明确不链 sync_engine_client/server/shared、
-# delta、main、transfer_tuning、hash_memcache、net_topology、cli（FR-33/AC-42），也不链 disk_io
-# 五件套（file_index.ComputeFileHash 不依赖 disk_io，§8.2/FR-34）。
+# delta、main、transfer_tuning、hash_memcache、net_topology、cli（FR-33/AC-42）。
+# FastCheck 复用 DiskIoDriver + SequentialReader 执行并行本地哈希（ComputeFileHashViaDriver），
+# 因此链接统一 disk_io 五件套（${FASTCLONE_DISK_IO_SOURCES}）；file_index.cpp 依赖 disk_io，凡链它的
+# target 必须链 disk_io（fastcheck-parallel-hash M4/FR-03/D-07）。
 set(FASTCHECK_SHARED_SOURCES
     FastCheck/check_cli.cpp
     FastCheck/check_engine.cpp
@@ -184,6 +169,7 @@ set(FASTCHECK_SHARED_SOURCES
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
     FastClone/win_socket.cpp
+    ${FASTCLONE_DISK_IO_SOURCES}
 )
 
 # xxhash / Win 链接与 FastClone 复用同一解析结果，封装成函数避免在两个 target 上重复。
@@ -223,3 +209,22 @@ add_executable(FastCheckTests
 )
 fastcheck_configure_target(FastCheckTests)
 add_test(NAME FastCheckTests COMMAND FastCheckTests)
+
+# Optional io_uring (Linux only). When liburing is present the io_uring backend compiles and links
+# against it; when absent, disk_io_backend_uring.cpp's __has_include guard leaves only the bounded
+# pread/pwrite pool fallback (design §7.3). macOS/Windows never look for liburing. Placed after all
+# targets are defined so FastCheck/FastCheckTests (which now link the disk_io five-piece set) exist
+# when target_link_libraries runs (fastcheck-parallel-hash D-07).
+if(UNIX AND NOT APPLE)
+    find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+    find_library(LIBURING_LIBRARY NAMES uring)
+    if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+        foreach(tgt FastClone FastCloneTests FastCheck FastCheckTests)
+            target_include_directories(${tgt} PRIVATE ${LIBURING_INCLUDE_DIR})
+            target_link_libraries(${tgt} PRIVATE ${LIBURING_LIBRARY})
+        endforeach()
+        message(STATUS "FastClone: io_uring backend enabled (liburing found)")
+    else()
+        message(STATUS "FastClone: liburing not found; Linux disk IO uses the pread/pwrite pool")
+    endif()
+endif()

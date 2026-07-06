@@ -59,6 +59,16 @@ FILETIME ToFileTimeFromNs(int64_t unixNs) {
 // NFR-02/AC-14).
 constexpr uint32_t kHashChunkBytes = 1u << 20;
 constexpr uint32_t kHashReadAhead = 4;
+
+// Per-phase timing accumulators for ComputeFileHashViaDriver (diagnostics only, relaxed atomics).
+// Fetch-add on each call; negligible cost. Read via GetHashPhaseTimings() (FastCheck progress line).
+std::atomic<uint64_t> g_hashCount{0};
+std::atomic<uint64_t> g_hashTotalUs{0};
+std::atomic<uint64_t> g_hashFileSizeUs{0};
+std::atomic<uint64_t> g_hashOpenUs{0};
+std::atomic<uint64_t> g_hashReadUs{0};
+std::atomic<uint64_t> g_hashXxhUs{0};
+std::atomic<uint64_t> g_hashCloseUs{0};
 constexpr uint64_t kSmallFileDirectThreshold = 256u * 1024u;
 
 fs::file_time_type::duration FileToSystemEpochDelta() {
@@ -339,13 +349,30 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
     // Shared hash read path for FastCheck + server hash-miss:
     //  - <=256 KiB: one driver read request + ComputeBufferHash over real bytes
     //  - >256 KiB : existing SequentialReader streaming path
+    const auto fnStart = std::chrono::steady_clock::now();
+    g_hashCount.fetch_add(1, std::memory_order_relaxed);
+
+    const auto fsStart = std::chrono::steady_clock::now();
     std::error_code ec;
     const uint64_t fileSize = static_cast<uint64_t>(fs::file_size(path, ec));
+    const auto fsEnd = std::chrono::steady_clock::now();
+    g_hashFileSizeUs.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(fsEnd - fsStart).count()),
+        std::memory_order_relaxed);
     if (ec) {
         throw std::runtime_error("ComputeFileHashViaDriver: file_size failed");
     }
+
+    const auto openStart = std::chrono::steady_clock::now();
+    // Change 3a (fastcheck-redundant-syscall-elim, FR-19): reuse the file size we just read above as
+    // the read-open expectedSize so the backend skips the redundant Windows FileSizeOnDisk query.
+    // A 0-byte file passes fileSize==0 (unknown/legacy path), which is fine (early-returns below).
     const uint64_t fid =
-        driver.openFile(path.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+        driver.openFile(path.string(), fc::io::OpKind::Read, /*unbuffered=*/true, fileSize);
+    const auto openEnd = std::chrono::steady_clock::now();
+    g_hashOpenUs.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(openEnd - openStart).count()),
+        std::memory_order_relaxed);
     if (fid == 0) {
         throw std::runtime_error("ComputeFileHashViaDriver: open failed");
     }
@@ -353,14 +380,32 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
     struct FileCloser {
         fc::io::DiskIoDriver& driver;
         uint64_t fileId = 0;
-        ~FileCloser() { driver.closeFile(fileId); }
+        ~FileCloser() {
+            const auto c0 = std::chrono::steady_clock::now();
+            driver.closeFile(fileId);
+            const auto c1 = std::chrono::steady_clock::now();
+            g_hashCloseUs.fetch_add(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(c1 - c0).count()),
+                std::memory_order_relaxed);
+        }
     } closer{driver, fid};
 
+    Hash256 hash{};
     if (fileSize == 0) {
-        return ComputeBufferHash(nullptr, 0);
+        const auto xxhStart = std::chrono::steady_clock::now();
+        hash = ComputeBufferHash(nullptr, 0);
+        const auto xxhEnd = std::chrono::steady_clock::now();
+        g_hashXxhUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(xxhEnd - xxhStart).count()),
+            std::memory_order_relaxed);
+        g_hashTotalUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - fnStart).count()), std::memory_order_relaxed);
+        return hash;
     }
 
     if (fileSize <= kSmallFileDirectThreshold) {
+        const auto readStart = std::chrono::steady_clock::now();
         const fc::io::AlignInfo align = driver.queryAlign(path.string());
         if (align.ioGranularity == 0) {
             throw std::runtime_error("ComputeFileHashViaDriver: invalid io granularity");
@@ -392,6 +437,10 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
             driver.waitForFile(fid, 1000);
             driver.drainCompletionsForFile(fid, comps);
         }
+        const auto readEnd = std::chrono::steady_clock::now();
+        g_hashReadUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(readEnd - readStart).count()),
+            std::memory_order_relaxed);
         if (comps.size() != 1) {
             throw std::runtime_error("ComputeFileHashViaDriver: completion count mismatch");
         }
@@ -405,12 +454,22 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
         if (comp.transferred < fileSize || comp.data.size() < static_cast<size_t>(fileSize)) {
             throw std::runtime_error("ComputeFileHashViaDriver: short read");
         }
-        return ComputeBufferHash(comp.data.data(), static_cast<size_t>(fileSize));
+        const auto xxhStart = std::chrono::steady_clock::now();
+        hash = ComputeBufferHash(comp.data.data(), static_cast<size_t>(fileSize));
+        const auto xxhEnd = std::chrono::steady_clock::now();
+        g_hashXxhUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(xxhEnd - xxhStart).count()),
+            std::memory_order_relaxed);
+        g_hashTotalUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - fnStart).count()), std::memory_order_relaxed);
+        return hash;
     }
 
     bool readErr = false;
     std::vector<uint8_t> chunkBuf;
     size_t chunkPos = 0;
+    const auto readStart = std::chrono::steady_clock::now();
     fc::io::SequentialReader reader(driver, fid, fileSize, kHashChunkBytes, kHashReadAhead);
     auto source = [&](uint8_t* dst, size_t maxLen) -> size_t {
         size_t written = 0;
@@ -436,11 +495,34 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
         }
         return written;
     };
-    const Hash256 hash = ComputeHashFromSource(source);
+    const auto xxhStart = std::chrono::steady_clock::now();
+    hash = ComputeHashFromSource(source);
+    const auto xxhEnd = std::chrono::steady_clock::now();
+    // Slow path: ComputeHashFromSource interleaves reader.next (IO) and XXH3 update, so the read
+    // and hash time are folded here into g_hashReadUs (g_hashXxhUs left for the fast path). The
+    // slow path is the minority (>256 KiB); precise split is not worth a second timer here.
+    g_hashReadUs.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(xxhEnd - readStart).count()),
+        std::memory_order_relaxed);
     if (readErr) {
         throw std::runtime_error("ComputeFileHashViaDriver: read failed");
     }
+    g_hashTotalUs.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - fnStart).count()), std::memory_order_relaxed);
     return hash;
+}
+
+HashPhaseTimings GetHashPhaseTimings() {
+    HashPhaseTimings t;
+    t.count = g_hashCount.load(std::memory_order_relaxed);
+    t.totalUs = g_hashTotalUs.load(std::memory_order_relaxed);
+    t.fileSizeUs = g_hashFileSizeUs.load(std::memory_order_relaxed);
+    t.openUs = g_hashOpenUs.load(std::memory_order_relaxed);
+    t.readUs = g_hashReadUs.load(std::memory_order_relaxed);
+    t.xxhUs = g_hashXxhUs.load(std::memory_order_relaxed);
+    t.closeUs = g_hashCloseUs.load(std::memory_order_relaxed);
+    return t;
 }
 
 Hash256 ComputeBufferHash(const uint8_t* data, size_t len) {

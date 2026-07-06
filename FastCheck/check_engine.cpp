@@ -1,6 +1,7 @@
 #include "check_engine.h"
 
 #include "compare_phase.h"
+#include "disk_io_driver.h"
 #include "file_index.h"
 #include "protocol_codec.h"
 
@@ -8,14 +9,21 @@
 #include <Windows.h>
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -120,6 +128,37 @@ std::optional<FileEntry> ProbeLocal(const fs::path& root, const std::string& rel
 
 }  // namespace
 
+std::size_t NextLocalWorkerCap(std::size_t currentCap, std::size_t maxCap, std::size_t taskQueueLen,
+                               std::size_t localInFlight, std::uint64_t readFailDelta) {
+    if (readFailDelta > 0) {
+        // Multiplicative decrease on read/driver failures (halve, floor 1).
+        return std::max<std::size_t>(1, currentCap / 2);
+    }
+    // Additive increase: backlog present, all active workers busy, headroom below max.
+    if (taskQueueLen > 0 && localInFlight >= currentCap && currentCap < maxCap) {
+        return currentCap + 1;
+    }
+    return currentCap;
+}
+
+std::size_t NextNetWindow(std::size_t currentWindow, double rttSampleUs, double rttEwmaUs,
+                          std::size_t windowMin, std::size_t windowMax) {
+    constexpr double kStableFactor = 1.25;
+    constexpr double kSpikeFactor = 2.0;
+    constexpr double kDecreaseFactor = 0.6;
+    if (rttEwmaUs <= 0.0) {
+        return currentWindow;  // not enough samples to judge
+    }
+    if (rttSampleUs <= rttEwmaUs * kStableFactor) {
+        return std::min<std::size_t>(currentWindow + 1, windowMax);
+    }
+    if (rttSampleUs > rttEwmaUs * kSpikeFactor) {
+        const std::size_t decreased = static_cast<std::size_t>(currentWindow * kDecreaseFactor);
+        return std::max<std::size_t>(windowMin, decreased);
+    }
+    return currentWindow;
+}
+
 EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                        const std::atomic<bool>& interrupted) {
     const auto startTime = std::chrono::steady_clock::now();
@@ -129,6 +168,22 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     CheckResult result;
     result.mode = o.mode;
     fc::CompareCounters& counters = result.counters;
+
+    // Diagnostics-only accumulators (no behavior change): track how many files need hashing and
+    // how many bytes that represents, so the progress line can report avg file size + byte progress
+    // and we can tell whether the workload is small-file/IOPS-bound or bandwidth-bound.
+    uint64_t hashEnqueued = 0;
+    uint64_t hashBytesTotal = 0;
+    uint64_t hashBytesDone = 0;
+
+    // Worker per-phase wall-clock accumulators (microseconds, relaxed atomics). ProbeLocal = the
+    // stat syscall the strict-defer worker does; hashOne = the ComputeFileHash(ViaDriver) call.
+    // Together with GetHashPhaseTimings() (open/read/xxh/close inside the driver hash path) they
+    // locate where the per-file time goes. Read in the progress line via per-interval deltas.
+    std::atomic<uint64_t> probeUsSum{0};
+    std::atomic<uint64_t> probeCount{0};
+    std::atomic<uint64_t> hashOneUsSum{0};
+    std::atomic<uint64_t> hashOneCount{0};
 
     std::unordered_set<std::string> manifestPaths;
 
@@ -147,6 +202,219 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     bool localReadFailed = false;
     std::string errorText;
 
+    // --- Async local-hash pipeline (fastcheck-parallel-hash M5/M6/FR-05..FR-09). Mirrors the
+    // FastClone sync client worker pool (sync_engine_client.cpp:998-1041): a fixed thread pool reads
+    // and hashes local files off the recv loop; the main loop keeps receiving frames and pairs each
+    // HashResponse with its local hash whichever arrives first. ---
+
+    // Client-side unified disk IO driver (FR-04/FR-16). std::optional so --no-diskio-driver keeps the
+    // parallel pipeline but never constructs a real driver. Destroyed at RunCheck scope exit, after
+    // all workers are joined (AC-16).
+    std::optional<fc::io::DiskIoDriver> clientDriver;
+    std::string backendLabel;
+    if (!o.noDiskioDriver) {
+        clientDriver.emplace(fc::io::IoDriverConfig{});
+        backendLabel = clientDriver->backendName();
+        const fc::io::IoDriverConfig& cfg = clientDriver->config();
+        std::cerr << "[disk-io] backend=" << backendLabel
+                  << " maxInFlight=" << cfg.maxInFlight
+                  << " backendConcurrency=" << cfg.backendConcurrency
+                  << " chunkBytes=" << cfg.chunkBytes << std::endl;
+    } else {
+        backendLabel = "disabled(--no-diskio-driver)";
+        std::cerr << "[disk-io] backend=" << backendLabel << std::endl;
+    }
+
+    struct HashTask {
+        std::string rel;
+        fs::path abs;
+        bool deferredStat = false;   // strict=true: worker probes local existence/size before deciding to hash
+        FileEntry remote;            // strict: worker calls DecideCompare against this (unused for Fast)
+    };
+    std::mutex hashTaskMu;
+    std::condition_variable hashTaskCv;
+    std::deque<HashTask> hashTaskQueue;
+    std::atomic<bool> hashStop{false};
+    std::atomic<size_t> localHashInFlight{0};
+    std::atomic<uint64_t> readFailSignal{0};
+
+    // Worker conclusion for a file (replaces the old localHashes/localHashFailed pair). strict defers
+    // the existence/size probe to the worker, so a worker may conclude Missing/SizeDiff without hashing;
+    // Fast/SizeOnly workers only ever produce Hashed or Failed (local already probed on the recv path).
+    struct LocalResult {
+        enum class Kind { Hashed, Missing, SizeDiff, Failed };
+        Kind kind = Kind::Failed;
+        Hash256 hash{};                 // valid only for Hashed
+        std::optional<FileEntry> local; // strict: backfills local_size; Fast: nullopt (use awaiting.local)
+    };
+    std::mutex hashResultMu;
+    std::unordered_map<std::string, LocalResult> localResults;
+
+    std::mutex readyMu;
+    std::condition_variable readyCv;
+    std::deque<std::string> readyQueue;
+
+    // Server hash responses that arrived before the local hash was ready (pending, FR-07).
+    std::unordered_map<std::string, Hash256> serverHashReady;
+
+    // Two independent dynamic-concurrency dimensions (FR-12/FR-13/FR-14).
+    const uint32_t hardwareThreads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+    const size_t initialWorkers = (o.hashWorkers == 0) ? hardwareThreads : o.hashWorkers;
+    const size_t maxWorkers = std::max<size_t>(initialWorkers, static_cast<size_t>(4) * hardwareThreads);
+    std::atomic<size_t> hashWorkerCap{initialWorkers};   // local hash dimension (--hash-workers)
+    size_t hashWindow = o.checkers;                      // network window dimension (--checkers)
+    constexpr size_t kNetWindowMin = 1;
+    constexpr size_t kNetWindowMax = 256;
+    constexpr size_t kLocalBacklogFactor = 4;
+
+    // Fixed pool of maxWorkers threads; hashWorkerCap gates how many are active (park/unpark, no
+    // spawn/join churn, D-04). Worker myIndex >= cap parks until the cap grows or stop is signalled.
+    std::vector<std::thread> hashWorkers;
+    hashWorkers.reserve(maxWorkers);
+    for (size_t idx = 0; idx < maxWorkers; ++idx) {
+        hashWorkers.emplace_back([&, myIndex = idx]() {
+            while (true) {
+                HashTask task;
+                {
+                    std::unique_lock<std::mutex> lk(hashTaskMu);
+                    hashTaskCv.wait(lk, [&]() {
+                        return hashStop.load() ||
+                               (!hashTaskQueue.empty() && myIndex < hashWorkerCap.load());
+                    });
+                    if (hashTaskQueue.empty()) {
+                        // Only woken with an empty queue when stopping (predicate) -> exit.
+                        if (hashStop.load()) {
+                            return;
+                        }
+                        continue;  // spurious wakeup
+                    }
+                    task = std::move(hashTaskQueue.front());
+                    hashTaskQueue.pop_front();
+                }
+                localHashInFlight.fetch_add(1, std::memory_order_relaxed);
+                // HashOne: current try/catch moved verbatim into a closure, backfilling local for the
+                // result. Failed keeps the existing read-fail signal semantics (readFailSignal drives
+                // the local-worker AIMD MD; main-thread finalize maps Failed -> localReadFailed).
+                auto hashOne = [&](const std::optional<FileEntry>& localForResult) -> LocalResult {
+                    LocalResult lr;
+                    Hash256 hash{};
+                    bool hashFailed = false;
+                    const auto h0 = std::chrono::steady_clock::now();
+                    try {
+                        hash = o.noDiskioDriver ? ComputeFileHash(task.abs)
+                                                : ComputeFileHashViaDriver(*clientDriver, task.abs);
+                    } catch (...) {
+                        hashFailed = true;
+                    }
+                    const auto h1 = std::chrono::steady_clock::now();
+                    hashOneUsSum.fetch_add(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0).count()),
+                        std::memory_order_relaxed);
+                    hashOneCount.fetch_add(1, std::memory_order_relaxed);
+                    if (hashFailed) {
+                        lr.kind = LocalResult::Kind::Failed;
+                    } else {
+                        lr.kind = LocalResult::Kind::Hashed;
+                        lr.hash = hash;
+                        lr.local = localForResult;
+                    }
+                    return lr;
+                };
+                LocalResult r;
+                if (task.deferredStat) {
+                    // Change 1 (fastcheck-redundant-syscall-elim, FR-01..FR-04): strict decides the
+                    // local existence/size verdict here with a single std::filesystem metadata query
+                    // instead of ProbeLocal, removing the redundant GetFileAttributesExW+mtime probe
+                    // (M1/M2/NFR-02). This is behaviourally equivalent to DecideCompare(Strict,...):
+                    // no local -> Missing; size mismatch -> SizeDiff; size equal -> hashOne. strict
+                    // ignores mtime, so a minimal FileEntry (size only) suffices for record().
+                    // The metadata query here is deliberately NOT accounted into probe* (FR-08/M8),
+                    // so probeCount stays flat in strict steady state.
+                    //
+                    // NOTE (deviation from design §3.1.2 pseudocode, see 04-implementation.md): the
+                    // design assumed fs::file_size(path, ec) returns a non-empty ec for a directory /
+                    // special file so it maps to Missing (FR-02 / AC-04). On the MSVC STL that is NOT
+                    // the case: fs::file_size on a directory returns 0 with an EMPTY ec, which would
+                    // mis-classify a directory as SizeDiff and fail AC-04. To satisfy FR-02 + AC-04
+                    // portably while still using a SINGLE std::filesystem metadata query (FR-01
+                    // intent: one local metadata read, no ProbeLocal, no mtime), use directory_entry,
+                    // whose constructor performs exactly one cached attribute query that yields both
+                    // the type and the size. exists()/is_regular_file()/file_size() then read the
+                    // cache (no extra syscall). Not-found / directory / special / unreadable -> Missing.
+                    std::error_code ec;
+                    const fs::directory_entry entry(task.abs, ec);
+                    bool isRegular = false;
+                    uint64_t localSize = 0;
+                    if (!ec) {
+                        std::error_code tec;
+                        isRegular = entry.is_regular_file(tec) && !tec;
+                        if (isRegular) {
+                            std::error_code sec;
+                            localSize = static_cast<uint64_t>(entry.file_size(sec));
+                            if (sec) {
+                                isRegular = false;  // size unreadable -> Missing (FR-02)
+                            }
+                        }
+                    }
+                    if (!isRegular) {
+                        // FR-02/M3 + AC-04: not found / directory / special / unreadable -> Missing.
+                        r.kind = LocalResult::Kind::Missing;
+                        r.local = std::nullopt;
+                    } else if (localSize != task.remote.fileSize) {
+                        // FR-03/M4: size differs -> SizeDiff, no hash. local backfills localSize.
+                        FileEntry le;
+                        le.relativePath = task.rel;
+                        le.isDirectory = false;
+                        le.fileSize = localSize;
+                        r.kind = LocalResult::Kind::SizeDiff;
+                        r.local = le;
+                    } else {
+                        // FR-04/M5: size equal -> existing hashOne (Hashed/Failed semantics kept).
+                        FileEntry le;
+                        le.relativePath = task.rel;
+                        le.isDirectory = false;
+                        le.fileSize = localSize;
+                        r = hashOne(le);
+                    }
+                } else {
+                    r = hashOne(std::nullopt);  // Fast: local already probed on the recv path (awaiting.local)
+                }
+                const bool failed = (r.kind == LocalResult::Kind::Failed);
+                {
+                    std::lock_guard<std::mutex> lk(hashResultMu);
+                    localResults[task.rel] = std::move(r);
+                }
+                if (failed) {
+                    readFailSignal.fetch_add(1, std::memory_order_relaxed);
+                }
+                localHashInFlight.fetch_sub(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(readyMu);
+                    readyQueue.push_back(task.rel);
+                }
+                readyCv.notify_one();
+            }
+        });
+    }
+
+    // RTT sampling for the network window AIMD (D-05, mirrors sync_engine_client.cpp:1926-1935).
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> sentAt;
+    double rttEwmaUs = 0.0;
+    constexpr double kRttEwmaAlpha = 0.2;
+
+    // Teardown: stop workers, join all, then a final drain of anything that became ready. Runs on
+    // every exit path (clean, disconnect, interrupt, local-read-failure) so no worker is ever left
+    // hanging and the driver is destroyed only after join (FR-09/AC-16).
+    auto joinWorkers = [&]() {
+        hashStop.store(true);
+        hashTaskCv.notify_all();
+        for (auto& w : hashWorkers) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
+    };
+
     // Record a file with a decided category into the counters and (per filter/summaryOnly) the per-file listing.
     auto record = [&](fc::CompareCategory category, const FileEntry& remote,
                       const std::optional<FileEntry>& local, bool hashCompared) {
@@ -163,6 +431,10 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
             case fc::CompareCategory::Extra:
                 ++counters.extraLocal;
                 break;
+        }
+        // Diagnostics only: count bytes of files whose comparison actually went through a hash.
+        if (hashCompared) {
+            hashBytesDone += remote.fileSize;
         }
         if (o.summaryOnly) {
             return;
@@ -191,81 +463,352 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         result.entries.push_back(std::move(entry));
     };
 
+    // Finalize a paired file on the main thread: the worker's LocalResult and the remote HashResponse
+    // are both available (candidate A, D-01: Missing/SizeDiff also wait for the response before
+    // finalizing, but the remote hash is ignored for their classification, FR-06/NFR-07). Records once,
+    // rolls back the strict diagnostic over-accounting for Missing/SizeDiff (section 3.5), then erases
+    // awaiting + any pending server hash. Failed follows the existing local-read-failure semantics:
+    // set localReadFailed and leave the entry for teardown (no erase).
+    auto finalizePaired = [&](std::unordered_map<std::string, HashNeed>::iterator a,
+                              const LocalResult& lr, const Hash256& serverHash) {
+        const std::string rel = a->first;
+        switch (lr.kind) {
+            case LocalResult::Kind::Hashed: {
+                const std::optional<FileEntry>& loc =
+                    lr.local.has_value() ? lr.local : a->second.local;
+                record(ClassifyByHash(true, lr.hash, serverHash), a->second.remote, loc, true);
+                break;
+            }
+            case LocalResult::Kind::Missing:
+                record(fc::CompareCategory::Missing, a->second.remote, std::nullopt, false);  // FR-03
+                --hashEnqueued;
+                hashBytesTotal -= a->second.remote.fileSize;  // section 3.5 rollback
+                break;
+            case LocalResult::Kind::SizeDiff:
+                record(fc::CompareCategory::Diff, a->second.remote, lr.local, false);  // FR-04
+                --hashEnqueued;
+                hashBytesTotal -= a->second.remote.fileSize;  // section 3.5 rollback
+                break;
+            case LocalResult::Kind::Failed:
+                localReadFailed = true;
+                errorText = "local hash read failed: " + rel;
+                return;  // no erase; teardown handles it (existing semantics)
+        }
+        awaiting.erase(a);
+        serverHashReady.erase(rel);
+    };
+
+    // Eager enqueue (FR-05): sending the HashRequest and queuing the local hash task happen in the
+    // same step, so the network RTT + server hash overlaps the local SSD read. Also stamps sentAt
+    // for the network-window RTT sample (D-05).
     auto sendHashRequest = [&](const HashNeed& need) {
-        ch.send(Frame{MsgType::HashRequest, 0, EncodeHashRequest(need.remote.relativePath)});
-        awaiting.emplace(need.remote.relativePath, need);
+        const std::string& rel = need.remote.relativePath;
+        ch.send(Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
+        awaiting.emplace(rel, need);
+        {
+            std::lock_guard<std::mutex> lk(hashTaskMu);
+            const bool deferred = (mode == CompareMode::Strict);
+            hashTaskQueue.push_back(HashTask{rel, JoinLocal(targetRoot, rel), deferred, need.remote});
+        }
+        hashTaskCv.notify_one();
+        sentAt[rel] = std::chrono::steady_clock::now();
         ++inFlight;
     };
-    // Keep the in-flight HashRequest count <= --checkers (pipeline depth, not lane count, FR-06).
+    // pump double-gate (D-06): send while the network window has room AND the local backlog is under
+    // its cap. The network window (hashWindow) and the local backpressure cap (derived from
+    // hashWorkerCap) are two independent read-only gates; neither AIMD controller writes the other's
+    // target value (FR-14).
     auto pump = [&]() {
-        while (inFlight < o.checkers && !hashQueue.empty()) {
+        while (!hashQueue.empty() && inFlight < hashWindow) {
+            size_t queued = 0;
+            {
+                std::lock_guard<std::mutex> lk(hashTaskMu);
+                queued = hashTaskQueue.size();
+            }
+            const size_t backlogCap = kLocalBacklogFactor * hashWorkerCap.load();
+            if (queued + localHashInFlight.load() >= backlogCap) {
+                break;  // local backpressure: hold off sending more until workers catch up
+            }
             const HashNeed need = hashQueue.front();
             hashQueue.pop_front();
             sendHashRequest(need);
         }
     };
 
+    // Drain worker-completed rels; classify any whose server HashResponse is already pending (FR-08).
+    // A rel whose server response has not arrived yet is simply dropped here and finalized later by
+    // the HashResponse handler (which finds the local hash ready). One-and-only-once via awaiting.erase.
+    auto drainReady = [&]() {
+        std::deque<std::string> done;
+        {
+            std::lock_guard<std::mutex> lk(readyMu);
+            done.swap(readyQueue);
+        }
+        for (const std::string& rel : done) {
+            auto a = awaiting.find(rel);
+            if (a == awaiting.end()) {
+                continue;
+            }
+            auto s = serverHashReady.find(rel);
+            if (s == serverHashReady.end()) {
+                continue;  // server response not here yet; HashResponse handler will finalize
+            }
+            LocalResult lr;
+            {
+                std::lock_guard<std::mutex> lk(hashResultMu);
+                auto it = localResults.find(rel);
+                if (it == localResults.end()) {
+                    continue;  // not actually ready (defensive); leave for a later pass
+                }
+                lr = it->second;
+            }
+            finalizePaired(a, lr, s->second);
+            if (localReadFailed) {
+                return;
+            }
+        }
+    };
+
+    // Progress line to stderr every 5s or every 50000 enumerated entries (FR-15/AC-12/NFR-07).
+    auto lastProgressAt = std::chrono::steady_clock::now();
+    uint64_t lastProgressEnum = 0;
+    // Last-snapshot for per-interval per-phase timing deltas (steady-state localization).
+    fc::HashPhaseTimings lastHashPhases{};
+    uint64_t lastProbeUs = 0, lastProbeCount = 0;
+    uint64_t lastHashOneUs = 0, lastHashOneCount = 0;
+    auto maybeEmitProgress = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const bool timeDue = (now - lastProgressAt) >= std::chrono::seconds(5);
+        const bool countDue = (counters.enumerated - lastProgressEnum) >= 50000;
+        if (!timeDue && !countDue) {
+            return;
+        }
+        lastProgressAt = now;
+        lastProgressEnum = counters.enumerated;
+        const uint64_t compared = counters.same + counters.diff + counters.missing;
+        // Snapshot the driver counters (n/a when --no-diskio-driver). readPending is the
+        // instantaneous read-queue depth: if it sits at maxInFlight (default 64) the disk pipeline
+        // is IO-slot-bound; smallFileFallback vs directIo tells us whether tiny files dominate.
+        uint64_t ioSub = 0, ioComp = 0, ioReadPending = 0, ioDirect = 0;
+        uint64_t ioBufFallback = 0, ioSmallFallback = 0, ioTailFallback = 0, ioFailed = 0;
+        const char* ioTag = "n/a";
+        if (clientDriver.has_value()) {
+            const fc::io::IoCounters c = clientDriver->counters();
+            ioSub = c.submitted;
+            ioComp = c.completed;
+            ioReadPending = c.readPending;
+            ioDirect = c.directIo;
+            ioBufFallback = c.bufferedFallback;
+            ioSmallFallback = c.smallFileFallback;
+            ioTailFallback = c.tailZeroFallback;
+            ioFailed = c.failed;
+            ioTag = "io";
+        }
+        std::cerr << "[check] enum=" << counters.enumerated << " compared=" << compared
+                  << " same=" << counters.same << " diff=" << counters.diff
+                  << " missing=" << counters.missing
+                  << " hash_local_inflight=" << localHashInFlight.load()
+                  << " hash_inflight=" << inFlight << " backend=" << backendLabel
+                  << " hash_workers=" << hashWorkerCap.load() << " net_window=" << hashWindow
+                  << " pending_resp=" << serverHashReady.size()
+                  << " hash_enqueued=" << hashEnqueued
+                  << " hash_bytes_total=" << hashBytesTotal
+                  << " hash_bytes_done=" << hashBytesDone
+                  << " " << ioTag
+                  << "_submitted=" << ioSub
+                  << " " << ioTag << "_completed=" << ioComp
+                  << " " << ioTag << "_read_pending=" << ioReadPending
+                  << " " << ioTag << "_direct=" << ioDirect
+                  << " " << ioTag << "_buffered_fallback=" << ioBufFallback
+                  << " " << ioTag << "_small_fallback=" << ioSmallFallback
+                  << " " << ioTag << "_tail_fallback=" << ioTailFallback
+                  << " " << ioTag << "_failed=" << ioFailed
+                  << std::endl;
+
+        // Per-phase timing (per-interval delta averages, microseconds/file). Locates where the
+        // per-file hash time goes: probe (stat) vs hashOne (open/read/xxh/close), with hashOne
+        // broken down by GetHashPhaseTimings(). Empty when --no-diskio-driver or no samples yet.
+        const fc::HashPhaseTimings hp = fc::GetHashPhaseTimings();
+        const uint64_t hpDcount = hp.count - lastHashPhases.count;
+        const uint64_t probeDus = probeUsSum.load() - lastProbeUs;
+        const uint64_t probeDcount = probeCount.load() - lastProbeCount;
+        const uint64_t hashOneDus = hashOneUsSum.load() - lastHashOneUs;
+        const uint64_t hashOneDcount = hashOneCount.load() - lastHashOneCount;
+        auto avg = [](uint64_t us, uint64_t n) -> uint64_t {
+            return (n == 0) ? 0 : (us / n);
+        };
+        std::cerr << "[check-phases] probe_us_avg=" << avg(probeDus, probeDcount)
+                  << " probe_count=" << probeDcount
+                  << " hashone_us_avg=" << avg(hashOneDus, hashOneDcount)
+                  << " hashone_count=" << hashOneDcount
+                  << " hashph_count=" << hpDcount
+                  << " fs_us_avg=" << avg(hp.fileSizeUs - lastHashPhases.fileSizeUs, hpDcount)
+                  << " open_us_avg=" << avg(hp.openUs - lastHashPhases.openUs, hpDcount)
+                  << " read_us_avg=" << avg(hp.readUs - lastHashPhases.readUs, hpDcount)
+                  << " xxh_us_avg=" << avg(hp.xxhUs - lastHashPhases.xxhUs, hpDcount)
+                  << " close_us_avg=" << avg(hp.closeUs - lastHashPhases.closeUs, hpDcount)
+                  << " total_us_avg=" << avg(hp.totalUs - lastHashPhases.totalUs, hpDcount)
+                  << std::endl;
+        lastHashPhases = hp;
+        lastProbeUs = probeUsSum.load();
+        lastProbeCount = probeCount.load();
+        lastHashOneUs = hashOneUsSum.load();
+        lastHashOneCount = hashOneCount.load();
+    };
+
+    // Local worker AIMD sampling (D-04): periodically adjust hashWorkerCap from backlog / in-flight /
+    // read-fail signals. Writes only hashWorkerCap (never hashWindow), keeping the two dimensions
+    // decoupled (FR-14).
+    auto lastLocalTuneAt = std::chrono::steady_clock::now();
+    uint64_t lastReadFailSnapshot = 0;
+    auto maybeTuneLocal = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        if ((now - lastLocalTuneAt) < std::chrono::milliseconds(200)) {
+            return;
+        }
+        lastLocalTuneAt = now;
+        const uint64_t cur = readFailSignal.load();
+        const uint64_t delta = cur - lastReadFailSnapshot;
+        lastReadFailSnapshot = cur;
+        size_t queued = 0;
+        {
+            std::lock_guard<std::mutex> lk(hashTaskMu);
+            queued = hashTaskQueue.size();
+        }
+        const size_t oldCap = hashWorkerCap.load();
+        const size_t newCap =
+            NextLocalWorkerCap(oldCap, maxWorkers, queued, localHashInFlight.load(), delta);
+        if (newCap != oldCap) {
+            hashWorkerCap.store(newCap);
+            hashTaskCv.notify_all();  // wake newly-activated workers
+        }
+    };
+
+    // Network window AIMD on a HashResponse RTT sample (D-05). Writes only hashWindow (never
+    // hashWorkerCap), keeping the two dimensions decoupled (FR-14).
+    auto sampleRttAndTuneNet = [&](const std::string& rel) {
+        auto sa = sentAt.find(rel);
+        if (sa == sentAt.end()) {
+            return;
+        }
+        const double rttUs = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - sa->second)
+                .count());
+        sentAt.erase(sa);
+        hashWindow = NextNetWindow(hashWindow, rttUs, rttEwmaUs, kNetWindowMin, kNetWindowMax);
+        rttEwmaUs = (rttEwmaUs <= 0.0) ? rttUs : (kRttEwmaAlpha * rttUs + (1.0 - kRttEwmaAlpha) * rttEwmaUs);
+    };
+
+    // HashResponse handling (FR-07/M6): pair with a ready local hash, else stash as pending.
+    auto handleHashResponse = [&](const Frame& frame) {
+        const std::pair<std::string, Hash256> resp = DecodeHashResponse(frame.payload);
+        auto it = awaiting.find(resp.first);
+        if (it == awaiting.end()) {
+            return;  // Unknown/duplicate response, ignore.
+        }
+        --inFlight;
+        sampleRttAndTuneNet(resp.first);
+        bool haveLocal = false;
+        LocalResult lr;
+        {
+            std::lock_guard<std::mutex> lk(hashResultMu);
+            auto lit = localResults.find(resp.first);
+            if (lit != localResults.end()) {
+                lr = lit->second;
+                haveLocal = true;
+            }
+        }
+        if (haveLocal) {
+            finalizePaired(it, lr, resp.second);
+            if (localReadFailed) {
+                return;
+            }
+        } else {
+            serverHashReady[resp.first] = resp.second;  // pending until local result completes (FR-07)
+        }
+        pump();  // response freed a window slot
+    };
+
     try {
         ch.send(Frame{MsgType::ManifestRequest, 0, {}});
-        while (!(manifestDone && hashQueue.empty() && inFlight == 0)) {
+        while (!manifestDone || !hashQueue.empty() || inFlight > 0 || !awaiting.empty()) {
             if (interrupted.load()) {
                 userInterrupted = true;
                 break;
             }
-            const Frame frame = ch.recv();
-            if (frame.type == MsgType::ManifestEntry) {
-                FileEntry remote = DecodeManifestEntry(frame.payload);
-                if (remote.isDirectory) {
-                    continue;  // Directories do not participate in file comparison (EXTRA also counts files only).
-                }
-                ++counters.enumerated;
-                manifestPaths.insert(remote.relativePath);
-                std::optional<FileEntry> local = ProbeLocal(targetRoot, remote.relativePath);
-                const CompareOutcome out = DecideCompare(mode, local, remote);
-                if (out.needHash) {
-                    hashQueue.push_back(HashNeed{remote, local});
-                    pump();
+            drainReady();
+            if (localReadFailed) {
+                break;
+            }
+            pump();
+            maybeTuneLocal();
+            maybeEmitProgress();
+
+            // Block on recv only when a frame is guaranteed in transit (manifest not done, or a
+            // HashResponse is in flight). Otherwise only local hashes remain outstanding -> wait for
+            // a worker completion instead of blocking recv forever (D-02, prevents deadlock).
+            const bool expectFrame = (!manifestDone) || (inFlight > 0);
+            if (expectFrame) {
+                const Frame frame = ch.recv();
+                if (frame.type == MsgType::ManifestEntry) {
+                    FileEntry remote = DecodeManifestEntry(frame.payload);
+                    if (remote.isDirectory) {
+                        continue;  // Directories do not participate in file comparison (EXTRA also counts files only).
+                    }
+                    ++counters.enumerated;
+                    manifestPaths.insert(remote.relativePath);
+                    if (mode == CompareMode::Strict) {
+                        // M1/FR-01: the recv thread does no local probe in strict; every file enters
+                        // the hash schedule (M2/FR-02). The worker defers the existence/size decision.
+                        hashQueue.push_back(HashNeed{remote, std::nullopt});
+                        hashBytesTotal += remote.fileSize;  // temporary upper bound; rolled back for Missing/SizeDiff (section 3.5)
+                        ++hashEnqueued;
+                        pump();
+                    } else {
+                        // M6/FR-08/FR-09: Fast / SizeOnly recv path is preserved exactly.
+                        std::optional<FileEntry> local = ProbeLocal(targetRoot, remote.relativePath);
+                        const CompareOutcome out = DecideCompare(mode, local, remote);
+                        if (out.needHash) {
+                            hashQueue.push_back(HashNeed{remote, local});
+                            hashBytesTotal += remote.fileSize;
+                            ++hashEnqueued;
+                            pump();
+                        } else {
+                            record(out.category, remote, local, false);
+                        }
+                    }
+                } else if (frame.type == MsgType::ManifestProgress) {
+                    // Progress hint, ignore.
+                } else if (frame.type == MsgType::ManifestEnd) {
+                    manifestDone = true;
+                } else if (frame.type == MsgType::HashResponse) {
+                    handleHashResponse(frame);
+                    if (localReadFailed) {
+                        break;
+                    }
                 } else {
-                    record(out.category, remote, local, false);
+                    // Check should not receive transfer frames like File*/Delta*/BlockSig*; log a diagnostic and ignore.
+                    std::cerr << "[check] unexpected frame in Check session type="
+                              << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
                 }
-            } else if (frame.type == MsgType::ManifestProgress) {
-                // Progress hint, ignore.
-            } else if (frame.type == MsgType::ManifestEnd) {
-                manifestDone = true;
-            } else if (frame.type == MsgType::HashResponse) {
-                const std::pair<std::string, Hash256> resp = DecodeHashResponse(frame.payload);
-                auto it = awaiting.find(resp.first);
-                if (it == awaiting.end()) {
-                    continue;  // Unknown/duplicate response, ignore.
-                }
-                const HashNeed need = it->second;
-                awaiting.erase(it);
-                --inFlight;
-                Hash256 localHash{};
-                bool localReadable = false;
-                try {
-                    localHash = ComputeFileHash(JoinLocal(targetRoot, need.remote.relativePath));
-                    localReadable = true;
-                } catch (const std::exception& ex) {
-                    // Local file unreadable in the hash phase: abort the comparison, return exit code 3 (boundary condition).
-                    localReadFailed = true;
-                    errorText = ex.what();
-                    break;
-                }
-                const fc::CompareCategory cat =
-                    ClassifyByHash(localReadable, localHash, resp.second);
-                record(cat, need.remote, need.local, true);
-                pump();
             } else {
-                // Check should not receive transfer frames like File*/Delta*/BlockSig*; log a diagnostic and ignore.
-                std::cerr << "[check] unexpected frame in Check session type="
-                          << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
+                std::unique_lock<std::mutex> lk(readyMu);
+                readyCv.wait_for(lk, std::chrono::milliseconds(200),
+                                 [&]() { return !readyQueue.empty(); });
             }
         }
     } catch (const std::exception& ex) {
         // Disconnect (recv throws) or send failure: mark partial, exit code 2 (NFR-07/AC-48).
         disconnected = true;
         errorText = ex.what();
+    }
+
+    // Stop and join all hash workers, then finalize any pending results that are now ready. Runs on
+    // every exit path so no worker hangs and the driver is torn down only after join (FR-09/AC-16).
+    joinWorkers();
+    if (!localReadFailed) {
+        drainReady();
     }
 
     EngineOutcome outcome;
