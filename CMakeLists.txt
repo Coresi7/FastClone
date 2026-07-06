@@ -22,6 +22,7 @@ add_executable(FastClone
     FastClone/cli.cpp
     FastClone/client_handshake.cpp
     FastClone/compare_phase.cpp
+    FastClone/compare_pipeline.cpp
     FastClone/delta.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
@@ -76,6 +77,7 @@ enable_testing()
 add_executable(FastCloneTests
     FastClone/cli.cpp
     FastClone/compare_phase.cpp
+    FastClone/compare_pipeline.cpp
     FastClone/delta.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
@@ -89,6 +91,7 @@ add_executable(FastCloneTests
     tests/test_main.cpp
     tests/test_cli.cpp
     tests/test_compare_phase.cpp
+    tests/test_compare_pipeline.cpp
     tests/test_protocol_codec.cpp
     tests/test_delta.cpp
     tests/test_streaming_buildplan.cpp
@@ -166,6 +169,7 @@ set(FASTCHECK_SHARED_SOURCES
     FastCheck/check_engine.cpp
     FastCheck/check_report.cpp
     FastClone/compare_phase.cpp
+    FastClone/compare_pipeline.cpp
     FastClone/file_index.cpp
     FastClone/client_handshake.cpp
     FastClone/protocol.cpp

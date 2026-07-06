@@ -165,6 +165,7 @@
   <ItemGroup>
     <ClInclude Include="cli.h" />
     <ClInclude Include="compare_phase.h" />
+    <ClInclude Include="compare_pipeline.h" />
     <ClInclude Include="delta.h" />
     <ClInclude Include="disk_io_align.h" />
     <ClInclude Include="disk_io_backend.h" />
@@ -186,6 +187,7 @@
          main.cpp / transfer_tuning.cpp / route_probe_main.cpp / client_handshake.cpp). -->
     <ClCompile Include="cli.cpp" />
     <ClCompile Include="compare_phase.cpp" />
+    <ClCompile Include="compare_pipeline.cpp" />
     <ClCompile Include="delta.cpp" />
     <ClCompile Include="disk_io_align.cpp" />
     <ClCompile Include="disk_io_driver.cpp" />
@@ -207,6 +209,7 @@
     <ClCompile Include="..\tests\test_main.cpp" />
     <ClCompile Include="..\tests\test_cli.cpp" />
     <ClCompile Include="..\tests\test_compare_phase.cpp" />
+    <ClCompile Include="..\tests\test_compare_pipeline.cpp" />
     <ClCompile Include="..\tests\test_delta.cpp" />
     <ClCompile Include="..\tests\test_protocol_codec.cpp" />
     <ClCompile Include="..\tests\test_streaming_buildplan.cpp" />

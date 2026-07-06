@@ -156,6 +156,7 @@
     <ClInclude Include="cli.h" />
     <ClInclude Include="client_handshake.h" />
     <ClInclude Include="compare_phase.h" />
+    <ClInclude Include="compare_pipeline.h" />
     <ClInclude Include="delta.h" />
     <ClInclude Include="disk_io_align.h" />
     <ClInclude Include="disk_io_backend.h" />
@@ -178,6 +179,7 @@
     <ClCompile Include="cli.cpp" />
     <ClCompile Include="client_handshake.cpp" />
     <ClCompile Include="compare_phase.cpp" />
+    <ClCompile Include="compare_pipeline.cpp" />
     <ClCompile Include="delta.cpp" />
     <ClCompile Include="disk_io_align.cpp" />
     <ClCompile Include="disk_io_driver.cpp" />

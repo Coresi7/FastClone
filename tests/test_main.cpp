@@ -18,6 +18,7 @@ void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
 void RunWanTuningTests();
 void RunComparePhaseTests();
+void RunComparePipelineTests();
 void RunProtocolCodecTests();
 
 int main() {
@@ -39,6 +40,7 @@ int main() {
         RunLinkSchedulerTests();
         RunWanTuningTests();
         RunComparePhaseTests();
+        RunComparePipelineTests();
         RunProtocolCodecTests();
         std::cout << "All FastClone tests passed." << std::endl;
         return 0;

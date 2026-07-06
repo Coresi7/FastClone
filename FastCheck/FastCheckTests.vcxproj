@@ -173,6 +173,7 @@
     <ClInclude Include="check_report.h" />
     <ClInclude Include="..\FastClone\client_handshake.h" />
     <ClInclude Include="..\FastClone\compare_phase.h" />
+    <ClInclude Include="..\FastClone\compare_pipeline.h" />
     <ClInclude Include="..\FastClone\file_index.h" />
     <ClInclude Include="..\FastClone\protocol.h" />
     <ClInclude Include="..\FastClone\protocol_codec.h" />
@@ -188,6 +189,7 @@
     <ClCompile Include="check_engine.cpp" />
     <ClCompile Include="check_report.cpp" />
     <ClCompile Include="..\FastClone\compare_phase.cpp" />
+    <ClCompile Include="..\FastClone\compare_pipeline.cpp" />
     <ClCompile Include="..\FastClone\file_index.cpp" />
     <ClCompile Include="..\FastClone\client_handshake.cpp" />
     <ClCompile Include="..\FastClone\protocol.cpp" />
