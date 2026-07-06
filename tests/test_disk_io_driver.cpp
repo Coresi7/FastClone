@@ -6,6 +6,7 @@
 
 #include "disk_io_backend.h"
 #include "disk_io_driver.h"
+#include "file_index.h"
 
 #if defined(__linux__)
 // Linux-only: the io_uring runtime probe falls back to the pread/pwrite pool, which must report
@@ -13,10 +14,12 @@
 #include "disk_io_backend_pool.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -1149,6 +1152,291 @@ void TestUringFallbackCounter() {
 }
 #endif
 
+// ---------------------------------------------------------------------------------------------
+// fastcheck-test-coverage-supplement (TC-01)
+// ---------------------------------------------------------------------------------------------
+
+// Write `payload` to `path` through a REAL DiskIoDriver (helper for Gap A/C/D). Chunks by
+// cfg.chunkBytes, drains all write completions, then closeFile (SetEndOfFile -> exact size).
+void WriteViaDriver(const std::string& path, const std::vector<uint8_t>& payload,
+                    const IoDriverConfig& cfg) {
+    DiskIoDriver drv(cfg);
+    const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/true, payload.size());
+    Require(wf != 0, "WriteViaDriver: open write");
+    std::vector<IoRequest> batch;
+    for (uint64_t off = 0; off < payload.size(); off += cfg.chunkBytes) {
+        IoRequest r;
+        r.kind = OpKind::Write;
+        r.fileId = wf;
+        r.offset = off;
+        const uint64_t n = std::min<uint64_t>(cfg.chunkBytes, payload.size() - off);
+        r.data.assign(payload.begin() + static_cast<std::ptrdiff_t>(off),
+                      payload.begin() + static_cast<std::ptrdiff_t>(off + n));
+        r.length = static_cast<uint32_t>(n);
+        batch.push_back(std::move(r));
+    }
+    const size_t count = batch.size();
+    while (!batch.empty()) {
+        if (drv.submit(batch) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::vector<IoCompletion> comps;
+    Require(DrainUntil(drv, count, comps, 15000) == count, "WriteViaDriver: write completions");
+    for (auto& c : comps) Require(c.status != IoStatus::Error, "WriteViaDriver: write op error");
+    drv.closeFile(wf);
+}
+
+// -------- Gap A: server hash-miss three-way equivalence (M1 / FR-01..FR-04) --------
+
+// test-only: replicate the hash-miss inline block that used to live in sync_engine_server.cpp
+// (removed in the fastcheck-* disk-IO convergence; the old block is preserved in git parent
+// 37d32ad of the current HEAD 82666dd). The two constants match the production
+// kServerSigChunkBytes(1<<20) / kServerReadAhead(4); the server TU is intentionally NOT included,
+// so this helper only calls already-public symbols (SequentialReader / ComputeHashFromSource /
+// openFile / closeFile) and introduces no production hook/export/friend/#if branch (FR-04/AC-07).
+constexpr uint32_t kOldServerHashChunkBytes = 1u << 20;
+constexpr uint32_t kOldServerHashReadAhead = 4;
+
+fc::Hash256 ReconstructOldServerHashMiss(DiskIoDriver& drv, const std::filesystem::path& p) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const uint64_t fileSize = static_cast<uint64_t>(fs::file_size(p, ec));
+    Require(!ec, "gapA: file_size");
+    // Old block opened the read with expectedSize=0 (unknown size); replicated verbatim.
+    const uint64_t fid = drv.openFile(p.string(), OpKind::Read, /*unbuffered=*/true, 0);
+    Require(fid != 0, "gapA: open");
+    bool rerr = false;
+    SequentialReader reader(drv, fid, fileSize, kOldServerHashChunkBytes, kOldServerHashReadAhead);
+    std::vector<uint8_t> cbuf;
+    size_t cpos = 0;
+    // C-01: byte-for-byte identical to the removed inline `src` pull loop.
+    auto src = [&](uint8_t* dst, size_t maxLen) -> size_t {
+        size_t written = 0;
+        while (written < maxLen) {
+            if (cpos < cbuf.size()) {
+                const size_t take = std::min<size_t>(cbuf.size() - cpos, maxLen - written);
+                std::memcpy(dst + written, cbuf.data() + cpos, take);
+                cpos += take;
+                written += take;
+                continue;
+            }
+            bool okr = true;
+            cbuf.clear();
+            cpos = 0;
+            const uint32_t n = reader.next(cbuf, okr);
+            if (!okr) {
+                rerr = true;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+        }
+        return written;
+    };
+    const fc::Hash256 h = fc::ComputeHashFromSource(src);
+    drv.closeFile(fid);
+    Require(!rerr, "gapA: read");
+    return h;
+}
+
+// FR-01/FR-02/FR-03 (AC-02..AC-05): for every size in the matrix, the old inline hash-miss path,
+// ComputeFileHashViaDriver and ComputeFileHash must all produce the identical Hash256. All reads go
+// through a REAL DiskIoDriver against a Windows temp file (no mock, M5/D-05).
+void TestServerHashMissThreeWayEquivalence() {
+    namespace fs = std::filesystem;
+    const uint64_t sizes[] = {0,       1,       64,      4096,    65535,   65536,  262143,
+                              262144,  262145,  1048576, 1048577, 5242880, 5000003};
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.chunkBytes = 1u << 20;
+    DiskIoDriver drv(cfg);  // real platform backend, shared by ViaDriver + old-inline reconstruction
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path dir = fs::temp_directory_path() / ("fc_gapA_" + std::to_string(stamp));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    for (uint64_t size : sizes) {
+        const fs::path p = dir / ("blob_" + std::to_string(size) + ".bin");
+        const std::vector<uint8_t> payload =
+            RandomBytes(static_cast<size_t>(size), 4200u + static_cast<uint32_t>(size));
+        {
+            std::ofstream os(p, std::ios::binary | std::ios::trunc);
+            if (size > 0) {
+                os.write(reinterpret_cast<const char*>(payload.data()),
+                         static_cast<std::streamsize>(payload.size()));
+            }
+        }
+        Require(static_cast<uint64_t>(fs::file_size(p, ec)) == size, "gapA: on-disk size");
+
+        const fc::Hash256 inlineHash = fc::ComputeFileHash(p);
+        const fc::Hash256 viaDriver = fc::ComputeFileHashViaDriver(drv, p);
+        const fc::Hash256 oldServer = ReconstructOldServerHashMiss(drv, p);
+
+        Require(fc::HashEquals(inlineHash, viaDriver),
+                "gapA: ComputeFileHashViaDriver == ComputeFileHash size " + std::to_string(size));
+        Require(fc::HashEquals(inlineHash, oldServer),
+                "gapA: old-server-inline == ComputeFileHash size " + std::to_string(size));
+        Require(fc::HashEquals(viaDriver, oldServer),
+                "gapA: old-server-inline == ComputeFileHashViaDriver size " + std::to_string(size));
+        fs::remove(p, ec);
+    }
+    fs::remove_all(dir, ec);
+}
+
+// -------- Gap C: read openFile expectedSize contract (M3 / FR-09..FR-12) --------
+
+// FR-09/FR-10/FR-12 (AC-13..AC-15/AC-17): across the kSmallFileBufferedMax(1 MiB) boundary sizes,
+// reading with expectedSize==size (known-size policy) and expectedSize==0 (legacy unknown-size
+// policy) both return byte-identical content. ReadAllViaDriver loops to a clean EOF and closeFile's
+// the read fileId (AC-17).
+void TestReadOpenExpectedSizeContract() {
+    namespace fs = std::filesystem;
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.chunkBytes = 1u << 20;
+    const uint64_t sizes[] = {(1u << 20) - 1, (1u << 20), (1u << 20) + 1};
+    for (uint64_t size : sizes) {
+        const fs::path tmp =
+            fs::temp_directory_path() / ("fc_gapC_" + std::to_string(size) + ".bin");
+        const std::string path = tmp.string();
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 131u);
+        WriteViaDriver(path, payload, cfg);
+        Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == size, "gapC: on-disk size");
+
+        DiskIoDriver drvKnown(cfg);
+        const std::vector<uint8_t> gotKnown =
+            ReadAllViaDriver(drvKnown, path, size, cfg.chunkBytes, /*expectedSize=*/size);
+        DiskIoDriver drvUnknown(cfg);
+        const std::vector<uint8_t> gotUnknown =
+            ReadAllViaDriver(drvUnknown, path, size, cfg.chunkBytes, /*expectedSize=*/0);
+
+        Require(gotKnown.size() == size, "gapC: expectedSize==size byte count matches");
+        Require(gotUnknown.size() == size, "gapC: expectedSize==0 byte count matches");
+        Require(gotKnown == payload, "gapC: expectedSize==size bytes == file content (AC-13/14/15)");
+        Require(gotUnknown == payload, "gapC: expectedSize==0 bytes == file content (AC-13/14/15)");
+        Require(gotKnown == gotUnknown, "gapC: known vs unknown expectedSize identical bytes");
+        fs::remove(tmp, ec);
+    }
+}
+
+// FR-11 (AC-16): expectedSize is a POLICY HINT, not the source of truth for content length. A read
+// open with an OVER-estimated expectedSize (real size + delta, crossing the small-file gate) still
+// returns byte-identical content, because SequentialReader plans by the real size and never reads
+// past EOF.
+void TestReadOpenExpectedSizeMismatch() {
+    namespace fs = std::filesystem;
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.chunkBytes = 1u << 20;
+    const uint64_t size = 300000;                       // < 1 MiB real content
+    const uint64_t mismatchExpected = size + (2u << 20);  // over-estimate -> crosses small-file gate
+    const fs::path tmp = fs::temp_directory_path() / "fc_gapC_mismatch.bin";
+    const std::string path = tmp.string();
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 137u);
+    WriteViaDriver(path, payload, cfg);
+    Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == size, "gapC mismatch: on-disk size");
+
+    DiskIoDriver drv(cfg);
+    // SequentialReader plans by the REAL size; the mismatched expectedSize only steers the openFile
+    // buffered/unbuffered policy, not the content length.
+    const std::vector<uint8_t> got =
+        ReadAllViaDriver(drv, path, size, cfg.chunkBytes, /*expectedSize=*/mismatchExpected);
+    Require(got == payload,
+            "gapC: expectedSize is a policy hint, not a content-length source of truth; the read "
+            "returns the real file bytes (AC-16)");
+    fs::remove(tmp, ec);
+}
+
+// -------- Gap D: QueryAlign cache + concurrent open/read integration (M4 / FR-13..FR-15) --------
+
+// FR-13/FR-14/FR-15 (AC-18/AC-19/AC-20): a shared REAL DiskIoDriver on one volume, 16 threads x 32
+// files. Each thread round-robins files and per iteration: queryAlign -> real read open -> full
+// SequentialReader read-back -> byte-exact content verify -> closeFile. C-02 fixes threads=16 /
+// files=32 as lower bounds; only the iteration count is tunable.
+void TestConcurrentQueryAlignAndReadIntegration() {
+    namespace fs = std::filesystem;
+    const int kFiles = 32;
+    const int kThreads = 16;
+    const int kIters = 64;
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path dir = fs::temp_directory_path() / ("fc_gapD_" + std::to_string(stamp));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 64;
+    cfg.chunkBytes = 1u << 20;
+
+    std::vector<std::vector<uint8_t>> contents(kFiles);
+    std::vector<std::string> paths(kFiles);
+    for (int i = 0; i < kFiles; ++i) {
+        // Distinct deterministic content + mixed sizes; every 8th file is >= 1 MiB to cover the
+        // unbuffered read path alongside small buffered files.
+        const size_t size = (i % 8 == 0) ? ((1u << 20) + static_cast<size_t>(i) * 331u)
+                                          : (4096u + static_cast<size_t>(i) * 997u);
+        contents[i] = RandomBytes(size, 9000u + static_cast<uint32_t>(i));
+        paths[i] = (dir / ("f_" + std::to_string(i) + ".bin")).string();
+        WriteViaDriver(paths[i], contents[i], cfg);
+    }
+
+    DiskIoDriver drv(cfg);  // shared across all 16 threads
+    std::atomic<int> reads{0};
+    std::atomic<int> closes{0};
+    std::atomic<int> openFailures{0};
+    std::atomic<bool> mismatch{false};
+
+    auto worker = [&](int t) {
+        for (int k = 0; k < kIters; ++k) {
+            const int i = (t + k) % kFiles;
+            const uint64_t size = contents[i].size();
+            (void)drv.queryAlign(paths[i]);
+            const uint64_t rf = drv.openFile(paths[i], OpKind::Read, /*unbuffered=*/true, size);
+            if (rf == 0) {
+                openFailures.fetch_add(1);
+                return;
+            }
+            SequentialReader reader(drv, rf, size, cfg.chunkBytes, 4);
+            std::vector<uint8_t> got;
+            bool readOk = true;
+            for (;;) {
+                std::vector<uint8_t> chunk;
+                bool ok = true;
+                const uint32_t n = reader.next(chunk, ok);
+                if (!ok) {
+                    readOk = false;
+                    break;
+                }
+                if (n == 0) break;
+                got.insert(got.end(), chunk.begin(), chunk.end());
+            }
+            drv.closeFile(rf);
+            closes.fetch_add(1);
+            if (!readOk || got != contents[i]) {
+                mismatch.store(true);
+                return;
+            }
+            reads.fetch_add(1);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    Require(openFailures.load() == 0, "gapD: no read-open failure across 16 threads (AC-18)");
+    Require(!mismatch.load(), "gapD: concurrent read content verified byte-exact (AC-18/AC-19)");
+    Require(reads.load() == kThreads * kIters, "gapD: every read fully verified (AC-18/AC-20)");
+    Require(closes.load() == kThreads * kIters, "gapD: every read fileId closed (AC-20)");
+
+    fs::remove_all(dir, ec);
+}
+
 }  // namespace
 
 void RunDiskIoDriverTests() {
@@ -1170,6 +1458,10 @@ void RunDiskIoDriverTests() {
     RealBackendSmallSizes();
     TestUnbufferedRandomWriteNoPollution();
     TestUnbufferedOffAndReadGate();
+    TestServerHashMissThreeWayEquivalence();
+    TestReadOpenExpectedSizeContract();
+    TestReadOpenExpectedSizeMismatch();
+    TestConcurrentQueryAlignAndReadIntegration();
 #if defined(__linux__)
     TestPosixPoolAlignedDirectIo();
     TestUringFallbackCounter();

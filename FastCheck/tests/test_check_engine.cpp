@@ -28,6 +28,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>  // FSCTL_SET_SPARSE (Gap B sparse-file coverage)
 #endif
 
 namespace fs = std::filesystem;
@@ -785,6 +786,114 @@ void TestComputeFileHashViaDriverConsistency() {
     fs::remove_all(dir, ec);
 }
 
+// fastcheck-test-coverage-supplement Gap B (FR-07/AC-10): files > 1 MiB whose tail is NOT aligned
+// to 1 MiB force the ComputeFileHashViaDriver SequentialReader slow path; its Hash256 must equal
+// ComputeFileHash byte-for-byte. Uses a REAL DiskIoDriver (default platform backend).
+void TestComputeFileHashViaDriverUnalignedTail() {
+    const fs::path dir = MakeTempDir();
+    const std::vector<size_t> sizes = {
+        (1u << 20) + 1u,
+        (1u << 20) + 123u,
+        (5u << 20) + 3u,  // 5242883
+        5000003u,
+    };
+    fc::io::DiskIoDriver driver(fc::io::IoDriverConfig{});
+    for (size_t idx = 0; idx < sizes.size(); ++idx) {
+        const size_t n = sizes[idx];
+        const fs::path p = dir / ("unaligned_" + std::to_string(idx) + ".bin");
+        WriteFile(p, MakeDeterministicContent(n, 200u + static_cast<uint32_t>(idx)));
+        const Hash256 inlineHash = ComputeFileHash(p);
+        const Hash256 driverHash = ComputeFileHashViaDriver(driver, p);
+        Expect(HashEquals(inlineHash, driverHash),
+               "ComputeFileHashViaDriver == ComputeFileHash for unaligned-tail size " +
+                   std::to_string(n) + " (AC-10)");
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+#if defined(_WIN32)
+// Try to create a real Windows sparse file: mark FSCTL_SET_SPARSE, extend the logical size to
+// create a zero hole, then write a deterministic tail at an unaligned offset. Returns false (leaving
+// the file untouched/removed) if any step fails so the caller can fall back to a plain content file.
+bool TryCreateWindowsSparseFile(const fs::path& p, uint64_t logicalSize, uint64_t tailOffset,
+                                const std::vector<uint8_t>& tail) {
+    HANDLE h = CreateFileW(p.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD returned = 0;
+    if (!DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr)) {
+        CloseHandle(h);
+        return false;
+    }
+    LARGE_INTEGER end;
+    end.QuadPart = static_cast<LONGLONG>(logicalSize);
+    if (!SetFilePointerEx(h, end, nullptr, FILE_BEGIN) || !SetEndOfFile(h)) {
+        CloseHandle(h);
+        return false;
+    }
+    LARGE_INTEGER at;
+    at.QuadPart = static_cast<LONGLONG>(tailOffset);
+    if (!SetFilePointerEx(h, at, nullptr, FILE_BEGIN)) {
+        CloseHandle(h);
+        return false;
+    }
+    DWORD written = 0;
+    if (!::WriteFile(h, tail.data(), static_cast<DWORD>(tail.size()), &written, nullptr) ||
+        written != tail.size()) {
+        CloseHandle(h);
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+#endif
+
+// fastcheck-test-coverage-supplement Gap B (FR-08/AC-11/AC-12): sparse-file coverage.
+//   - Windows sparse creation succeeds -> assert ComputeFileHashViaDriver == ComputeFileHash on the
+//     real sparse file (AC-11).
+//   - Sparse creation fails / non-Windows -> write an equal-length deterministic content file with
+//     the SAME byte layout (zero hole + deterministic tail) and assert the same equivalence (AC-12).
+void TestComputeFileHashViaDriverSparseFile() {
+    const fs::path dir = MakeTempDir();
+    const fs::path p = dir / "sparse.bin";
+    const uint64_t logicalSize = (3u << 20) + 777u;   // > 1 MiB, unaligned tail
+    const size_t tailLen = 12345u;                    // deterministic non-zero tail
+    const uint64_t tailOffset = logicalSize - tailLen;  // zero hole in [0, tailOffset)
+    const std::string tailStr = MakeDeterministicContent(tailLen, 88u);
+    const std::vector<uint8_t> tail(tailStr.begin(), tailStr.end());
+
+    bool sparseReady = false;
+#if defined(_WIN32)
+    sparseReady = TryCreateWindowsSparseFile(p, logicalSize, tailOffset, tail);
+#endif
+    if (!sparseReady) {
+        // Fallback: equal-length deterministic content file, same byte layout as the sparse case.
+        std::vector<uint8_t> content(static_cast<size_t>(logicalSize), 0);
+        std::copy(tail.begin(), tail.end(),
+                  content.begin() + static_cast<std::ptrdiff_t>(tailOffset));
+        std::ofstream os(p, std::ios::binary | std::ios::trunc);
+        os.write(reinterpret_cast<const char*>(content.data()),
+                 static_cast<std::streamsize>(content.size()));
+    }
+
+    std::error_code sizeEc;
+    Expect(static_cast<uint64_t>(fs::file_size(p, sizeEc)) == logicalSize,
+           "sparse/fallback file has the expected logical size");
+
+    fc::io::DiskIoDriver driver(fc::io::IoDriverConfig{});
+    const Hash256 inlineHash = ComputeFileHash(p);
+    const Hash256 driverHash = ComputeFileHashViaDriver(driver, p);
+    Expect(HashEquals(inlineHash, driverHash),
+           sparseReady ? "sparse file ComputeFileHashViaDriver == ComputeFileHash (AC-11)"
+                       : "equal-length content fallback ViaDriver == ComputeFileHash (AC-12)");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 void TestComputeFileHashViaDriverSmallFileSingleRead() {
     const fs::path dir = MakeTempDir();
     const size_t fileSize = 200u * 1024u + 73u;
@@ -1253,6 +1362,8 @@ void RunCheckEngineTests() {
     TestHashWorkersOneSerial();
     TestNoDiskioDriverDegraded();
     TestComputeFileHashViaDriverConsistency();
+    TestComputeFileHashViaDriverUnalignedTail();
+    TestComputeFileHashViaDriverSparseFile();
     TestComputeFileHashViaDriverSmallFileSingleRead();
     TestComputeFileHashViaDriverAlignedHash();
     TestComputeFileHashViaDriverSmallReadFailures();
