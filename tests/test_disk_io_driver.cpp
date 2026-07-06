@@ -214,6 +214,191 @@ size_t DrainUntil(DiskIoDriver& drv, size_t expected, std::vector<IoCompletion>&
     return out.size();
 }
 
+void SubmitSingle(DiskIoDriver& drv, IoRequest req) {
+    std::vector<IoRequest> batch;
+    batch.push_back(std::move(req));
+    while (!batch.empty()) {
+        if (drv.submit(batch) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
+void TestIoDriverConfigDefaults() {
+    // fastcheck-smallfile-disk-perf FR-12/AC-18
+    const IoDriverConfig cfg{};
+    Require(cfg.maxInFlight == 64, "IoDriverConfig default maxInFlight=64");
+    Require(cfg.backendConcurrency == 8, "IoDriverConfig default backendConcurrency=8");
+}
+
+void TestPerFileWaitIsolation() {
+    // fastcheck-smallfile-disk-perf AC-21: completion for file A must not wake file B waiters.
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    auto mock = std::make_unique<MockBackend>(cfg);
+    MockBackend* raw = mock.get();
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    const uint64_t fidA = drv.openFile("a", OpKind::Read, true, 0);
+    const uint64_t fidB = drv.openFile("b", OpKind::Read, true, 0);
+    raw->setReadData(fidA, RandomBytes(8192, 101u));
+    raw->setReadData(fidB, RandomBytes(8192, 202u));
+
+    std::atomic<bool> doneA{false};
+    std::atomic<bool> doneB{false};
+    std::vector<IoCompletion> aOut;
+    std::vector<IoCompletion> bOut;
+    std::mutex outMu;
+
+    auto waiter = [&](uint64_t fid, std::atomic<bool>& done, std::vector<IoCompletion>& out) {
+        for (int i = 0; i < 40; ++i) {
+            drv.waitForFile(fid, 50);
+            std::vector<IoCompletion> tmp;
+            drv.drainCompletionsForFile(fid, tmp);
+            if (!tmp.empty()) {
+                std::lock_guard<std::mutex> lk(outMu);
+                out = std::move(tmp);
+                done.store(true);
+                return;
+            }
+        }
+        done.store(true);  // timeout path
+    };
+
+    std::thread wa(waiter, fidA, std::ref(doneA), std::ref(aOut));
+    std::thread wb(waiter, fidB, std::ref(doneB), std::ref(bOut));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    IoRequest reqA;
+    reqA.kind = OpKind::Read;
+    reqA.fileId = fidA;
+    reqA.offset = 0;
+    reqA.length = 4096;
+    reqA.prio = Prio::Small;
+    SubmitSingle(drv, std::move(reqA));
+
+    for (int i = 0; i < 80 && !doneA.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    Require(doneA.load(), "file A waiter completed after file A completion");
+    Require(!doneB.load(), "file B waiter not released by file A completion");
+
+    IoRequest reqB;
+    reqB.kind = OpKind::Read;
+    reqB.fileId = fidB;
+    reqB.offset = 0;
+    reqB.length = 4096;
+    reqB.prio = Prio::Small;
+    SubmitSingle(drv, std::move(reqB));
+
+    wa.join();
+    wb.join();
+    Require(aOut.size() == 1 && aOut[0].fileId == fidA, "file A waiter drained file A completion");
+    Require(bOut.size() == 1 && bOut[0].fileId == fidB, "file B waiter drained file B completion");
+}
+
+void TestCancelWakesPerFileWaiters() {
+    // fastcheck-smallfile-disk-perf AC-22: requestCancel must wake each file's waiter.
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 0;  // keep requests queued so cancel flushes all as Cancelled completions.
+    auto mock = std::make_unique<MockBackend>(cfg);
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    const uint64_t fidA = drv.openFile("a", OpKind::Write, false, 0);
+    const uint64_t fidB = drv.openFile("b", OpKind::Write, false, 0);
+
+    IoRequest reqA;
+    reqA.kind = OpKind::Write;
+    reqA.fileId = fidA;
+    reqA.offset = 0;
+    reqA.length = 4;
+    reqA.data = {1, 2, 3, 4};
+    SubmitSingle(drv, std::move(reqA));
+
+    IoRequest reqB;
+    reqB.kind = OpKind::Write;
+    reqB.fileId = fidB;
+    reqB.offset = 0;
+    reqB.length = 4;
+    reqB.data = {5, 6, 7, 8};
+    SubmitSingle(drv, std::move(reqB));
+
+    std::vector<IoCompletion> aOut;
+    std::vector<IoCompletion> bOut;
+    std::atomic<bool> doneA{false};
+    std::atomic<bool> doneB{false};
+
+    auto waiter = [&](uint64_t fid, std::vector<IoCompletion>& out, std::atomic<bool>& done) {
+        for (int i = 0; i < 40; ++i) {
+            drv.waitForFile(fid, 50);
+            drv.drainCompletionsForFile(fid, out);
+            if (!out.empty()) {
+                done.store(true);
+                return;
+            }
+        }
+        done.store(true);
+    };
+
+    std::thread wa(waiter, fidA, std::ref(aOut), std::ref(doneA));
+    std::thread wb(waiter, fidB, std::ref(bOut), std::ref(doneB));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    drv.requestCancel();
+    wa.join();
+    wb.join();
+
+    Require(doneA.load() && doneB.load(), "cancel waiters returned");
+    Require(aOut.size() == 1 && aOut[0].status == IoStatus::Cancelled && aOut[0].fileId == fidA,
+            "file A waiter received Cancelled");
+    Require(bOut.size() == 1 && bOut[0].status == IoStatus::Cancelled && bOut[0].fileId == fidB,
+            "file B waiter received Cancelled");
+}
+
+void TestDrainGlobalVsPerFile() {
+    // fastcheck-smallfile-disk-perf AC-23: per-file drain must not be duplicated by global drain.
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    auto mock = std::make_unique<MockBackend>(cfg);
+    MockBackend* raw = mock.get();
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    const uint64_t fidA = drv.openFile("a", OpKind::Read, true, 0);
+    const uint64_t fidB = drv.openFile("b", OpKind::Read, true, 0);
+    raw->setReadData(fidA, RandomBytes(4096, 123u));
+    raw->setReadData(fidB, RandomBytes(4096, 234u));
+
+    IoRequest reqA;
+    reqA.kind = OpKind::Read;
+    reqA.fileId = fidA;
+    reqA.offset = 0;
+    reqA.length = 4096;
+    reqA.userTag = 11;
+    SubmitSingle(drv, std::move(reqA));
+
+    IoRequest reqB;
+    reqB.kind = OpKind::Read;
+    reqB.fileId = fidB;
+    reqB.offset = 0;
+    reqB.length = 4096;
+    reqB.userTag = 22;
+    SubmitSingle(drv, std::move(reqB));
+
+    drv.waitForFile(fidA, 2000);
+    drv.waitForFile(fidB, 2000);
+
+    std::vector<IoCompletion> perFileA;
+    Require(drv.drainCompletionsForFile(fidA, perFileA) == 1, "per-file drain got file A completion");
+    Require(perFileA[0].fileId == fidA && perFileA[0].userTag == 11, "per-file drain consumed A tag");
+
+    std::vector<IoCompletion> global;
+    const size_t n = drv.drainCompletions(global);
+    Require(n == 1, "global drain gets remaining completion only");
+    Require(global[0].fileId == fidB && global[0].userTag == 22, "global drain only returns file B");
+    for (const auto& c : global) {
+        Require(c.fileId != fidA, "global drain must not duplicate per-file-drained completion");
+    }
+}
+
 void TestMockRoundTripAndCounters() {
     IoDriverConfig cfg;
     cfg.maxInFlight = 8;
@@ -889,6 +1074,10 @@ void TestUringFallbackCounter() {
 }  // namespace
 
 void RunDiskIoDriverTests() {
+    TestIoDriverConfigDefaults();
+    TestPerFileWaitIsolation();
+    TestCancelWakesPerFileWaiters();
+    TestDrainGlobalVsPerFile();
     TestMockRoundTripAndCounters();
     TestMultiOpInFlight();
     TestFairness();

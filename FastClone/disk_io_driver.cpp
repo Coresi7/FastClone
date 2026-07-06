@@ -78,6 +78,14 @@ static IoRequest PopPreferSmall(std::deque<IoRequest>& q) {
     return r;
 }
 
+void DiskIoDriver::EnqueueCompletion(IoCompletion completion) {
+    std::lock_guard<std::mutex> lk(cmu_);
+    const uint64_t fileId = completion.fileId;
+    completionOrder_.push_back(fileId);
+    completionsByFile_[fileId].push_back(std::move(completion));
+    fileWait_[fileId].cv.notify_one();
+}
+
 bool DiskIoDriver::PickAndSubmit() {
     IoRequest op;
     bool isRead = false;
@@ -141,12 +149,7 @@ bool DiskIoDriver::PickAndSubmit() {
         c.requested = opRequested;
         c.userTag   = opUserTag;
         c.status    = IoStatus::Error;
-        {
-            std::lock_guard<std::mutex> lk(cmu_);
-            completionsByFile_[opFileId].push_back(std::move(c));
-            completionOrder_.push_back(opFileId);
-        }
-        ccv_.notify_all();
+        EnqueueCompletion(std::move(c));
         std::lock_guard<std::mutex> lk(qmu_);
         --inFlight_;
     }
@@ -186,7 +189,7 @@ void DiskIoDriver::SchedulerLoop() {
             // slot AND queued work): the next loop iteration will then top up the pipeline without
             // delay. Otherwise (saturated at maxInFlight, or drained but ops still in flight) block
             // briefly so the scheduler yields the core instead of busy-spinning until a completion
-            // arrives. Any completion / new submit wakes the wait below via ccv_/qcv_.
+            // arrives. Any completion / new submit wakes waiters via per-file cv / qcv_.
             const bool canSubmitMore =
                 (!readQ_.empty() || !writeQ_.empty()) && inFlight_ < cfg_.maxInFlight;
             timeout = (inFlight_ > 0 && !stopping) ? (canSubmitMore ? 0 : 2) : 0;
@@ -194,19 +197,15 @@ void DiskIoDriver::SchedulerLoop() {
         const size_t got = backend_->reap(comps, 128, timeout);
         if (got > 0) {
             uint64_t completed = 0, failed = 0, cancelled = 0;
-            {
-                std::lock_guard<std::mutex> lk(cmu_);
-                for (auto& c : comps) {
-                    if (c.status == IoStatus::Error) {
-                        ++failed;
-                    } else if (c.status == IoStatus::Cancelled) {
-                        ++cancelled;
-                    } else {
-                        ++completed;
-                    }
-                    completionOrder_.push_back(c.fileId);
-                    completionsByFile_[c.fileId].push_back(std::move(c));
+            for (auto& c : comps) {
+                if (c.status == IoStatus::Error) {
+                    ++failed;
+                } else if (c.status == IoStatus::Cancelled) {
+                    ++cancelled;
+                } else {
+                    ++completed;
                 }
+                EnqueueCompletion(std::move(c));
             }
             {
                 std::lock_guard<std::mutex> lk(qmu_);
@@ -218,7 +217,6 @@ void DiskIoDriver::SchedulerLoop() {
                 counters_.failed += failed;
                 counters_.cancelled += cancelled;
             }
-            ccv_.notify_all();
             qcv_.notify_all();
         }
     }
@@ -258,7 +256,8 @@ size_t DiskIoDriver::drainCompletionsForFile(uint64_t fileId, std::vector<IoComp
 
 void DiskIoDriver::waitForFile(uint64_t fileId, int timeoutMs) {
     std::unique_lock<std::mutex> lk(cmu_);
-    ccv_.wait_for(lk, std::chrono::milliseconds(timeoutMs < 0 ? 1000 : timeoutMs), [&] {
+    auto& waitState = fileWait_[fileId];
+    waitState.cv.wait_for(lk, std::chrono::milliseconds(timeoutMs < 0 ? 1000 : timeoutMs), [&] {
         auto it = completionsByFile_.find(fileId);
         return it != completionsByFile_.end() && !it->second.empty();
     });
@@ -276,30 +275,25 @@ void DiskIoDriver::requestCancel() {
         w.swap(writeQ_);
     }
     uint64_t flushed = 0;
-    {
-        std::lock_guard<std::mutex> lk(cmu_);
-        auto flush = [&](std::deque<IoRequest>& q) {
-            for (auto& req : q) {
-                IoCompletion c;
-                c.kind = req.kind;
-                c.fileId = req.fileId;
-                c.offset = req.offset;
-                c.requested = req.length;
-                c.userTag = req.userTag;
-                c.status = IoStatus::Cancelled;
-                completionOrder_.push_back(c.fileId);
-                completionsByFile_[c.fileId].push_back(std::move(c));
-                ++flushed;
-            }
-        };
-        flush(r);
-        flush(w);
-    }
+    auto flush = [&](std::deque<IoRequest>& q) {
+        for (auto& req : q) {
+            IoCompletion c;
+            c.kind = req.kind;
+            c.fileId = req.fileId;
+            c.offset = req.offset;
+            c.requested = req.length;
+            c.userTag = req.userTag;
+            c.status = IoStatus::Cancelled;
+            EnqueueCompletion(std::move(c));
+            ++flushed;
+        }
+    };
+    flush(r);
+    flush(w);
     if (flushed > 0) {
         std::lock_guard<std::mutex> lk(countMu_);
         counters_.cancelled += flushed;
     }
-    ccv_.notify_all();
     qcv_.notify_all();
 }
 

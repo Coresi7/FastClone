@@ -1,4 +1,5 @@
 #include "file_index.h"
+#include "disk_io_driver.h"
 #include "path_utils.h"
 
 #ifdef _WIN32
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -49,6 +51,15 @@ FILETIME ToFileTimeFromNs(int64_t unixNs) {
     return ft;
 }
 #endif
+
+// Streaming read chunk / read-ahead window for ComputeFileHashViaDriver. Values match the server's
+// signature/hash single-pass constants (kServerSigChunkBytes / kServerReadAhead in
+// sync_engine_server.cpp): 1 MiB chunk, 4-deep read-ahead. XXH3 streaming is chunk-size independent
+// so the resulting Hash256 is identical to ComputeFileHash's inline read (fastcheck-parallel-hash
+// NFR-02/AC-14).
+constexpr uint32_t kHashChunkBytes = 1u << 20;
+constexpr uint32_t kHashReadAhead = 4;
+constexpr uint64_t kSmallFileDirectThreshold = 256u * 1024u;
 
 fs::file_time_type::duration FileToSystemEpochDelta() {
     using namespace std::chrono;
@@ -322,6 +333,114 @@ Hash256 ComputeHashFromSource(const std::function<size_t(uint8_t*, size_t)>& sou
     Hash256 output{};
     std::memcpy(output.data(), &digest, output.size());
     return output;
+}
+
+Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& path) {
+    // Shared hash read path for FastCheck + server hash-miss:
+    //  - <=256 KiB: one driver read request + ComputeBufferHash over real bytes
+    //  - >256 KiB : existing SequentialReader streaming path
+    std::error_code ec;
+    const uint64_t fileSize = static_cast<uint64_t>(fs::file_size(path, ec));
+    if (ec) {
+        throw std::runtime_error("ComputeFileHashViaDriver: file_size failed");
+    }
+    const uint64_t fid =
+        driver.openFile(path.string(), fc::io::OpKind::Read, /*unbuffered=*/true, 0);
+    if (fid == 0) {
+        throw std::runtime_error("ComputeFileHashViaDriver: open failed");
+    }
+
+    struct FileCloser {
+        fc::io::DiskIoDriver& driver;
+        uint64_t fileId = 0;
+        ~FileCloser() { driver.closeFile(fileId); }
+    } closer{driver, fid};
+
+    if (fileSize == 0) {
+        return ComputeBufferHash(nullptr, 0);
+    }
+
+    if (fileSize <= kSmallFileDirectThreshold) {
+        const fc::io::AlignInfo align = driver.queryAlign(path.string());
+        if (align.ioGranularity == 0) {
+            throw std::runtime_error("ComputeFileHashViaDriver: invalid io granularity");
+        }
+        const uint64_t reqOffset = fc::io::AlignDown(0, align.ioGranularity);
+        const uint64_t reqLength = fc::io::AlignUp(fileSize, align.ioGranularity);
+        if (reqLength == 0 || reqLength > (std::numeric_limits<uint32_t>::max)()) {
+            throw std::runtime_error("ComputeFileHashViaDriver: request too large");
+        }
+
+        fc::io::IoRequest req;
+        req.kind = fc::io::OpKind::Read;
+        req.fileId = fid;
+        req.offset = reqOffset;
+        req.length = static_cast<uint32_t>(reqLength);
+        req.prio = fc::io::Prio::Small;
+        req.userTag = 0;
+
+        std::vector<fc::io::IoRequest> batch;
+        batch.push_back(std::move(req));
+        const size_t accepted = driver.submit(batch);
+        if (accepted != 1 || !batch.empty()) {
+            throw std::runtime_error("ComputeFileHashViaDriver: submit failed");
+        }
+
+        std::vector<fc::io::IoCompletion> comps;
+        driver.drainCompletionsForFile(fid, comps);
+        if (comps.empty()) {
+            driver.waitForFile(fid, 1000);
+            driver.drainCompletionsForFile(fid, comps);
+        }
+        if (comps.size() != 1) {
+            throw std::runtime_error("ComputeFileHashViaDriver: completion count mismatch");
+        }
+        const fc::io::IoCompletion& comp = comps.front();
+        if (comp.status == fc::io::IoStatus::Error || comp.status == fc::io::IoStatus::Cancelled) {
+            throw std::runtime_error("ComputeFileHashViaDriver: read failed");
+        }
+        if (comp.status == fc::io::IoStatus::Eof && comp.transferred < fileSize) {
+            throw std::runtime_error("ComputeFileHashViaDriver: early eof");
+        }
+        if (comp.transferred < fileSize || comp.data.size() < static_cast<size_t>(fileSize)) {
+            throw std::runtime_error("ComputeFileHashViaDriver: short read");
+        }
+        return ComputeBufferHash(comp.data.data(), static_cast<size_t>(fileSize));
+    }
+
+    bool readErr = false;
+    std::vector<uint8_t> chunkBuf;
+    size_t chunkPos = 0;
+    fc::io::SequentialReader reader(driver, fid, fileSize, kHashChunkBytes, kHashReadAhead);
+    auto source = [&](uint8_t* dst, size_t maxLen) -> size_t {
+        size_t written = 0;
+        while (written < maxLen) {
+            if (chunkPos < chunkBuf.size()) {
+                const size_t take = std::min<size_t>(chunkBuf.size() - chunkPos, maxLen - written);
+                std::memcpy(dst + written, chunkBuf.data() + chunkPos, take);
+                chunkPos += take;
+                written += take;
+                continue;
+            }
+            bool ok = true;
+            chunkBuf.clear();
+            chunkPos = 0;
+            const uint32_t n = reader.next(chunkBuf, ok);
+            if (!ok) {
+                readErr = true;
+                break;
+            }
+            if (n == 0) {
+                break;  // clean EOF
+            }
+        }
+        return written;
+    };
+    const Hash256 hash = ComputeHashFromSource(source);
+    if (readErr) {
+        throw std::runtime_error("ComputeFileHashViaDriver: read failed");
+    }
+    return hash;
 }
 
 Hash256 ComputeBufferHash(const uint8_t* data, size_t len) {

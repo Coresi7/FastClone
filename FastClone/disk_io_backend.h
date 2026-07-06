@@ -61,14 +61,19 @@ struct BackendCounters {
 };
 
 // Config shared by the driver and backends.
+// Default memory upper bounds (chunkBytes defaults to 1 MiB):
+//   read in-flight payload <= maxInFlight * chunkBytes        = 64 MiB
+//   backend scratch       <= backendConcurrency * chunkBytes  = 8 MiB
+//   queued write payload  <= maxWriteQueue * chunkBytes       (unchanged cap)
+// These are per-driver-process bounds and never scale with a single file's total size.
 struct IoDriverConfig {
-    uint32_t backendConcurrency = 4;  // in-flight ops / worker threads for the pool backends
+    uint32_t backendConcurrency = 8;  // in-flight ops / worker threads for the pool backends
     uint32_t maxReadQueue = 256;
     uint32_t maxWriteQueue = 256;
     uint32_t readWeight = 1;          // fair-share credits (design section 3.2 / D-03)
     uint32_t writeWeight = 1;
     uint32_t chunkBytes = 1u << 20;   // 1 MiB read-ahead / write chunk granularity
-    uint32_t maxInFlight = 16;        // cap on submitted-not-completed ops (bounds memory, FR-12)
+    uint32_t maxInFlight = 64;        // cap on submitted-not-completed ops (bounds memory, FR-12)
     bool forceBuffered = false;       // tests: force the buffered path regardless of size
     bool recordSchedule = false;      // tests: record submitted-op direction order (AC-19/20)
 };
