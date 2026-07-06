@@ -1,6 +1,7 @@
 #include "check_engine.h"
 
 #include "compare_phase.h"
+#include "compare_pipeline.h"
 #include "disk_io_driver.h"
 #include "file_index.h"
 #include "protocol_codec.h"
@@ -126,6 +127,36 @@ std::optional<FileEntry> ProbeLocal(const fs::path& root, const std::string& rel
 #endif
 }
 
+// Strict-mode local probe injected into the ComparePipeline (fastcheck-compare-pipeline D-03). Strict
+// ignores mtime, so a single std::filesystem::directory_entry cached metadata query yields both the
+// type and the size (preserving the redundant-syscall-elim single-query semantics, dev-map RS-01):
+// not-found / directory / special / unreadable -> nullopt (Missing); a regular file -> size only.
+// DecideCompare(Strict, ...) then decides Missing / Diff (size differs) / needHash (size equal). mtime
+// is deliberately left 0 because Strict never consults it.
+std::optional<FileEntry> StrictProbe(const fs::path& root, const std::string& rel) {
+    const fs::path abs = JoinLocal(root, rel);
+    std::error_code ec;
+    const fs::directory_entry entry(abs, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    std::error_code tec;
+    if (!entry.is_regular_file(tec) || tec) {
+        return std::nullopt;  // not found / directory / special -> Missing
+    }
+    std::error_code sec;
+    const uint64_t localSize = static_cast<uint64_t>(entry.file_size(sec));
+    if (sec) {
+        return std::nullopt;  // size unreadable -> Missing
+    }
+    FileEntry fe;
+    fe.relativePath = rel;
+    fe.isDirectory = false;
+    fe.fileSize = localSize;
+    fe.mtimeNs = 0;  // Strict ignores mtime
+    return fe;
+}
+
 }  // namespace
 
 std::size_t NextLocalWorkerCap(std::size_t currentCap, std::size_t maxCap, std::size_t taskQueueLen,
@@ -241,8 +272,6 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     struct HashTask {
         std::string rel;
         fs::path abs;
-        bool deferredStat = false;   // strict=true: worker probes local existence/size before deciding to hash
-        FileEntry remote;            // strict: worker calls DecideCompare against this (unused for Fast)
     };
     std::mutex hashTaskMu;
     std::condition_variable hashTaskCv;
@@ -251,14 +280,16 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     std::atomic<size_t> localHashInFlight{0};
     std::atomic<uint64_t> readFailSignal{0};
 
-    // Worker conclusion for a file (replaces the old localHashes/localHashFailed pair). strict defers
-    // the existence/size probe to the worker, so a worker may conclude Missing/SizeDiff without hashing;
-    // Fast/SizeOnly workers only ever produce Hashed or Failed (local already probed on the recv path).
+    // Worker conclusion for a file. With the shared ComparePipeline (fastcheck-compare-pipeline §4.3),
+    // the local existence/size probe already ran in the compare workers, so only size-equal files ever
+    // reach a hash worker: the worker's only job is to hash, producing Hashed or Failed. The Missing /
+    // SizeDiff kinds and the local backfill (candidate B) are gone -- those verdicts are recorded
+    // directly on the drain path (candidate A, decisions.md D-01). The final local FileEntry for
+    // recording comes from awaiting[rel].local (captured at enqueue time from the compare probe).
     struct LocalResult {
-        enum class Kind { Hashed, Missing, SizeDiff, Failed };
+        enum class Kind { Hashed, Failed };
         Kind kind = Kind::Failed;
-        Hash256 hash{};                 // valid only for Hashed
-        std::optional<FileEntry> local; // strict: backfills local_size; Fast: nullopt (use awaiting.local)
+        Hash256 hash{};  // valid only for Hashed
     };
     std::mutex hashResultMu;
     std::unordered_map<std::string, LocalResult> localResults;
@@ -307,11 +338,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                     hashTaskQueue.pop_front();
                 }
                 localHashInFlight.fetch_add(1, std::memory_order_relaxed);
-                // HashOne: current try/catch moved verbatim into a closure, backfilling local for the
-                // result. Failed keeps the existing read-fail signal semantics (readFailSignal drives
-                // the local-worker AIMD MD; main-thread finalize maps Failed -> localReadFailed).
-                auto hashOne = [&](const std::optional<FileEntry>& localForResult) -> LocalResult {
-                    LocalResult lr;
+                // Worker job: hash the (already size-equal) file. The local existence/size verdict was
+                // decided upstream in the compare pipeline, so every task that reaches here is a
+                // size-equal file that needs a content hash (Fast mtime-miss or Strict size-equal). The
+                // try/catch keeps the existing read-fail semantics: readFailSignal drives the local-worker
+                // AIMD MD; the main-thread finalize maps Failed -> localReadFailed.
+                LocalResult r;
+                {
                     Hash256 hash{};
                     bool hashFailed = false;
                     const auto h0 = std::chrono::steady_clock::now();
@@ -327,72 +360,11 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                         std::memory_order_relaxed);
                     hashOneCount.fetch_add(1, std::memory_order_relaxed);
                     if (hashFailed) {
-                        lr.kind = LocalResult::Kind::Failed;
+                        r.kind = LocalResult::Kind::Failed;
                     } else {
-                        lr.kind = LocalResult::Kind::Hashed;
-                        lr.hash = hash;
-                        lr.local = localForResult;
+                        r.kind = LocalResult::Kind::Hashed;
+                        r.hash = hash;
                     }
-                    return lr;
-                };
-                LocalResult r;
-                if (task.deferredStat) {
-                    // Change 1 (fastcheck-redundant-syscall-elim, FR-01..FR-04): strict decides the
-                    // local existence/size verdict here with a single std::filesystem metadata query
-                    // instead of ProbeLocal, removing the redundant GetFileAttributesExW+mtime probe
-                    // (M1/M2/NFR-02). This is behaviourally equivalent to DecideCompare(Strict,...):
-                    // no local -> Missing; size mismatch -> SizeDiff; size equal -> hashOne. strict
-                    // ignores mtime, so a minimal FileEntry (size only) suffices for record().
-                    // The metadata query here is deliberately NOT accounted into probe* (FR-08/M8),
-                    // so probeCount stays flat in strict steady state.
-                    //
-                    // NOTE (deviation from design §3.1.2 pseudocode, see 04-implementation.md): the
-                    // design assumed fs::file_size(path, ec) returns a non-empty ec for a directory /
-                    // special file so it maps to Missing (FR-02 / AC-04). On the MSVC STL that is NOT
-                    // the case: fs::file_size on a directory returns 0 with an EMPTY ec, which would
-                    // mis-classify a directory as SizeDiff and fail AC-04. To satisfy FR-02 + AC-04
-                    // portably while still using a SINGLE std::filesystem metadata query (FR-01
-                    // intent: one local metadata read, no ProbeLocal, no mtime), use directory_entry,
-                    // whose constructor performs exactly one cached attribute query that yields both
-                    // the type and the size. exists()/is_regular_file()/file_size() then read the
-                    // cache (no extra syscall). Not-found / directory / special / unreadable -> Missing.
-                    std::error_code ec;
-                    const fs::directory_entry entry(task.abs, ec);
-                    bool isRegular = false;
-                    uint64_t localSize = 0;
-                    if (!ec) {
-                        std::error_code tec;
-                        isRegular = entry.is_regular_file(tec) && !tec;
-                        if (isRegular) {
-                            std::error_code sec;
-                            localSize = static_cast<uint64_t>(entry.file_size(sec));
-                            if (sec) {
-                                isRegular = false;  // size unreadable -> Missing (FR-02)
-                            }
-                        }
-                    }
-                    if (!isRegular) {
-                        // FR-02/M3 + AC-04: not found / directory / special / unreadable -> Missing.
-                        r.kind = LocalResult::Kind::Missing;
-                        r.local = std::nullopt;
-                    } else if (localSize != task.remote.fileSize) {
-                        // FR-03/M4: size differs -> SizeDiff, no hash. local backfills localSize.
-                        FileEntry le;
-                        le.relativePath = task.rel;
-                        le.isDirectory = false;
-                        le.fileSize = localSize;
-                        r.kind = LocalResult::Kind::SizeDiff;
-                        r.local = le;
-                    } else {
-                        // FR-04/M5: size equal -> existing hashOne (Hashed/Failed semantics kept).
-                        FileEntry le;
-                        le.relativePath = task.rel;
-                        le.isDirectory = false;
-                        le.fileSize = localSize;
-                        r = hashOne(le);
-                    }
-                } else {
-                    r = hashOne(std::nullopt);  // Fast: local already probed on the recv path (awaiting.local)
                 }
                 const bool failed = (r.kind == LocalResult::Kind::Failed);
                 {
@@ -478,31 +450,19 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         result.entries.push_back(std::move(entry));
     };
 
-    // Finalize a paired file on the main thread: the worker's LocalResult and the remote HashResponse
-    // are both available (candidate A, D-01: Missing/SizeDiff also wait for the response before
-    // finalizing, but the remote hash is ignored for their classification, FR-06/NFR-07). Records once,
-    // rolls back the strict diagnostic over-accounting for Missing/SizeDiff (section 3.5), then erases
-    // awaiting + any pending server hash. Failed follows the existing local-read-failure semantics:
-    // set localReadFailed and leave the entry for teardown (no erase).
+    // Finalize a paired file on the main thread: the worker's LocalResult (Hashed/Failed) and the
+    // remote HashResponse are both available. Only size-equal files ever reach hash (Missing/SizeDiff
+    // were recorded directly on the compare drain path, candidate A / decisions.md D-01), so there is
+    // no diagnostic rollback here. The local FileEntry comes from awaiting[rel].local (captured at
+    // enqueue time from the compare probe). Records once, then erases awaiting + any pending server
+    // hash. Failed follows the existing local-read-failure semantics: set localReadFailed and leave
+    // the entry for teardown (no erase).
     auto finalizePaired = [&](std::unordered_map<std::string, HashNeed>::iterator a,
                               const LocalResult& lr, const Hash256& serverHash) {
         const std::string rel = a->first;
         switch (lr.kind) {
-            case LocalResult::Kind::Hashed: {
-                const std::optional<FileEntry>& loc =
-                    lr.local.has_value() ? lr.local : a->second.local;
-                record(ClassifyByHash(true, lr.hash, serverHash), a->second.remote, loc, true);
-                break;
-            }
-            case LocalResult::Kind::Missing:
-                record(fc::CompareCategory::Missing, a->second.remote, std::nullopt, false);  // FR-03
-                --hashEnqueued;
-                hashBytesTotal -= a->second.remote.fileSize;  // section 3.5 rollback
-                break;
-            case LocalResult::Kind::SizeDiff:
-                record(fc::CompareCategory::Diff, a->second.remote, lr.local, false);  // FR-04
-                --hashEnqueued;
-                hashBytesTotal -= a->second.remote.fileSize;  // section 3.5 rollback
+            case LocalResult::Kind::Hashed:
+                record(ClassifyByHash(true, lr.hash, serverHash), a->second.remote, a->second.local, true);
                 break;
             case LocalResult::Kind::Failed:
                 localReadFailed = true;
@@ -515,15 +475,15 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
 
     // Eager enqueue (FR-05): sending the HashRequest and queuing the local hash task happen in the
     // same step, so the network RTT + server hash overlaps the local SSD read. Also stamps sentAt
-    // for the network-window RTT sample (D-05).
+    // for the network-window RTT sample (D-05). The compare pipeline already probed the local file, so
+    // the worker only hashes (no deferred stat).
     auto sendHashRequest = [&](const HashNeed& need) {
         const std::string& rel = need.remote.relativePath;
         ch.send(Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
         awaiting.emplace(rel, need);
         {
             std::lock_guard<std::mutex> lk(hashTaskMu);
-            const bool deferred = (mode == CompareMode::Strict);
-            hashTaskQueue.push_back(HashTask{rel, JoinLocal(targetRoot, rel), deferred, need.remote});
+            hashTaskQueue.push_back(HashTask{rel, JoinLocal(targetRoot, rel)});
         }
         hashTaskCv.notify_one();
         sentAt[rel] = std::chrono::steady_clock::now();
@@ -745,25 +705,79 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         pump();  // response freed a window slot
     };
 
+    // Shared compare pipeline (fastcheck-compare-pipeline §4.1). The recv main thread only parses a
+    // frame, inserts into manifestPaths, and Enqueue()s; ALL local metadata probing runs in the compare
+    // worker pool (FR-02/AC-01/NFR-02). probe = ProbeLocal (Fast/SizeOnly, size+mtime, verbatim) or
+    // StrictProbe (Strict, size-only directory_entry, D-03), injected so DecideCompare reaches the same
+    // verdict as before (AC-24). onResultsReady wakes the main loop via the existing readyCv. Declared
+    // after clientDriver (§6.4) and explicitly Stop()/Join()ed before clientDriver is destroyed (AC-16).
+    fc::ComparePipelineConfig compareCfg;
+    compareCfg.mode = mode;
+    compareCfg.workerCount = std::max<std::size_t>(4, hardwareThreads);
+    compareCfg.batchPop = 32;
+    fc::LocalProbeFn compareProbe =
+        (mode == CompareMode::Strict)
+            ? fc::LocalProbeFn([&](const std::string& rel) { return StrictProbe(targetRoot, rel); })
+            : fc::LocalProbeFn([&](const std::string& rel) { return ProbeLocal(targetRoot, rel); });
+    fc::ComparePipeline comparePipeline(compareCfg, compareProbe, [&]() { readyCv.notify_one(); });
+
+    // Bounded in-flight for the compare pipeline (NFR-07/AC-31); overflow parks in delayedCompareEntries
+    // exactly like the FastClone client (mirrors maxInFlightCompareTasks).
+    const std::size_t kCompareInFlightCap = std::max<std::size_t>(8192, compareCfg.workerCount * 256);
+    std::deque<FileEntry> delayedCompareEntries;
+
+    // Drain compare results and route by outcome (fastcheck-compare-pipeline §4.1): needHash==false is
+    // final -> record; needHash==true -> hash schedule (Fast mtime-miss / Strict size-equal). The local
+    // FileEntry captured by the compare probe is carried into HashNeed for later record/pairing. Missing
+    // and SizeDiff are recorded here directly (candidate A: no eager HashRequest for them, no rollback).
+    auto drainCompare = [&]() {
+        std::vector<fc::ComparedItem> items;
+        comparePipeline.Drain(items);
+        for (fc::ComparedItem& item : items) {
+            if (item.outcome.needHash) {
+                hashQueue.push_back(HashNeed{item.remote, item.local});
+                hashBytesTotal += item.remote.fileSize;
+                ++hashEnqueued;
+            } else {
+                record(item.outcome.category, item.remote, item.local, false);
+            }
+        }
+        if (!items.empty()) {
+            pump();
+        }
+    };
+
     try {
         ch.send(Frame{MsgType::ManifestRequest, 0, {}});
-        while (!manifestDone || !hashQueue.empty() || inFlight > 0 || !awaiting.empty()) {
+        while (!manifestDone || comparePipeline.InFlight() > 0 || !delayedCompareEntries.empty() ||
+               !hashQueue.empty() || inFlight > 0 || !awaiting.empty()) {
             if (interrupted.load()) {
                 userInterrupted = true;
                 break;
             }
+            drainCompare();
             drainReady();
             if (localReadFailed) {
                 break;
             }
+            // Refill the compare pipeline from the overflow buffer while under the in-flight cap.
+            while (!delayedCompareEntries.empty() && comparePipeline.InFlight() < kCompareInFlightCap) {
+                comparePipeline.Enqueue(delayedCompareEntries.front());
+                delayedCompareEntries.pop_front();
+            }
+            comparePipeline.Flush();
             pump();
             maybeTuneLocal();
             maybeEmitProgress();
 
-            // Block on recv only when a frame is guaranteed in transit (manifest not done, or a
-            // HashResponse is in flight). Otherwise only local hashes remain outstanding -> wait for
-            // a worker completion instead of blocking recv forever (D-02, prevents deadlock).
-            const bool expectFrame = (!manifestDone) || (inFlight > 0);
+            // Receive a frame only when one is guaranteed in transit AND the compare pipeline has room:
+            // manifest not done and under the in-flight cap, or a HashResponse is in flight. Otherwise
+            // only local compare/hash work remains -> wait on a worker completion instead of blocking
+            // recv forever (D-02, prevents deadlock). When the compare pipeline saturates we stop
+            // pulling manifest until Drain frees in-flight (NFR-07 backpressure).
+            const bool manifestFramesWanted =
+                (!manifestDone) && (comparePipeline.InFlight() < kCompareInFlightCap);
+            const bool expectFrame = manifestFramesWanted || (inFlight > 0);
             if (expectFrame) {
                 const Frame frame = ch.recv();
                 if (frame.type == MsgType::ManifestEntry) {
@@ -772,26 +786,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                         continue;  // Directories do not participate in file comparison (EXTRA also counts files only).
                     }
                     ++counters.enumerated;
-                    manifestPaths.insert(remote.relativePath);
-                    if (mode == CompareMode::Strict) {
-                        // M1/FR-01: the recv thread does no local probe in strict; every file enters
-                        // the hash schedule (M2/FR-02). The worker defers the existence/size decision.
-                        hashQueue.push_back(HashNeed{remote, std::nullopt});
-                        hashBytesTotal += remote.fileSize;  // temporary upper bound; rolled back for Missing/SizeDiff (section 3.5)
-                        ++hashEnqueued;
-                        pump();
+                    manifestPaths.insert(remote.relativePath);  // recv-thread bookkeeping, not a stat (FR-13)
+                    // No local probe on the recv path for ANY mode (FR-02/AC-01): enqueue into the
+                    // compare pipeline; overflow above the in-flight cap parks in delayedCompareEntries.
+                    if (comparePipeline.InFlight() >= kCompareInFlightCap) {
+                        delayedCompareEntries.push_back(remote);
                     } else {
-                        // M6/FR-08/FR-09: Fast / SizeOnly recv path is preserved exactly.
-                        std::optional<FileEntry> local = ProbeLocal(targetRoot, remote.relativePath);
-                        const CompareOutcome out = DecideCompare(mode, local, remote);
-                        if (out.needHash) {
-                            hashQueue.push_back(HashNeed{remote, local});
-                            hashBytesTotal += remote.fileSize;
-                            ++hashEnqueued;
-                            pump();
-                        } else {
-                            record(out.category, remote, local, false);
-                        }
+                        comparePipeline.Enqueue(remote);
                     }
                 } else if (frame.type == MsgType::ManifestProgress) {
                     // Progress hint, ignore.
@@ -810,7 +811,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
             } else {
                 std::unique_lock<std::mutex> lk(readyMu);
                 readyCv.wait_for(lk, std::chrono::milliseconds(200),
-                                 [&]() { return !readyQueue.empty(); });
+                                 [&]() { return !readyQueue.empty() || comparePipeline.HasResults(); });
             }
         }
     } catch (const std::exception& ex) {
@@ -819,8 +820,11 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         errorText = ex.what();
     }
 
-    // Stop and join all hash workers, then finalize any pending results that are now ready. Runs on
-    // every exit path so no worker hangs and the driver is torn down only after join (FR-09/AC-16).
+    // Stop and join the compare pipeline first (no external blocking, so it drains fast), then the hash
+    // workers, then finalize any pending results now ready. Runs on every exit path so no worker hangs
+    // and the driver is torn down only after every worker has joined (FR-09/AC-16).
+    comparePipeline.Stop();
+    comparePipeline.Join();
     joinWorkers();
     if (!localReadFailed) {
         drainReady();

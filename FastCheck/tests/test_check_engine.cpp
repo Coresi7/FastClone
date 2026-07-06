@@ -61,9 +61,27 @@ struct MockChannel {
     std::vector<Frame> sent;
     bool recvThrowsImmediately = false;
 
+    // Optional request-reactive hash responder. When useResponder is set, send() appends the mapped
+    // HashResponse to inbound on each HashRequest -- modelling the real server, which emits a
+    // HashResponse only in reply to a HashRequest, so on-the-wire response order always equals request
+    // order regardless of the client's internal compare ordering (which the parallel compare pipeline
+    // no longer keeps in manifest order). Tests using the responder must NOT also pre-push HashResponse
+    // frames into inbound.
+    bool useResponder = false;
+    std::unordered_map<std::string, Hash256> hashResponder;
+
     FrameChannel Make() {
         FrameChannel ch;
-        ch.send = [this](const Frame& frame) { sent.push_back(frame); };
+        ch.send = [this](const Frame& frame) {
+            sent.push_back(frame);
+            if (useResponder && frame.type == MsgType::HashRequest) {
+                const std::string rel = DecodeHashRequest(frame.payload);
+                const auto it = hashResponder.find(rel);
+                if (it != hashResponder.end()) {
+                    inbound.push_back(Frame{MsgType::HashResponse, 0, EncodeHashResponse(rel, it->second)});
+                }
+            }
+        };
         ch.recv = [this]() -> Frame {
             if (recvThrowsImmediately || inbound.empty()) {
                 throw std::runtime_error("recv failed WSA=0 (mock EOF)");
@@ -592,10 +610,11 @@ void TestCheckersOneSerializesHash() {
     mock.inbound.push_back(ManifestEntryFrame("b.txt", 3));
     mock.inbound.push_back(ManifestEntryFrame("c.txt", 3));
     mock.inbound.push_back(ManifestEndFrame());
-    // Response order matches request order (with checkers=1 at most one is in flight, responses return in order).
-    mock.inbound.push_back(HashResponseFrame("a.txt", ha));
-    mock.inbound.push_back(HashResponseFrame("b.txt", hb));
-    mock.inbound.push_back(HashResponseFrame("c.txt", hc));
+    // checkers=1 keeps at most one HashRequest in flight, but the parallel compare pipeline may emit
+    // requests in a non-manifest order, so use the request-reactive responder (models the real server:
+    // one HashResponse per HashRequest, in request order) instead of a fixed pre-scripted response order.
+    mock.useResponder = true;
+    mock.hashResponder = {{"a.txt", ha}, {"b.txt", hb}, {"c.txt", hc}};
 
     CheckOptions o = BaseOptions(dir, Mode::Fast);
     o.checkers = 1;
@@ -1053,10 +1072,10 @@ void TestNetWindowAimd() {
     Expect(NextNetWindow(1, 1000.0, 100.0, 1, 256) == 1, "AIMD-net floor windowMin on spike (AC-11)");
 }
 
-// V-02 (AC-03/AC-06): strict Missing decided on the WORKER path. The manifest lists a file absent
-// locally; recv performs no probe (M1/FR-01), so the worker's ProbeLocal->DecideCompare concludes
-// Missing without hashing. A HashRequest is still sent eagerly, and the (arbitrary) remote
-// HashResponse must not change the Missing classification (FR-06/NFR-07).
+// V-02 (AC-03/AC-06): strict Missing decided on the compare-pipeline path. The manifest lists a file
+// absent locally; recv performs no probe (M1/FR-01), so the compare worker's StrictProbe->DecideCompare
+// concludes Missing without hashing. Under candidate A (decisions.md D-01) no HashRequest is sent for a
+// Missing file; any (arbitrary) unsolicited remote HashResponse is ignored (FR-06/NFR-07).
 void TestStrictMissingViaWorker() {
     const fs::path dir = MakeTempDir();
     // "gone.txt" is intentionally NOT created locally.
@@ -1076,8 +1095,8 @@ void TestStrictMissingViaWorker() {
     Expect(outcome.result.counters.missing == 1, "strict worker-path missing=1 (AC-03)");
     Expect(outcome.result.counters.same == 0 && outcome.result.counters.diff == 0,
            "strict missing yields no same/diff (AC-03)");
-    Expect(mock.CountSent(MsgType::HashRequest) == 1,
-           "strict missing still sends 1 HashRequest eagerly (AC-06)");
+    Expect(mock.CountSent(MsgType::HashRequest) == 0,
+           "strict missing sends NO HashRequest (candidate A, D-01)");
     Expect(outcome.exit == kDiffFound, "missing present -> exit 1");
     const DiffEntry* m = FindEntry(outcome.result, "gone.txt");
     Expect(m != nullptr, "gone.txt MISSING entry present");
@@ -1091,9 +1110,9 @@ void TestStrictMissingViaWorker() {
     fs::remove_all(dir, ec);
 }
 
-// V-03 (AC-04/AC-06): strict size-difference decided on the WORKER path. Local file exists but its
-// size differs from the manifest; the worker concludes Diff without hashing. HashRequest still sent;
-// arbitrary remote HashResponse ignored (FR-06).
+// V-03 (AC-04/AC-06): strict size-difference decided on the compare-pipeline path. Local file exists
+// but its size differs from the manifest; the compare worker concludes Diff without hashing. Under
+// candidate A (D-01) no HashRequest is sent for a SizeDiff file; an unsolicited HashResponse is ignored.
 void TestStrictSizeDiffViaWorker() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "s.txt", "12345");  // 5 bytes local; manifest says 999 -> size diff
@@ -1113,8 +1132,8 @@ void TestStrictSizeDiffViaWorker() {
     Expect(outcome.result.counters.diff == 1, "strict worker-path size-diff diff=1 (AC-04)");
     Expect(outcome.result.counters.same == 0 && outcome.result.counters.missing == 0,
            "strict size-diff yields no same/missing (AC-04)");
-    Expect(mock.CountSent(MsgType::HashRequest) == 1,
-           "strict size-diff still sends 1 HashRequest eagerly (AC-06)");
+    Expect(mock.CountSent(MsgType::HashRequest) == 0,
+           "strict size-diff sends NO HashRequest (candidate A, D-01)");
     Expect(outcome.exit == kDiffFound, "diff present -> exit 1");
     const DiffEntry* d = FindEntry(outcome.result, "s.txt");
     Expect(d != nullptr, "s.txt DIFF entry present");
@@ -1128,10 +1147,10 @@ void TestStrictSizeDiffViaWorker() {
 }
 
 // V-06 (AC-07/AC-08): arrival-order independence for strict Missing / SizeDiff / size-equal in a
-// single batch. The Missing and SizeDiff responses are scripted to arrive BEFORE ManifestEnd (i.e.
-// likely before the worker finishes probing), exercising the serverHashReady pending path; the
-// size-equal response arrives after. Correctness holds on either ordering, so the assertions only
-// check the final invariants (each file classified exactly once).
+// single batch. Under candidate A (D-01) only the size-equal file sends a HashRequest; the Missing and
+// SizeDiff files are classified on the compare-drain path, so their scripted early HashResponses are
+// unsolicited and ignored. Correctness holds on either ordering, so the assertions only check the
+// final invariants (each file classified exactly once).
 void TestStrictOrderingMissingDiff() {
     const fs::path dir = MakeTempDir();
     WriteFile(dir / "s.txt", "12345");   // 5 bytes, manifest 999 -> size diff
@@ -1166,7 +1185,8 @@ void TestStrictOrderingMissingDiff() {
     Expect(outcome.result.entries.size() == 2,
            "exactly 2 listed entries (Missing+SizeDiff), no duplicates (AC-07/AC-08)");
     Expect(outcome.exit == kDiffFound, "diff/missing present -> exit 1");
-    Expect(mock.CountSent(MsgType::HashRequest) == 3, "3 HashRequests (one per manifest file)");
+    Expect(mock.CountSent(MsgType::HashRequest) == 1,
+           "1 HashRequest (only the size-equal file; candidate A, D-01)");
     AssertNoTransferFrames(mock);
 
     std::error_code ec;
@@ -1251,7 +1271,8 @@ void TestStrictMixed() {
     Expect(outcome.result.counters.missing == 1, "mixed strict missing=1 (AC-14)");
     Expect(outcome.result.counters.extraLocal == 1, "mixed strict extra_local=1 (AC-14)");
     Expect(outcome.result.counters.TotalCompared() == 4, "mixed strict total_compared=4 (AC-14)");
-    Expect(mock.CountSent(MsgType::HashRequest) == 4, "4 HashRequests (one per manifest file)");
+    Expect(mock.CountSent(MsgType::HashRequest) == 2,
+           "2 HashRequests (only the 2 size-equal files; candidate A, D-01)");
     Expect(outcome.exit == kDiffFound, "differences present -> exit 1");
     AssertNoTransferFrames(mock);
 
