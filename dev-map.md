@@ -143,3 +143,35 @@
   - POSIX/uring：read direct 门控与 `expectedSize` **解耦**（`mode==Read ? false : true`），read 恒 buffered，保持既有 direct/buffered 策略与 `smallFileFallback` 计数（FR-25/AC-39）。写路径不变。
   - 调用点传已知大小：`file_index.cpp ComputeFileHashViaDriver`（传 `fileSize`）；`sync_engine_server.cpp` BlockSig miss（传 `fileSize`）、DeltaRangeOpen（前置 零长度/`offset+length` 溢出 → `DeltaError` 不 open，否则传 `offset+length` 读取边界）；`sync_engine_client.cpp` `finalizeDelta`（传 `verifySize`）、`buildDeltaPlanOffloaded`（旧文件传 `oldLen`）。HashRequest miss 仍走 `ComputeFileHashViaDriver(GetServerDiskIoDriver(), abs)`，无服务端专用 hash 分支（FR-19..FR-24/M12）。
 - **RS-04 测试落点（追加）**：`FastCheck/tests/test_check_engine.cpp` +`TestStrictSizeDiffLocalGreater`(AC-06) +`TestStrictDirIsMissing`(AC-04) +`#if _WIN32 TestStrictToctouFailed`(AC-09，无共享句柄锁使 driver read open 失败)；既有 strict 用例（Missing/SizeDiff/ordering/no-diskio/mixed/hash）不变即回归基线。`tests/test_disk_io_align.cpp` +`TestQueryAlignSameVolumeReuse`(AC-17) +`TestQueryAlignBounded`(AC-20，用 `AlignCacheSizeForTest`) +`TestQueryAlignConcurrent`(AC-19) +`#if _WIN32 TestQueryAlignMultiVolumeWindows`(AC-18，环境门控 ≥2 固定卷否则 skip)。`tests/test_disk_io_driver.cpp` +`RealBackendReadKnownSize`(AC-24/25，known vs unknown expectedSize 读回字节一致)。
+
+## 热路径 syscall 降低（fastcheck-perf-tune）
+
+`docs/tasks/fastcheck-perf-tune/`。在**不增加 auto 模式 worker 数**、不改 hash / 协议 / 分类 / mtime 单位 / 诊断输出 / 同步行为的前提下，减少四条热路径的每文件 kernel transition 与目录锁争用。四项改动互不耦合，按 A–E 提交拆分。
+
+| Change | 文件 / 符号 | 做法 |
+|---|---|---|
+| 0 (commit A) hash-worker auto pin | `FastCheck/check_engine.cpp/.h` `ResolveMaxHashWorkers(hashWorkers, hardwareThreads)` | auto（`--hash-workers 0`）把 `maxWorkers` **钉为 `hardwareThreads`**（不再 AIMD 上探到 `4*hw`）；显式 `--hash-workers N` 保持 `max(N, 4*hw)`。上限公式抽为纯函数（与 `NextLocalWorkerCap`/`NextNetWindow` 同范式），`RunCheck` 调用之，值完全等价。`hashWorkerCap` 活跃门控/`--checkers`/HashRequest/HashResponse/drain/`--no-diskio-driver`/诊断行零改动。 |
+| 1 (commit B) 服务端 manifest 复用 directory_entry | `FastClone/sync_engine_server.cpp` POSIX `listOneDir` | `fs::file_size(absPath, ec)` → `it->file_size(ec)`；`ToUnixNs(fs::last_write_time(absPath, ec))` → `ToUnixNs(it->last_write_time(ec))`。`ToUnixNs` 调用点、单位、错误置 0 逐字保留。**仅 POSIX 分支**：Windows 分支走 `FindFirstFileW`（`WIN32_FIND_DATAW` 已含 size+mtime，无 `fs::file_size` 可换），不触碰。 |
+| 2 (commit C) EnsureParentDir 每 worker 目录缓存 | `FastClone/sync_util.h/.cpp` `PerWorkerDirCache` + `EnsureParentDir(path, cache)` + `EnsureParentDirCached<EnsureFn>`；`sync_engine_client.cpp` 四落点 | 每 worker 一份 `PerWorkerDirCache`（无锁、非线程安全、不跨 worker 共享）。命中 → 零 filesystem syscall；miss → 走现有 `CreateDirectoriesLong` 后 `DirExists` 探测，成功才 `addWithAncestors`（parent + 全部 ancestor，键切分复用 `CreateDirectoriesLong` 的卷根定位逻辑，保证与后续 `contains` 查询字符串一致）；失败不缓存（下次仍走 miss）。核心抽成模板 `EnsureParentDirCached<EnsureFn>`（命中 early-return 不触碰算子，零开销；测试注入计数/失败替身）。 |
+| 3 (commit D) BuildIndex 枚举期捕获 file_size | `FastClone/file_index.cpp` `BuildIndex` | `Candidate` 增 `uint64_t fileSize`；迭代阶段对普通文件 `item.file_size(ec)`（失败即跳过该候选，等价旧 worker `fs::file_size` 失败→`continue` 的用户可见结果），worker 阶段用 `c.fileSize` 复用，**不再** `fs::file_size(c.absPath, sec)`。mtime 路径不动，继续 `ReadFileMtimeCanonical`。 |
+| E (commit E) | 本节 | dev-map 追加记录。 |
+
+### 客户端四落点（Change 2，FR-13）
+
+| # | 位置 | worker 上下文 | cache 归属 |
+|---|---|---|---|
+| 1 | 整文件下载写 `EnsureParentDir(abs, dirCache)` | `ioWorkers` 池 lambda | lambda 顶部（while 前）`PerWorkerDirCache dirCache`，跨 batch 复用 |
+| 2 | 单文件下载 open 前（`tryStartTransfers`） | 主调度循环（单线程） | 会话作用域 `PerWorkerDirCache mainThreadDirCache` |
+| 3 | delta 重建 temp 文件（`buildDeltaPlanOffloaded`） | `deltaPlanWorkers` 池 | 给 `buildDeltaPlanOffloaded` 增 `PerWorkerDirCache&` 参数，worker while 顶部持一份传入 |
+| 4 | batch 零字节文件 finalize（`processIncomingFrame`） | 主/帧处理（单线程） | 复用落点 2 的 `mainThreadDirCache`（`tryStartTransfers` 与 `processIncomingFrame` 均只在主循环线程 L3537/L3895 调用，同线程私有，无跨 worker 共享） |
+
+### 行为等价红线（不得触碰）
+- `Hash256` 长度 / XXH3 / hash 字节布局 / 比较规则；网络协议 / frame 编解码 / 握手 / HashRequest / HashResponse / manifest / delta payload。
+- `compare_phase*` 分类规则 / 报告字段 / 退出码；mtime 单位 / 规范化 / `ReadFileMtimeCanonical`（Change 3 只碰 size，mtime 完全不动）。
+- disk IO scheduler / 默认 disk IO 并发；**auto 模式 worker count 不得增加**（Change 0 只 pin 上限）；delta verify read-back；不新增 client hash memcache / 跨进程 / 持久化 / 全局目录 cache；既有诊断行不删 / 不改名 / 不弱化。
+
+### 测试 / 构建
+- 新增测试：`FastCheck/tests/test_check_engine.cpp` `TestResolveMaxHashWorkers`（auto hw=1/2/8/20 pin、显式 `max(N,4*hw)` 含 hw=1 边界，AC-03/04）；`tests/test_manifest_dirent.cpp` `RunManifestDirentTests`（`directory_entry` vs `fs` 的 size/mtime/ec 及 `ToUnixNs` 逐值等价 + 删除后错误路径，AC-06..10）；`tests/test_sync_util.cpp` `RunSyncUtilTests`（`EnsureParentDirCached` 注入计数替身：hit/miss/ancestor/fail-not-cached/多 worker，AC-12..16）；`tests/test_file_index.cpp` `RunBuildIndexFileSizeTests`（空/小/大/目录 size 捕获等价，AC-21；既有 mtime 断言守 AC-22）。两个新 FastClone 测试文件登记进 `CMakeLists.txt` `FastCloneTests` 源列表 + `tests/test_main.cpp` `RunManifestDirentTests`/`RunSyncUtilTests`。
+- **测试闭包边界**：`sync_engine_server.cpp` / `sync_engine_client.cpp` 未链入 `FastCloneTests`（`CMakeLists.txt` 源列表实测），故 Change 1/2 用**被替换 API 的等价单测 + 静态审查**，非整条 server/client 走查（既有边界，NFR-07 禁止扩链）。
+- 构建/运行：`cmake --build _bl_x64 --target FastCheckTests --config Release`、`... FastCloneTests ...`；`_bl_x64\Release\FastCheckTests.exe`、`_bl_x64\Release\FastCloneTests.exe`。
+- **FastCheckTests 已知间歇性 hang**（S-06 记载的 pre-existing 问题，非本任务范畴）：运行时若 hang/超时/未通过，**最多重试 3 次**，3 次内一次通过即算通过；每次结果记入实现文档。
