@@ -491,7 +491,10 @@ void EnumerateManifestEntriesFast(
             if (isDir) {
                 entry.fileSize = 0;
             } else {
-                entry.fileSize = static_cast<uint64_t>(fs::file_size(absPath, ec));
+                // Change 1 (fastcheck-perf-tune, FR-04): reuse the size the directory_iterator already
+                // cached for this entry instead of a second independent stat on absPath. Error path is
+                // byte-identical to the former fs::file_size(absPath, ec): on failure skip the entry.
+                entry.fileSize = static_cast<uint64_t>(it->file_size(ec));
                 if (ec) {
                     ec.clear();
                     continue;
@@ -503,7 +506,9 @@ void EnumerateManifestEntriesFast(
                     out.push_back(Frame{MsgType::ManifestProgress, 0, std::move(payload)});
                 }
             }
-            entry.mtimeNs = ToUnixNs(fs::last_write_time(absPath, ec));
+            // Change 1 (fastcheck-perf-tune, FR-05/FR-06): reuse the directory_entry's cached mtime;
+            // the ToUnixNs conversion, unit, sign and error-to-0 handling are unchanged.
+            entry.mtimeNs = ToUnixNs(it->last_write_time(ec));
             if (ec) {
                 entry.mtimeNs = 0;
                 ec.clear();
