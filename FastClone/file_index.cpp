@@ -170,14 +170,21 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
         }
         uint64_t fileSize = 0;
         if (isRegular) {
-            // Reuse the directory_entry's cached size (MSVC reuses the enumeration WIN32_FIND_DATA,
-            // not a new syscall). FR-17: on failure skip the candidate -- byte-for-byte the same
-            // user-visible result as the former worker-stage `fs::file_size` failure -> continue.
+#ifdef _WIN32
+            // MSVC directory_entry caches size from the enumeration WIN32_FIND_DATA (no extra
+            // syscall), so capture it here and reuse in the worker. On failure skip the candidate
+            // -- byte-for-byte the same user-visible result as the former worker-stage
+            // fs::file_size failure -> continue.
             std::error_code sizeEc;
             fileSize = static_cast<uint64_t>(item.file_size(sizeEc));
             if (sizeEc) {
                 continue;
             }
+#else
+            // POSIX readdir/getdents does not return file size, so item.file_size would issue a
+            // stat in this serial iteration loop. Defer the stat to the parallel worker (below) to
+            // keep enumeration cheap; fileSize stays 0 as a not-captured sentinel here.
+#endif
         }
         candidates.push_back(Candidate{absPath, isDir, isRegular, fileSize});
     }
@@ -203,9 +210,19 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                     entry.fileSize = 0;
                     entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else if (c.isRegular) {
+#ifdef _WIN32
                     // Change 3 (FR-16): reuse the size captured at iteration time (no second
                     // fs::file_size on c.absPath). mtime path is unchanged (FR-18): still canonical.
                     entry.fileSize = c.fileSize;
+#else
+                    // POSIX: size was not captured at iteration (readdir gives no size); stat here
+                    // in the worker (parallel). Same failure contract as the pre-Change-3 path.
+                    std::error_code sec;
+                    entry.fileSize = static_cast<uint64_t>(fs::file_size(c.absPath, sec));
+                    if (sec) {
+                        continue;
+                    }
+#endif
                     entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else {
                     continue;
