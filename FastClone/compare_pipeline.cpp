@@ -72,6 +72,10 @@ std::size_t ComparePipeline::QueuedTasks() const {
     return tasks_.size();
 }
 
+std::size_t ComparePipeline::PendingResults() const noexcept {
+    return pending_.load(std::memory_order_relaxed);
+}
+
 bool ComparePipeline::HasResults() const noexcept {
     return pending_.load(std::memory_order_relaxed) != 0;
 }

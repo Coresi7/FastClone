@@ -69,9 +69,10 @@ public:
     // Consumer side (caller main thread). Moves ready results into `out`, returns the count moved.
     std::size_t Drain(std::vector<ComparedItem>& out);
 
-    std::size_t InFlight() const noexcept;   // issued - drained (backpressure gate)
-    std::size_t QueuedTasks() const;         // pending probe tasks (diagnostics / optional tuning read)
-    bool HasResults() const noexcept;        // result queue non-empty (wait predicate, atomic)
+    std::size_t InFlight() const noexcept;      // issued - drained (backpressure gate)
+    std::size_t QueuedTasks() const;            // pending probe tasks (diagnostics / optional tuning read)
+    std::size_t PendingResults() const noexcept;  // ready-but-undrained result count (diagnostics)
+    bool HasResults() const noexcept;           // result queue non-empty (wait predicate, atomic)
 
     void Stop() noexcept;  // set stop flag + wake all workers (idempotent)
     void Join();           // join all workers (must run before the caller destroys its DiskIoDriver)

@@ -1,6 +1,7 @@
 #include "sync_engine_internal.h"
 
 #include "compare_phase.h"
+#include "compare_pipeline.h"
 
 namespace fs = std::filesystem;
 
@@ -59,8 +60,10 @@ enum class CompareAction {
 // the mtime tolerance / normalization / legacy raw-value fallback logic has been migrated verbatim into compare_phase,
 // and the Fast branch truth table is byte-level equivalent to the old implementation. Here we only map CompareOutcome
 // back to the client's existing CompareAction: Missing/Diff->TransferNow, Same->Skip, needHash->FallbackHash.
-CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
-    const CompareOutcome outcome = DecideCompare(CompareMode::Fast, localFile, remoteFile);
+// Map a CompareOutcome to the client's CompareAction. This is the ONE outcome->action truth table:
+// both the legacy DecideCompareAction entry point and the ComparePipeline drain path (fastcheck-
+// compare-pipeline FR-06) go through here, so the mapping stays byte-level identical (AC-05/AC-24).
+CompareAction CompareActionFromOutcome(const CompareOutcome& outcome) {
     if (outcome.needHash) {
         return CompareAction::FallbackHash;
     }
@@ -72,6 +75,10 @@ CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, con
         default:
             return CompareAction::Skip;
     }
+}
+
+CompareAction DecideCompareAction(const std::optional<FileEntry>& localFile, const FileEntry& remoteFile) {
+    return CompareActionFromOutcome(DecideCompare(CompareMode::Fast, localFile, remoteFile));
 }
 
 struct RemoveLocalExtrasResult {
@@ -921,25 +928,24 @@ int RunClient(const CliOptions& options) {
     std::unordered_set<std::string> localHashFailed;
     std::mutex fallbackReadyMu;
     std::deque<std::string> fallbackReadyQueue;
-    struct CompareTask {
-        FileEntry remote;
-    };
-    struct CompareResult {
-        std::string relPath;
-        CompareAction action = CompareAction::Skip;
-    };
-    std::mutex compareTaskMu;
-    std::condition_variable compareTaskCv;
-    std::deque<CompareTask> compareTasks;
-    std::mutex compareResultMu;
+    // Compare orchestration is delegated to the shared fc::ComparePipeline (fastcheck-compare-pipeline
+    // FR-01/§5): batch enqueue -> worker pool probe + DecideCompare -> main-thread Drain. The inline
+    // CompareTask/CompareResult structs, task/result queues, worker pool, stop flag and issued/handled
+    // counters that used to live here now live inside the component (design §8 extraction table). Only
+    // compareResultCv (woken by the pipeline's onResultsReady callback) and the diagnostics-only mtime
+    // delta samples stay on the client side; the pipeline object itself is declared after clientDriver
+    // further below (§6.4 lifetime).
     std::condition_variable compareResultCv;
-    std::deque<CompareResult> compareResults;
-    // Diagnostics-only: |local.mtimeNs - remote.mtimeNs| samples for size-equal files.
-    std::mutex mtimeDeltaMu;
+    // Dedicated mutex paired with compareResultCv for the main loop's brief timed wait. The pipeline
+    // owns its own internal result mutex; this one only guards the CV wait (predicate reads the
+    // pipeline's atomic HasResults()), replacing the former compareResultMu wait.
+    std::mutex compareWaitMu;
+    // Running total of compare results handled on the main thread (mirrors the pipeline's internal
+    // drained counter); feeds the stall-watchdog forward-progress signal. Main-thread only, no atomic.
+    size_t compareResultsHandled = 0;
+    // Diagnostics-only: |local.mtimeNs - remote.mtimeNs| samples for size-equal files (accumulated on
+    // the main-thread drain path now that probing lives in the pipeline workers).
     std::vector<int64_t> mtimeDeltas;
-    std::atomic<bool> compareStop = false;
-    std::atomic<size_t> compareTasksIssued = 0;
-    std::atomic<size_t> compareResultsHandled = 0;
 
     // Async file-write pool. Batch transfer payloads are buffered per file and handed
     // off here; workers do EnsureParentDir + open/write/close + SetFileModifyTime in
@@ -1587,60 +1593,18 @@ int RunClient(const CliOptions& options) {
     // Keep a deep in-flight window so the compare workers do not run dry while the
     // single main thread is busy ingesting a burst of manifest frames between refills.
     const size_t maxInFlightCompareTasks = std::max<size_t>(8192, static_cast<size_t>(compareWorkerCount) * 256);
-    constexpr size_t kCompareBatchPop = 32;
-    std::vector<std::thread> compareWorkers;
-    compareWorkers.reserve(compareWorkerCount);
-    for (uint32_t i = 0; i < compareWorkerCount; ++i) {
-        compareWorkers.emplace_back([&]() {
-            std::vector<int64_t> localMtimeDeltas;
-            std::vector<CompareTask> taskBatch;
-            taskBatch.reserve(kCompareBatchPop);
-            std::vector<CompareResult> resultBatch;
-            resultBatch.reserve(kCompareBatchPop);
-            while (true) {
-                taskBatch.clear();
-                {
-                    std::unique_lock<std::mutex> lock(compareTaskMu);
-                    compareTaskCv.wait(lock, [&]() { return compareStop.load() || !compareTasks.empty(); });
-                    if (compareStop.load() && compareTasks.empty()) {
-                        break;
-                    }
-                    const size_t take = std::min<size_t>(kCompareBatchPop, compareTasks.size());
-                    for (size_t j = 0; j < take; ++j) {
-                        taskBatch.push_back(std::move(compareTasks.front()));
-                        compareTasks.pop_front();
-                    }
-                }
-                resultBatch.clear();
-                for (const CompareTask& task : taskBatch) {
-                    CompareResult result;
-                    result.relPath = task.remote.relativePath;
-                    const std::optional<FileEntry> localProbe = probeLocalFile(task.remote.relativePath);
-                    if (diagnostics && localProbe.has_value() && localProbe->fileSize == task.remote.fileSize) {
-                        localMtimeDeltas.push_back(std::llabs(static_cast<long long>(localProbe->mtimeNs - task.remote.mtimeNs)));
-                    }
-                    result.action = DecideCompareAction(localProbe, task.remote);
-                    resultBatch.push_back(std::move(result));
-                }
-                if (!resultBatch.empty()) {
-                    {
-                        std::lock_guard<std::mutex> lock(compareResultMu);
-                        for (CompareResult& result : resultBatch) {
-                            compareResults.push_back(std::move(result));
-                        }
-                    }
-                    // Wake the main loop promptly so it can drain results and refill the
-                    // worker queue; without this the loop only polls once per iteration
-                    // and workers idle after exhausting the in-flight batch.
-                    compareResultCv.notify_one();
-                }
-            }
-            if (diagnostics && !localMtimeDeltas.empty()) {
-                std::lock_guard<std::mutex> lock(mtimeDeltaMu);
-                mtimeDeltas.insert(mtimeDeltas.end(), localMtimeDeltas.begin(), localMtimeDeltas.end());
-            }
-        });
-    }
+    // Shared compare pipeline (fastcheck-compare-pipeline §5): Fast mode, probe = probeLocalFile
+    // injected verbatim (preserves the FILETIME-ticks mtime representation, D-04/AC-24), workers wake
+    // the main loop via compareResultCv. Declared AFTER clientDriver (§6.4 lifetime): its destructor
+    // Stop()+Join()s the workers before clientDriver is destroyed (the compare workers do not touch the
+    // driver, but the ordering matches the design's teardown contract). Explicit Stop()/Join() below
+    // keep the deterministic teardown order on the clean and catch paths.
+    fc::ComparePipelineConfig comparePipelineCfg;
+    comparePipelineCfg.mode = CompareMode::Fast;
+    comparePipelineCfg.workerCount = compareWorkerCount;
+    comparePipelineCfg.batchPop = 32;
+    fc::ComparePipeline comparePipeline(comparePipelineCfg, probeLocalFile,
+                                        [&]() { compareResultCv.notify_one(); });
 
     // Directory-creation worker pool (see dirTasks declaration). Each worker pops a
     // batch and runs create_directories without holding any lock; concurrent creation
@@ -1857,22 +1821,21 @@ int RunClient(const CliOptions& options) {
         });
     }
 
-    auto handleCompareResult = [&](const CompareResult& r) {
-        const CompareAction action = r.action;
+    auto handleCompareResult = [&](const std::string& relPath, CompareAction action) {
         if (action == CompareAction::TransferNow) {
             // Size-different changed file (e.g. append/insert). delta gate G4 admits it only
             // when a readable local old version exists; brand-new files fall through to full.
-            if (!tryEnterDelta(r.relPath)) {
-                scheduleTransfer(r.relPath);
+            if (!tryEnterDelta(relPath)) {
+                scheduleTransfer(relPath);
             }
         } else if (action == CompareAction::Skip) {
             ++compared;
             ++unchanged;
         } else {
-            if (!hashRequested.contains(r.relPath)) {
-                hashRequested.insert(r.relPath);
+            if (!hashRequested.contains(relPath)) {
+                hashRequested.insert(relPath);
                 ++fallbackCount;
-                pendingHashRequests.push_back(r.relPath);
+                pendingHashRequests.push_back(relPath);
                 pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());
             }
         }
@@ -2362,31 +2325,11 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Batch hand-off buffer: compare tasks accumulated while processing one drained
-    // batch of manifest frames are flushed to the worker queue under a SINGLE lock +
-    // one notify_all, instead of one lock+notify per file. This removes the
-    // producer/consumer lock convoy on compareTaskMu that throttled enumeration
-    // throughput to a few tens of K/s while the CPU sat idle (all threads parked).
-    std::vector<CompareTask> compareDispatchBuffer;
-    auto enqueueCompareTask = [&](const FileEntry& e) {
-        compareDispatchBuffer.push_back(CompareTask{e});
-        // Count as issued immediately so in-flight gating stays accurate even before
-        // the buffer is flushed into compareTasks.
-        ++compareTasksIssued;
-    };
-    auto flushCompareDispatch = [&]() {
-        if (compareDispatchBuffer.empty()) {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(compareTaskMu);
-            for (CompareTask& t : compareDispatchBuffer) {
-                compareTasks.push_back(std::move(t));
-            }
-        }
-        compareTaskCv.notify_all();
-        compareDispatchBuffer.clear();
-    };
+    // Compare-task hand-off is now the pipeline's Enqueue (single-producer buffer, no lock) + Flush
+    // (one lock + notify_all for the whole drained batch). enqueueCompareTask/flushCompareDispatch are
+    // thin wrappers so the existing call sites stay readable (fastcheck-compare-pipeline §8 extraction).
+    auto enqueueCompareTask = [&](const FileEntry& e) { comparePipeline.Enqueue(e); };
+    auto flushCompareDispatch = [&]() { comparePipeline.Flush(); };
 
     // --- Binary delta (FC7) client orchestration (design section 6.1/section 6.7) ---
     auto makeDeltaTempPath = [&](const fs::path& target) -> fs::path {
@@ -2909,7 +2852,7 @@ int RunClient(const CliOptions& options) {
             if ((enumerated % 2048) == 0) {
                 ensureEntryReserve(enumerated + 2048);
             }
-            if ((compareTasksIssued.load() - compareResultsHandled.load()) >= maxInFlightCompareTasks) {
+            if (comparePipeline.InFlight() >= maxInFlightCompareTasks) {
                 delayedCompareEntries.push_back(e);
             } else {
                 enqueueCompareTask(e);
@@ -3256,7 +3199,7 @@ int RunClient(const CliOptions& options) {
     };
 
     auto updateStallWatchdog = [&](bool loopHadForwardProgress) {
-        const size_t compareHandledNow = compareResultsHandled.load();
+        const size_t compareHandledNow = compareResultsHandled;
         const size_t dirsDoneNow = dirTasksDone.load(std::memory_order_relaxed);
         const bool countersAdvanced = loopHadForwardProgress ||
                                       (enumerated != lastProgressEnumerated) ||
@@ -3298,18 +3241,14 @@ int RunClient(const CliOptions& options) {
             queuedIncomingManifestFrames = incomingManifestFrames.size();
             queuedIncomingBytes = incomingQueuedBytes;
         }
-        size_t queuedCompareTasks = 0;
-        {
-            std::lock_guard<std::mutex> lock(compareTaskMu);
-            queuedCompareTasks = compareTasks.size();
-        }
+        const size_t queuedCompareTasks = comparePipeline.QueuedTasks();
         size_t queuedHashTasks = 0;
         {
             std::lock_guard<std::mutex> lock(hashTaskMu);
             queuedHashTasks = hashTaskQueue.size();
         }
         const size_t hashLocalInflight = localHashInFlight.load(std::memory_order_relaxed);
-        const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
+        const size_t compareInflight = comparePipeline.InFlight();
         const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
         const size_t pendingTransfersTotal = pendingTransfers.size() + pendingBatchTransfers.size() +
                                              pendingRetryTransfers.size() + pendingRetryBatchTransfers.size();
@@ -3569,15 +3508,23 @@ int RunClient(const CliOptions& options) {
             }
             tryStartDeltaRanges();
             {
-                std::deque<CompareResult> ready;
-                {
-                    std::lock_guard<std::mutex> lock(compareResultMu);
-                    ready.swap(compareResults);
+                // Drain compare results from the shared pipeline and map each outcome to the client's
+                // CompareAction via the single outcome->action truth table (CompareActionFromOutcome),
+                // then feed the unchanged handleCompareResult state machine. Diagnostics-only mtime
+                // delta samples (size-equal files) are accumulated here now that probing runs in the
+                // pipeline workers (fastcheck-compare-pipeline §5.2).
+                std::vector<fc::ComparedItem> ready;
+                comparePipeline.Drain(ready);
+                for (const fc::ComparedItem& item : ready) {
+                    if (diagnostics && item.local.has_value() &&
+                        item.local->fileSize == item.remote.fileSize) {
+                        mtimeDeltas.push_back(std::llabs(
+                            static_cast<long long>(item.local->mtimeNs - item.remote.mtimeNs)));
+                    }
+                    handleCompareResult(item.remote.relativePath,
+                                        CompareActionFromOutcome(item.outcome));
                 }
-                for (const auto& r : ready) {
-                    handleCompareResult(r);
-                    ++compareResultsHandled;
-                }
+                compareResultsHandled += ready.size();
                 if (!ready.empty()) {
                     loopHadForwardProgress = true;
                 }
@@ -3607,7 +3554,7 @@ int RunClient(const CliOptions& options) {
                 }
             }
             while (!delayedCompareEntries.empty() &&
-                   (compareTasksIssued.load() - compareResultsHandled.load()) < maxInFlightCompareTasks) {
+                   comparePipeline.InFlight() < maxInFlightCompareTasks) {
                 FileEntry e = std::move(delayedCompareEntries.front());
                 delayedCompareEntries.pop_front();
                 enqueueCompareTask(e);
@@ -3677,16 +3624,8 @@ int RunClient(const CliOptions& options) {
             if (debugEnabled) {
                 const auto now = std::chrono::steady_clock::now();
                 if ((now - lastDebugPrint) >= std::chrono::seconds(1)) {
-                    size_t readyCompareResults = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(compareResultMu);
-                        readyCompareResults = compareResults.size();
-                    }
-                    size_t queuedCompareTasks = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(compareTaskMu);
-                        queuedCompareTasks = compareTasks.size();
-                    }
+                    const size_t readyCompareResults = comparePipeline.PendingResults();
+                    const size_t queuedCompareTasks = comparePipeline.QueuedTasks();
                     size_t queuedIncomingFrames = 0;
                     size_t queuedIncomingPriorityFrames = 0;
                     size_t queuedIncomingManifestFrames = 0;
@@ -3703,7 +3642,7 @@ int RunClient(const CliOptions& options) {
                         std::lock_guard<std::mutex> lock(hashTaskMu);
                         queuedHashTasks = hashTaskQueue.size();
                     }
-                    const size_t compareInflight = compareTasksIssued.load() - compareResultsHandled.load();
+                    const size_t compareInflight = comparePipeline.InFlight();
                     const size_t hashInflight = hashRequestsSent - hashResponsesReceived;
                     const size_t hashLocalInflight = localHashInFlight.load(std::memory_order_relaxed);
                     std::cerr << "[debug][client] enum=" << enumerated
@@ -3779,7 +3718,7 @@ int RunClient(const CliOptions& options) {
             }
 
             const bool allHashDone = (fallbackResolved == fallbackCount);
-            const bool allCompareDone = (compareResultsHandled.load() == compareTasksIssued.load());
+            const bool allCompareDone = (comparePipeline.InFlight() == 0);
             const bool deltaIdle = deltaStates.empty() && pendingDeltaSigRequests.empty() &&
                                    pendingDeltaRanges.empty() && activeDeltaRanges.empty() &&
                                    deltaPlanInFlight.load(std::memory_order_relaxed) == 0;
@@ -3872,16 +3811,16 @@ int RunClient(const CliOptions& options) {
                 //      the workers promptly instead of sleeping on incoming frames.
                 //  (b) genuinely nothing to do: wait on incoming frames.
                 const bool compareWorkPending =
-                    (compareTasksIssued.load() != compareResultsHandled.load()) || !delayedCompareEntries.empty();
+                    (comparePipeline.InFlight() > 0) || !delayedCompareEntries.empty();
                 if (ingestPaused || compareWorkPending) {
                     {
-                        std::unique_lock<std::mutex> lock(compareResultMu);
+                        std::unique_lock<std::mutex> lock(compareWaitMu);
                         compareResultCv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-                            return !compareResults.empty();
+                            return comparePipeline.HasResults();
                         });
                     }
-                    // updateStallWatchdog() takes its own locks (incomingMu/compareTaskMu/
-                    // hashTaskMu) on the warn path, so it MUST run with no loop mutex held.
+                    // updateStallWatchdog() takes its own locks (incomingMu/hashTaskMu) on the warn
+                    // path, so it MUST run with no loop mutex held.
                     updateStallWatchdog(loopHadForwardProgress);
                     continue;
                 }
@@ -3927,8 +3866,7 @@ int RunClient(const CliOptions& options) {
         for (auto& cptr : pool) {
             ShutdownBoth(cptr->socket);
         }
-        compareStop.store(true);
-        compareTaskCv.notify_all();
+        comparePipeline.Stop();
         hashStop.store(true);
         hashTaskCv.notify_all();
         deltaPlanStop.store(true);
@@ -3940,9 +3878,7 @@ int RunClient(const CliOptions& options) {
         for (auto& cptr : pool) {
             JoinDiag(cptr->recvThread, "client-catch-recv");
         }
-        for (auto& w : compareWorkers) {
-            JoinDiag(w, "client-catch-compare");
-        }
+        comparePipeline.Join();
         for (auto& w : hashWorkers) {
             JoinDiag(w, "client-catch-hash");
         }
@@ -3958,17 +3894,14 @@ int RunClient(const CliOptions& options) {
         throw;
     }
 
-    compareStop.store(true);
-    compareTaskCv.notify_all();
+    comparePipeline.Stop();
     hashStop.store(true);
     hashTaskCv.notify_all();
     deltaPlanStop.store(true);
     deltaPlanTaskCv.notify_all();
     ioStop.store(true);
     ioTaskCv.notify_all();
-    for (auto& w : compareWorkers) {
-        JoinDiag(w, "client-compare");
-    }
+    comparePipeline.Join();
     for (auto& w : hashWorkers) {
         JoinDiag(w, "client-hash");
     }
