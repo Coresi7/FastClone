@@ -150,6 +150,9 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
         fs::path absPath;
         bool isDirectory = false;
         bool isRegular = false;
+        // Change 3 (fastcheck-perf-tune, FR-15): file size captured during directory iteration and
+        // reused by the worker, so the worker no longer re-stats the file with fs::file_size.
+        uint64_t fileSize = 0;
     };
     std::vector<Candidate> candidates;
     for (const auto& item : fs::recursive_directory_iterator(canonicalRoot, fs::directory_options::skip_permission_denied)) {
@@ -157,13 +160,26 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
         if (canonicalExclude.has_value() && fs::exists(*canonicalExclude) && absPath == *canonicalExclude) {
             continue;
         }
-        if (canonicalExclude.has_value() && item.is_directory() && IsPathUnderRoot(absPath, *canonicalExclude)) {
+        const bool isDir = item.is_directory();
+        if (canonicalExclude.has_value() && isDir && IsPathUnderRoot(absPath, *canonicalExclude)) {
             continue;
         }
-        if (!item.is_directory() && !item.is_regular_file()) {
+        const bool isRegular = item.is_regular_file();
+        if (!isDir && !isRegular) {
             continue;
         }
-        candidates.push_back(Candidate{absPath, item.is_directory(), item.is_regular_file()});
+        uint64_t fileSize = 0;
+        if (isRegular) {
+            // Reuse the directory_entry's cached size (MSVC reuses the enumeration WIN32_FIND_DATA,
+            // not a new syscall). FR-17: on failure skip the candidate -- byte-for-byte the same
+            // user-visible result as the former worker-stage `fs::file_size` failure -> continue.
+            std::error_code sizeEc;
+            fileSize = static_cast<uint64_t>(item.file_size(sizeEc));
+            if (sizeEc) {
+                continue;
+            }
+        }
+        candidates.push_back(Candidate{absPath, isDir, isRegular, fileSize});
     }
 
     std::mutex pushMu;
@@ -187,11 +203,9 @@ std::vector<FileEntry> BuildIndex(const fs::path& root, const std::optional<fs::
                     entry.fileSize = 0;
                     entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else if (c.isRegular) {
-                    std::error_code sec;
-                    entry.fileSize = static_cast<uint64_t>(fs::file_size(c.absPath, sec));
-                    if (sec) {
-                        continue;
-                    }
+                    // Change 3 (FR-16): reuse the size captured at iteration time (no second
+                    // fs::file_size on c.absPath). mtime path is unchanged (FR-18): still canonical.
+                    entry.fileSize = c.fileSize;
                     entry.mtimeNs = ReadFileMtimeCanonical(c.absPath);
                 } else {
                     continue;

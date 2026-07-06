@@ -96,6 +96,8 @@ add_executable(FastCloneTests
     tests/test_disk_io_driver.cpp
     tests/test_read_gate.cpp
     tests/test_file_index.cpp
+    tests/test_manifest_dirent.cpp
+    tests/test_sync_util.cpp
     tests/test_hash_memcache.cpp
     tests/test_reconnect.cpp
     tests/test_route_selection.cpp

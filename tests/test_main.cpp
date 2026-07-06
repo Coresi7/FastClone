@@ -11,6 +11,8 @@ void RunDiskIoAlignTests();
 void RunDiskIoDriverTests();
 void RunReadGateTests();
 void RunFileIndexTests();
+void RunManifestDirentTests();
+void RunSyncUtilTests();
 void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
@@ -31,6 +33,8 @@ int main() {
         RunDiskIoDriverTests();
         RunReadGateTests();
         RunFileIndexTests();
+        RunManifestDirentTests();
+        RunSyncUtilTests();
         RunRouteSelectionTests();
         RunLinkSchedulerTests();
         RunWanTuningTests();
