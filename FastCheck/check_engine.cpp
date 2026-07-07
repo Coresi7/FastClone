@@ -566,7 +566,9 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         }
     };
 
-    // Progress line to stderr every 5s or every 50000 enumerated entries (FR-15/AC-12/NFR-07).
+    // Progress line to stderr once per second, mirroring FastClone's throttled per-batch print.
+    // The former 50000-entry count trigger fired multiple times per second under the batched recv
+    // path (200k files/s) and itself became a measurable cost on huge all-skip workloads.
     auto lastProgressAt = std::chrono::steady_clock::now();
     uint64_t lastProgressEnum = 0;
     // Last-snapshot for per-interval per-phase timing deltas (steady-state localization).
@@ -575,9 +577,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     uint64_t lastHashOneUs = 0, lastHashOneCount = 0;
     auto maybeEmitProgress = [&]() {
         const auto now = std::chrono::steady_clock::now();
-        const bool timeDue = (now - lastProgressAt) >= std::chrono::seconds(5);
-        const bool countDue = (counters.enumerated - lastProgressEnum) >= 50000;
-        if (!timeDue && !countDue) {
+        if ((now - lastProgressAt) < std::chrono::seconds(1)) {
             return;
         }
         lastProgressAt = now;
