@@ -794,34 +794,50 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                 (!manifestDone) && (comparePipeline.InFlight() < kCompareInFlightCap);
             const bool expectFrame = manifestFramesWanted || (inFlight > 0);
             if (expectFrame) {
-                const Frame frame = ch.recv();
-                if (frame.type == MsgType::ManifestEntry) {
-                    FileEntry remote = DecodeManifestEntry(frame.payload);
-                    if (remote.isDirectory) {
-                        continue;  // Directories do not participate in file comparison (EXTRA also counts files only).
-                    }
-                    ++counters.enumerated;
-                    manifestPaths.insert(remote.relativePath);  // recv-thread bookkeeping, not a stat (FR-13)
-                    // No local probe on the recv path for ANY mode (FR-02/AC-01): enqueue into the
-                    // compare pipeline; overflow above the in-flight cap parks in delayedCompareEntries.
-                    if (comparePipeline.InFlight() >= kCompareInFlightCap) {
-                        delayedCompareEntries.push_back(remote);
-                    } else {
-                        comparePipeline.Enqueue(remote);
-                    }
-                } else if (frame.type == MsgType::ManifestProgress) {
-                    // Progress hint, ignore.
-                } else if (frame.type == MsgType::ManifestEnd) {
-                    manifestDone = true;
-                } else if (frame.type == MsgType::HashResponse) {
-                    handleHashResponse(frame);
-                    if (localReadFailed) {
+                // Batch the receive: pull up to kRecvBatch frames per iteration and Enqueue each into the
+                // pipeline's lock-free dispatch buffer, so the single Flush()/notify_all at the top of the
+                // NEXT iteration covers the whole batch. Mirrors FastClone's batched ingest (one flush per
+                // ~512-8192 frames) -- a per-frame Flush() would notify_all all compare workers per frame
+                // (2.4M frames x 20 workers = 48M spurious wakeups + taskMu_ contention), which is the
+                // ~19x slowdown versus FastClone on all-skip workloads. Re-check stillWant before each
+                // recv so a blocking recv never waits for a frame that is not in transit (manifest done +
+                // no hash in flight); ManifestEnd / localReadFailed / batch full also end the batch.
+                constexpr size_t kRecvBatch = 4096;
+                for (size_t batched = 0; batched < kRecvBatch; ++batched) {
+                    const bool stillWant =
+                        (!manifestDone && comparePipeline.InFlight() < kCompareInFlightCap) || (inFlight > 0);
+                    if (!stillWant) {
                         break;
                     }
-                } else {
-                    // Check should not receive transfer frames like File*/Delta*/BlockSig*; log a diagnostic and ignore.
-                    std::cerr << "[check] unexpected frame in Check session type="
-                              << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
+                    const Frame frame = ch.recv();
+                    if (frame.type == MsgType::ManifestEntry) {
+                        FileEntry remote = DecodeManifestEntry(frame.payload);
+                        if (!remote.isDirectory) {
+                            ++counters.enumerated;
+                            manifestPaths.insert(remote.relativePath);  // recv-thread bookkeeping, not a stat (FR-13)
+                            // No local probe on the recv path for ANY mode (FR-02/AC-01): enqueue into the
+                            // compare pipeline; overflow above the in-flight cap parks in delayedCompareEntries.
+                            if (comparePipeline.InFlight() >= kCompareInFlightCap) {
+                                delayedCompareEntries.push_back(remote);
+                            } else {
+                                comparePipeline.Enqueue(remote);
+                            }
+                        }
+                    } else if (frame.type == MsgType::ManifestProgress) {
+                        // Progress hint, ignore.
+                    } else if (frame.type == MsgType::ManifestEnd) {
+                        manifestDone = true;
+                        break;  // nothing more expected this batch; top-of-loop drains + refills
+                    } else if (frame.type == MsgType::HashResponse) {
+                        handleHashResponse(frame);
+                        if (localReadFailed) {
+                            break;
+                        }
+                    } else {
+                        // Check should not receive transfer frames like File*/Delta*/BlockSig*; log a diagnostic and ignore.
+                        std::cerr << "[check] unexpected frame in Check session type="
+                                  << static_cast<int>(static_cast<uint8_t>(frame.type)) << std::endl;
+                    }
                 }
             } else {
                 std::unique_lock<std::mutex> lk(readyMu);
