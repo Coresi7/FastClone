@@ -7,6 +7,7 @@
 #include "disk_io_backend.h"
 #include "disk_io_driver.h"
 #include "file_index.h"
+#include "sync_util.h"
 
 #if defined(__linux__)
 // Linux-only: the io_uring runtime probe falls back to the pread/pwrite pool, which must report
@@ -1437,6 +1438,71 @@ void TestConcurrentQueryAlignAndReadIntegration() {
     fs::remove_all(dir, ec);
 }
 
+// Non-ASCII (Chinese) path round-trip through the REAL disk IO driver + the production
+// ComputeFileHashViaDriver code path (Chinese-source-directory fix). The disk IO backend decodes
+// path std::strings as UTF-8 (CP_UTF8); production now hands it fc::PathToUtf8(path) instead of
+// path.string() (CP_ACP). On CP_ACP=936 a path.string() revert would open a garbled filename and
+// fail to read back the bytes / produce a matching hash; on CP_ACP=65001 path.string() already
+// yields UTF-8 so the test stays green either way (the bug does not manifest there). The path bytes
+// are built from \x escapes (pure-ASCII source) and widened via CP_UTF8, so construction is also
+// codepage-independent. This is the end-to-end regression guard that activates on a 936 CI runner.
+void TestNonAsciiPathIoRoundTrip() {
+    namespace fs = std::filesystem;
+    // "中文目录" / "文件.txt" as UTF-8 byte escapes (see test_sync_util.cpp for the codepoints).
+    const std::string kDir = "\xe4\xb8\xad\xe6\x96\x87\xe7\x9b\xae\xe5\xbd\x95";
+    const std::string kFile = "\xe6\x96\x87\xe4\xbb\xb6.txt";
+    auto pathFromUtf8 = [&](const std::string& u8) -> fs::path {
+#ifdef _WIN32
+        return fs::path(fc::Utf8ToWide(u8));
+#else
+        return fs::path(u8);
+#endif
+    };
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path root = fs::temp_directory_path() / ("fc_nonascii_" + std::to_string(stamp));
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    const fs::path dir = root / pathFromUtf8(kDir);
+    fs::create_directories(dir, ec);
+    Require(fs::is_directory(dir), "nonascii: created Chinese-named directory");
+
+    const fs::path file = dir / pathFromUtf8(kFile);
+    const std::string pathUtf8 = fc::PathToUtf8(file);
+    const std::vector<uint8_t> payload = RandomBytes(200000, 314u);  // spans buffered + unbuffered
+
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.chunkBytes = 1u << 20;
+
+    // Write through the real backend using the same UTF-8 path shape production now uses.
+    WriteViaDriver(pathUtf8, payload, cfg);
+    Require(static_cast<uint64_t>(fs::file_size(file, ec)) == payload.size(),
+            "nonascii: on-disk size via Chinese-named path");
+
+    // Read back through the real backend and verify byte-exact content.
+    {
+        DiskIoDriver drv(cfg);
+        const std::vector<uint8_t> got =
+            ReadAllViaDriver(drv, pathUtf8, payload.size(), cfg.chunkBytes, /*expectedSize=*/payload.size());
+        Require(got == payload, "nonascii: real-backend read round-trips bytes through Chinese path");
+    }
+
+    // Production code-path guard: ComputeFileHashViaDriver (file_index.cpp now calls PathToUtf8)
+    // must match ComputeFileHash (ground truth: CreateFileW + path.wstring(), CP_ACP-independent).
+    DiskIoDriver drv(cfg);
+    const fc::Hash256 viaDriver = fc::ComputeFileHashViaDriver(drv, file);
+    const fc::Hash256 ground = fc::ComputeFileHash(file);
+    Require(fc::HashEquals(viaDriver, ground),
+            "nonascii: ComputeFileHashViaDriver == ComputeFileHash through Chinese-named path");
+    // And the driver path must itself be openable via the UTF-8 form (exercises queryAlign + openFile
+    // on a non-ASCII path, the exact pair the fix touched in file_index.cpp).
+    Require(drv.queryAlign(pathUtf8).ioGranularity > 0,
+            "nonascii: queryAlign resolves a Chinese-named UTF-8 path");
+
+    fs::remove_all(root, ec);
+}
+
 }  // namespace
 
 void RunDiskIoDriverTests() {
@@ -1462,6 +1528,7 @@ void RunDiskIoDriverTests() {
     TestReadOpenExpectedSizeContract();
     TestReadOpenExpectedSizeMismatch();
     TestConcurrentQueryAlignAndReadIntegration();
+    TestNonAsciiPathIoRoundTrip();
 #if defined(__linux__)
     TestPosixPoolAlignedDirectIo();
     TestUringFallbackCounter();

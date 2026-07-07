@@ -178,7 +178,15 @@ std::wstring ToExtendedLengthPath(const fs::path& path) {
 }
 #endif
 
-fs::path JoinRel(const fs::path& root, const std::string& relPath) {
+std::string PathToUtf8(const std::filesystem::path& path) {
+#ifdef _WIN32
+    return WideToUtf8(path.wstring());
+#else
+    return path.string();
+#endif
+}
+
+std::filesystem::path JoinRel(const std::filesystem::path& root, const std::string& relPath) {
 #ifdef _WIN32
     std::wstring full = root.wstring();
     for (wchar_t& c : full) {

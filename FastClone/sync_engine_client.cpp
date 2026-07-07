@@ -1811,7 +1811,7 @@ int RunClient(const CliOptions& options) {
                     // size are identical to the former trunc+write path.
                     const fs::path abs = JoinRel(options.rootDir, t.relPath);
                     EnsureParentDir(abs, dirCache);
-                    const bool ok = driverWriteWholeFile(abs.string(), t.data);
+                    const bool ok = driverWriteWholeFile(fc::PathToUtf8(abs), t.data);
                     if (ok) {
                         SetFileModifyTime(abs, t.mtimeNs);
                     }
@@ -2097,7 +2097,7 @@ int RunClient(const CliOptions& options) {
                 // unbuffered-writes FR-05: open the target on the unified driver instead of an
                 // ofstream. expectedSize=fileBytes lets the backend truncate to the exact size at
                 // close (ofstream-trunc-equivalent); fileId==0 is the former "!d.output" failure.
-                d.fileId = clientDriver.openFile(abs.string(), fc::io::OpKind::Write,
+                d.fileId = clientDriver.openFile(fc::PathToUtf8(abs), fc::io::OpKind::Write,
                                                  unbufferedWrites, fileBytes);
                 if (d.fileId == 0) {
                     retryOrFail(rel);
@@ -2406,7 +2406,7 @@ int RunClient(const CliOptions& options) {
                 // read above as the read-open expectedSize so the backend skips the redundant
                 // Windows FileSizeOnDisk query. The verify read bytes/decision are unchanged.
                 const uint64_t fid = clientDriver.openFile(
-                    st.tempPath.string(), fc::io::OpKind::Read, /*unbuffered=*/true, verifySize);
+                    fc::PathToUtf8(st.tempPath), fc::io::OpKind::Read, /*unbuffered=*/true, verifySize);
                 if (fid == 0) {
                     verifyOk = false;
                 } else {
@@ -2523,7 +2523,7 @@ int RunClient(const CliOptions& options) {
         // Change 3d (fastcheck-redundant-syscall-elim, FR-24): reuse oldLen (read above) as the
         // read-open expectedSize so the backend skips the redundant Windows FileSizeOnDisk query.
         const uint64_t oldFileId =
-            clientDriver.openFile(abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true, oldLen);
+            clientDriver.openFile(fc::PathToUtf8(abs), fc::io::OpKind::Read, /*unbuffered=*/true, oldLen);
         if (oldFileId == 0) {
             res.ok = false;
             res.fallbackReason = "old_unreadable";
@@ -2540,7 +2540,7 @@ int RunClient(const CliOptions& options) {
         EnsureParentDir(abs, dirCache);
         const fs::path tmp = makeDeltaTempPath(abs);
         const uint64_t tempFileId = clientDriver.openFile(
-            tmp.string(), fc::io::OpKind::Write, unbufferedWrites, task.sig.fileSize);
+            fc::PathToUtf8(tmp), fc::io::OpKind::Write, unbufferedWrites, task.sig.fileSize);
         bool ioOk = (tempFileId != 0);
         uint32_t copySubmitted = 0;
         uint32_t copyCompleted = 0;

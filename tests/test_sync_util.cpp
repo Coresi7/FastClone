@@ -35,6 +35,24 @@ struct CountingEnsure {
     }
 };
 
+// UTF-8 bytes for a non-ASCII path, built from \x escapes so the source file stays pure ASCII.
+// This makes the test independent of both the compiler's source charset and the system ANSI
+// codepage (CP_ACP). "中文目录" / "文件.txt":
+//   中=E4 B8 AD  文=E6 96 87  目=E7 9B AE  录=E5 BD 95  件=E4 BB B6
+const std::string kUtf8DirName = "\xe4\xb8\xad\xe6\x96\x87\xe7\x9b\xae\xe5\xbd\x95";  // 中文目录
+const std::string kUtf8FileName = "\xe6\x96\x87\xe4\xbb\xb6.txt";                       // 文件.txt
+
+// Build an fs::path from UTF-8 bytes WITHOUT going through the system ANSI codepage, so the
+// construction itself is correct on every Windows locale (CP_ACP=936 included): on Windows we
+// widen with CP_UTF8 and construct from the wide string; on POSIX the native byte string is UTF-8.
+fs::path PathFromUtf8(const std::string& utf8) {
+#ifdef _WIN32
+    return fs::path(fc::Utf8ToWide(utf8));
+#else
+    return fs::path(utf8);
+#endif
+}
+
 }  // namespace
 
 // fastcheck-perf-tune Change 2 (V-03a..e): PerWorkerDirCache + EnsureParentDirCached. Uses the
@@ -124,6 +142,31 @@ void RunSyncUtilTests() {
         fc::EnsureParentDir(f, cache);
         Expect(fs::is_directory(root / "real" / "nested"),
                "cache-hit EnsureParentDir leaves the directory intact");
+    }
+
+    // PathToUtf8 contract (Chinese-source-directory fix). The disk IO backend decodes path
+    // std::strings as UTF-8 (CP_UTF8), but on Windows path::string() yields CP_ACP bytes (GBK on a
+    // Simplified-Chinese locale), which corrupts any non-ASCII path. PathToUtf8 goes through
+    // wstring()+WideToUtf8 so the output is always UTF-8. These assertions are portable on every
+    // locale; on CP_ACP=936 they also catch a regression to `return path.string();` (the bytes
+    // would differ). On CP_ACP=65001 path::string() already yields UTF-8, so the two implementations
+    // converge and the guard is inert there -- that is a physical property of CP_ACP=65001, not a
+    // test gap; the contract asserted below (round-trip == original UTF-8) is correct everywhere.
+    {
+        const fs::path fileOnly = PathFromUtf8(kUtf8FileName);
+        Expect(fc::PathToUtf8(fileOnly) == kUtf8FileName,
+               "PathToUtf8 preserves non-ASCII filename bytes as UTF-8 (CP_ACP-independent)");
+
+        const fs::path nested = PathFromUtf8(kUtf8DirName) / PathFromUtf8(kUtf8FileName);
+#ifdef _WIN32
+        Expect(fc::Utf8ToWide(fc::PathToUtf8(nested)) == nested.wstring(),
+               "PathToUtf8 round-trips through Utf8ToWide to the original wide path");
+        Expect(fc::PathToUtf8(nested) == fc::WideToUtf8(nested.wstring()),
+               "PathToUtf8 must equal WideToUtf8(path.wstring()) on Windows (bypasses CP_ACP)");
+#else
+        Expect(fc::PathToUtf8(nested) == nested.string(),
+               "PathToUtf8 == path.string() on POSIX (native UTF-8)");
+#endif
     }
 
     std::error_code ec;

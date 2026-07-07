@@ -1,6 +1,7 @@
 #include "file_index.h"
 #include "disk_io_driver.h"
 #include "path_utils.h"
+#include "sync_util.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -399,7 +400,7 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
     // the read-open expectedSize so the backend skips the redundant Windows FileSizeOnDisk query.
     // A 0-byte file passes fileSize==0 (unknown/legacy path), which is fine (early-returns below).
     const uint64_t fid =
-        driver.openFile(path.string(), fc::io::OpKind::Read, /*unbuffered=*/true, fileSize);
+        driver.openFile(fc::PathToUtf8(path), fc::io::OpKind::Read, /*unbuffered=*/true, fileSize);
     const auto openEnd = std::chrono::steady_clock::now();
     g_hashOpenUs.fetch_add(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(openEnd - openStart).count()),
@@ -437,7 +438,7 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
 
     if (fileSize <= kSmallFileDirectThreshold) {
         const auto readStart = std::chrono::steady_clock::now();
-        const fc::io::AlignInfo align = driver.queryAlign(path.string());
+        const fc::io::AlignInfo align = driver.queryAlign(fc::PathToUtf8(path));
         if (align.ioGranularity == 0) {
             throw std::runtime_error("ComputeFileHashViaDriver: invalid io granularity");
         }

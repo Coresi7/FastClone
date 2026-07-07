@@ -45,6 +45,13 @@ bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs);
 std::filesystem::path JoinRel(const std::filesystem::path& root, const std::string& relPath);
 void EnsureParentDir(const std::filesystem::path& filePath);
 
+// Render an fs::path as UTF-8 bytes on every platform. On Windows, path::string() uses the
+// system ANSI codepage (CP_ACP), which is GBK on a Simplified-Chinese locale and would corrupt
+// any non-ASCII path when the caller (e.g. the disk IO backend, which decodes with CP_UTF8)
+// assumes UTF-8. Go through wstring() + WideToUtf8 instead so the encoding is always UTF-8.
+// On POSIX, path::string() is already the native UTF-8 byte string.
+std::string PathToUtf8(const std::filesystem::path& path);
+
 // Per-worker "directory already exists" cache (fastcheck-perf-tune Change 2, FR-09..14). Each write
 // worker owns ONE instance; it is NOT thread-safe and MUST NOT be shared across workers (no global
 // lock, no cross-worker failure propagation). On a cache hit EnsureParentDir performs zero filesystem

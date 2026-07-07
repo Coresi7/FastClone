@@ -1100,7 +1100,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                                     // fileSize just read above so the read open skips the redundant
                                     // Windows FileSizeOnDisk query. Signing bytes are unchanged.
                                     const uint64_t fid = GetServerDiskIoDriver().openFile(
-                                        abs.string(), fc::io::OpKind::Read, /*unbuffered=*/true,
+                                        fc::PathToUtf8(abs), fc::io::OpKind::Read, /*unbuffered=*/true,
                                         fileSize);
                                     if (fid == 0) {
                                         ok = false;
@@ -1204,7 +1204,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     rs.relativePath = req.relPath;
                     rs.remaining = req.length;
                     rs.nextReadOffset = req.offset;
-                    rs.fileId = GetServerDiskIoDriver().openFile(abs.string(), fc::io::OpKind::Read,
+                    rs.fileId = GetServerDiskIoDriver().openFile(fc::PathToUtf8(abs), fc::io::OpKind::Read,
                                                                 /*unbuffered=*/true, readBound);
                     if (rs.fileId == 0) {
                         enqueueHigh(Frame{MsgType::DeltaError, frame.streamId, EncodeDeltaError(req.relPath)});
