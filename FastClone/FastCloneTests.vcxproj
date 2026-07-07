@@ -179,6 +179,7 @@
     <ClInclude Include="protocol_codec.h" />
     <ClInclude Include="read_gate.h" />
     <ClInclude Include="sync_util.h" />
+    <ClInclude Include="parallel_dir_walk.h" />
     <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
   </ItemGroup>
@@ -200,6 +201,7 @@
     <ClCompile Include="protocol.cpp" />
     <ClCompile Include="protocol_codec.cpp" />
     <ClCompile Include="sync_util.cpp" />
+    <ClCompile Include="parallel_dir_walk.cpp" />
     <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
     <!-- Test sources. test_cli.cpp builds under MSVC too: it widens its ASCII argv to

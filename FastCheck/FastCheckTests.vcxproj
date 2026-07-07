@@ -182,6 +182,8 @@
     <ClInclude Include="..\FastClone\disk_io_backend.h" />
     <ClInclude Include="..\FastClone\disk_io_backend_pool.h" />
     <ClInclude Include="..\FastClone\disk_io_driver.h" />
+    <ClInclude Include="..\FastClone\parallel_dir_walk.h" />
+    <ClInclude Include="..\FastClone\sync_util.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared production sources under test (mirrors CMake FastCheckTests). -->
@@ -201,6 +203,9 @@
     <ClCompile Include="..\FastClone\disk_io_backend_win.cpp" />
     <ClCompile Include="..\FastClone\disk_io_backend_posix.cpp" />
     <ClCompile Include="..\FastClone\disk_io_backend_uring.cpp" />
+    <!-- Shared with FastClone: parallel directory walker (extra-detection) + UTF/path helpers used by compare_phase.cpp. -->
+    <ClCompile Include="..\FastClone\parallel_dir_walk.cpp" />
+    <ClCompile Include="..\FastClone\sync_util.cpp" />
     <!-- Test sources (no check_main.cpp). -->
     <ClCompile Include="tests\test_main.cpp" />
     <ClCompile Include="tests\test_check_cli.cpp" />

@@ -148,6 +148,142 @@ void TestCollectExtraLocal() {
     fs::remove_all(dir, ec);
 }
 
+// TM-02/AC-05 (FR-06): CollectExtraLocal must skip "." and "..". On Windows FindFirstFileW yields
+// "." and ".." for every directory, so the enumerator has to drop them or they would leak into
+// relPaths (and "." would even be re-entered as a subdir). On POSIX directory_iterator already omits
+// them, so the assertion simply holds there too. Either way only real files may come back.
+void TestCollectExtraLocalDotDotSkip() {
+    const fs::path dir = MakeTempDir();
+    WriteFile(dir / "a.txt", "a");
+    WriteFile(dir / "sub" / "b.txt", "b");
+
+    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    bool hasA = false;
+    bool hasB = false;
+    for (const std::string& rel : extras) {
+        Expect(rel != "." && rel != "..", "'.'/'..' must never be emitted as an extra");
+        Expect(rel.find("/.") == std::string::npos,
+               "no '.'/'..' path component may leak into a relPath: " + rel);
+        if (rel == "a.txt") hasA = true;
+        if (rel == "sub/b.txt") hasB = true;
+    }
+    Expect(hasA && hasB, "both real files collected as extras");
+    Expect(extras.size() == 2, "exactly the two real files, no '.'/'..' entries");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// TM-02/AC-05 (S-01, FR-07/B7): a symlink pointing at a regular FILE follows regular-file semantics
+// and is reported as an extra. Runs unconditionally on POSIX; on Windows it needs the create-symlink
+// privilege (Developer Mode), so we skip cleanly when unavailable rather than fail the suite.
+void TestCollectExtraLocalSymlinkFile() {
+    const fs::path dir = MakeTempDir();
+    WriteFile(dir / "real_target.txt", "payload");  // in manifest -> not itself an extra
+
+    std::error_code linkEc;
+    fs::create_symlink(dir / "real_target.txt", dir / "flink.txt", linkEc);
+    if (linkEc) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        return;  // no symlink privilege on this platform/session -> skip
+    }
+
+    const std::unordered_set<std::string> manifest = {"real_target.txt"};
+    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, manifest);
+    bool hasFlink = false;
+    for (const std::string& rel : extras) {
+        if (rel == "flink.txt") hasFlink = true;
+    }
+    Expect(hasFlink, "symlink->file is a non-dir candidate -> extra (FR-07/B7/S-01)");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+#ifndef _WIN32
+// TM-05/AC-13 (FR-13): a POSIX symlink to a DIRECTORY must NOT be recursed, so the target's contents
+// never appear as extras, and the symlink itself (a directory) is never an extra file. POSIX-only: on
+// Windows a directory reparse point carries FILE_ATTRIBUTE_DIRECTORY and is intentionally handled as a
+// plain directory (design R-A3), so this FR-13 invariant is asserted only where it applies.
+void TestCollectExtraLocalSymlinkDirNotRecursed() {
+    const fs::path dir = MakeTempDir();
+    const fs::path externalDir = MakeTempDir();  // outside the walked root
+    WriteFile(externalDir / "inside.txt", "x");
+    WriteFile(dir / "normal.txt", "y");
+
+    std::error_code linkEc;
+    fs::create_directory_symlink(externalDir, dir / "linkdir", linkEc);
+    if (linkEc) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::remove_all(externalDir, ec);
+        return;  // no privilege -> skip
+    }
+
+    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    bool hasNormal = false;
+    bool recursed = false;
+    bool hasLinkDir = false;
+    for (const std::string& rel : extras) {
+        if (rel == "normal.txt") hasNormal = true;
+        if (rel == "linkdir/inside.txt") recursed = true;
+        if (rel == "linkdir") hasLinkDir = true;
+    }
+    Expect(hasNormal, "regular extra still collected alongside the symlink dir");
+    Expect(!recursed, "symlink directory is NOT recursed (FR-13/AC-13)");
+    Expect(!hasLinkDir, "symlink directory itself is a dir -> never an extra file (FR-06)");
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::remove_all(externalDir, ec);
+}
+
+// TM-02/AC-05 (FR-08/B6): a permission-denied subdirectory is skipped (skip_permission_denied) without
+// aborting the walk, and accessible siblings are still collected. POSIX-only (relies on chmod 000); on
+// Windows the equivalent open-failure skip is the OpenDirFind INVALID_HANDLE_VALUE path.
+void TestCollectExtraLocalPermissionDenied() {
+    const fs::path dir = MakeTempDir();
+    WriteFile(dir / "visible.txt", "v");
+    const fs::path noperm = dir / "noperm";
+    fs::create_directories(noperm);
+    WriteFile(noperm / "secret.txt", "s");
+
+    std::error_code permEc;
+    fs::permissions(noperm, fs::perms::none, permEc);
+    if (permEc) {
+        std::error_code ec;
+        fs::permissions(noperm, fs::perms::owner_all, ec);
+        fs::remove_all(dir, ec);
+        return;  // could not drop permissions -> skip
+    }
+    // If the mode change did not actually deny reads (e.g. running as root), the skip path is not
+    // exercised; skip to keep the assertion meaningful rather than flaky.
+    std::error_code probeEc;
+    fs::directory_iterator probe(noperm, probeEc);
+    if (!probeEc) {
+        std::error_code ec;
+        fs::permissions(noperm, fs::perms::owner_all, ec);
+        fs::remove_all(dir, ec);
+        return;
+    }
+
+    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    bool hasVisible = false;
+    bool hasSecret = false;
+    for (const std::string& rel : extras) {
+        if (rel == "visible.txt") hasVisible = true;
+        if (rel == "noperm/secret.txt") hasSecret = true;
+    }
+    Expect(hasVisible, "accessible sibling collected despite a permission-denied dir (FR-08)");
+    Expect(!hasSecret, "permission-denied dir contents skipped, walk not aborted (FR-08/B6)");
+
+    std::error_code ec;
+    fs::permissions(noperm, fs::perms::owner_all, ec);  // restore so remove_all can clean up
+    fs::remove_all(dir, ec);
+}
+#endif  // !_WIN32
+
 void TestPrintCompareCounters() {
     fc::CompareCounters c;
     c.same = 2;
@@ -180,5 +316,11 @@ void RunComparePhaseTests() {
     TestClassifyByHash();
     TestIsLocalExtra();
     TestCollectExtraLocal();
+    TestCollectExtraLocalDotDotSkip();
+    TestCollectExtraLocalSymlinkFile();
+#ifndef _WIN32
+    TestCollectExtraLocalSymlinkDirNotRecursed();
+    TestCollectExtraLocalPermissionDenied();
+#endif
     TestPrintCompareCounters();
 }

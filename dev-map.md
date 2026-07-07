@@ -198,3 +198,27 @@
 - **测试闭包边界**：`sync_engine_server.cpp` / `sync_engine_client.cpp` 未链入 `FastCloneTests`（`CMakeLists.txt` 源列表实测），故 Change 1/2 用**被替换 API 的等价单测 + 静态审查**，非整条 server/client 走查（既有边界，NFR-07 禁止扩链）。
 - 构建/运行：`cmake --build _bl_x64 --target FastCheckTests --config Release`、`... FastCloneTests ...`；`_bl_x64\Release\FastCheckTests.exe`、`_bl_x64\Release\FastCloneTests.exe`。
 - **FastCheckTests 已知间歇性 hang**（S-06 记载的 pre-existing 问题，非本任务范畴）：运行时若 hang/超时/未通过，**最多重试 3 次**，3 次内一次通过即算通过；每次结果记入实现文档。
+
+## 共享并行目录 walker + FastCheck extra 收尾（fastcheck-extra-parallel-walk）
+
+`docs/tasks/fastcheck-extra-parallel-walk/`。把并行目录遍历引擎从 sync engine 头图里抽成独立轻量 TU，供四个 target 共链；并让 FastCheck 收尾 extra 检测 `CollectExtraLocal` 改用该并行 walker、跳过无谓的全量 file_size stat。D-01 采**候选 B**（抽独立共享 TU），行为对 `RemoveLocalExtras` 逐字节不变。
+
+| 落点 | 文件 / 符号 | 做法 |
+|---|---|---|
+| walker 组件（新建） | `FastClone/parallel_dir_walk.h` | `ParallelDirWalk` 模板 + `fc::detail::{JoinDiag,ResolveDirWalkWorkerCount,BuildRelPath,OpenDirFind(Win)}` 声明 + `kDirPopBatch/kDeleteDirPopBatch/kFrameFlushThreshold` 常量。自带 `<atomic>/<thread>/<deque>/<filesystem>` + Win `<Windows.h>` 守卫，不依赖 sync engine 头图。 |
+| walker 定义（新建） | `FastClone/parallel_dir_walk.cpp` | 上述 4 个 detail 函数定义，从 `sync_engine_shared.cpp` **逐字搬迁**。`PercentileNearestRank` **留在** `sync_engine_shared.cpp`（非 walker 依赖）。 |
+| 再导出（保源码零改） | `FastClone/sync_engine_internal.h` | 改为 `#include "parallel_dir_walk.h"` 再导出并删除被搬走的模板体/声明/常量；保留 `ReadWholeFile`/`PercentileNearestRank` 声明。`sync_engine_client.cpp`（`RemoveLocalExtras`）源码**零改动**仍拿到同名同签名 `fc::detail` 符号。 |
+| FastCheck extra 收尾（重写） | `FastClone/compare_phase.cpp` `CollectExtraLocal` | 删 `BuildIndex(targetRoot, std::nullopt)`；改用 `ParallelDirWalk`（`kDeleteDirPopBatch`，per-worker `ExtraCtx` 收 extras，`finishWorker` 锁一次合并）。Win 用 `WIN32_FIND_DATA` 属性判类型，POSIX 用 `directory_entry::is_directory/is_regular_file/is_symlink`；**全链路无 file_size**。合并后 `std::sort` 复刻旧 `BuildIndex` 明细升序。新增 include `parallel_dir_walk.h` + `sync_util.h`（Win `WideToUtf8/ToExtendedLengthPath`）。调用点 `check_engine.cpp:886` `ProbeLocal`+`record(Extra,…)` 不变。 |
+| 构建（4 target） | `CMakeLists.txt` | `FastClone`、`FastCloneTests` 源列表加 `parallel_dir_walk.cpp`；`FASTCHECK_SHARED_SOURCES` 加 `parallel_dir_walk.cpp` + `sync_util.cpp`（供 `FastCheck`/`FastCheckTests` 拿 walker detail 定义 + Win 路径编码）。`fastcheck_configure_target` 无需改（两 TU 仅依赖 std + Win，不引入 net_topology/bcrypt/iphlpapi）。 |
+
+### 惯用法 / 约束
+- **walker 是独立组件**：任何 target 想并行遍历只需链 `parallel_dir_walk.cpp` + include `parallel_dir_walk.h`，**不**再被迫拉入 sync engine 头图。新建并行遍历落点走这里，别把符号搬回 `sync_engine_*`。
+- **extra 判定不读 file_size**（FR-02/AC-02..04）：`CollectExtraLocal` 只需目录/非目录 + manifest 集合 `contains`；size 仅在调用点 `ProbeLocal` 对真实 extra 子集读取（FR-09 路径，不随总文件数放大）。改这里时**禁止**引入 `fs::file_size`/`directory_entry::file_size`/`GetFileSizeEx`/`nFileSize`。
+- **relPath 与 `RemoveLocalExtras` 同源**：Win `WideToUtf8(name)`、POSIX `filename().string()`，都喂 `BuildRelPath`；根 `relDir=""` 使顶层文件 `rel==name`。改路径编码要两处一起看，保逐字节一致。
+- **POSIX symlink 目录不递归**：`if (!isSymlink) subdirs.push_back(...)`，语义对齐 `sync_engine_client.cpp:237-239`（FR-13）。
+- **并发所有权**：热路径每 worker 只写私有 `ExtraCtx.local`；仅 `finishWorker` 持 `extrasMu` 合并；`manifestPaths` 为 `const&` 只读并发访问（post-ManifestEnd 不再写）。与 `RemoveLocalExtras` 的 `DelCtx/mergeCtx` 同款。
+- **hash worker pool 横跨注释保留**：`check_engine.cpp:318-324` 与 `sync_engine_client.cpp:1004-1010` 原文位置/含义不动（FR-15/AC-20）；本组件与 hash 池无关。
+
+### 测试 / 构建
+- 等价回归复用既有用例：`tests/test_compare_phase.cpp` `TestCollectExtraLocal`（嵌套目录 forward-slash relPath、目录跳过、manifest 命中）；`FastCheck/tests/test_check_engine.cpp` 三模式 extra_local 计数（size-only/strict/filter/server-empty）。均随新实现通过，逐字节等价由 relPath 断言守。
+- 构建/运行：`cmake --build build --config Release --target FastCheck FastClone FastCheckTests FastCloneTests`；四 target Release 构建通过、无 `ParallelDirWalk` 未解析外部符号；`FastCheckTests.exe`/`FastCloneTests.exe` 全绿。

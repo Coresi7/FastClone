@@ -28,6 +28,7 @@ add_executable(FastClone
     FastClone/hash_memcache.cpp
     FastClone/main.cpp
     FastClone/net_topology.cpp
+    FastClone/parallel_dir_walk.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
     FastClone/sync_engine_shared.cpp
@@ -82,6 +83,7 @@ add_executable(FastCloneTests
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
     FastClone/net_topology.cpp
+    FastClone/parallel_dir_walk.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
     FastClone/sync_util.cpp
@@ -172,8 +174,10 @@ set(FASTCHECK_SHARED_SOURCES
     FastClone/compare_pipeline.cpp
     FastClone/file_index.cpp
     FastClone/client_handshake.cpp
+    FastClone/parallel_dir_walk.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
+    FastClone/sync_util.cpp
     FastClone/win_socket.cpp
     ${FASTCLONE_DISK_IO_SOURCES}
 )
