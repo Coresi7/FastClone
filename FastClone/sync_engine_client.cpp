@@ -1001,6 +1001,13 @@ int RunClient(const CliOptions& options) {
     std::atomic<size_t> dirTasksIssued = 0;
     std::atomic<size_t> dirTasksDone = 0;
 
+    // Local hash worker pool (fallback-hash phase). This is an INTENTIONALLY DIVERGED twin of the
+    // hash worker pool in FastCheck/check_engine.cpp (~line 318): same structure (task queue + CV +
+    // pop -> ComputeFileHash -> push to ready queue). FastCheck's twin adds a hashWorkerCap AIMD
+    // gate (with baton-passing on over-cap wake) that this pool does NOT have -- here all workers run
+    // active. If you change the notify/pairing semantics here, check the FastCheck twin too -- they
+    // are not yet a shared component (per-engine transport/reconnect/transfer coupling makes a full
+    // HashFallbackPipeline extraction poor risk/reward today; see design discussion).
     std::mutex hashTaskMu;
     std::mutex hashResultMu;
     std::condition_variable hashTaskCv;

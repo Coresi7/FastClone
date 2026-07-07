@@ -315,6 +315,13 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
 
     // Fixed pool of maxWorkers threads; hashWorkerCap gates how many are active (park/unpark, no
     // spawn/join churn, D-04). Worker myIndex >= cap parks until the cap grows or stop is signalled.
+    // Local hash worker pool (fallback-hash phase). This is a INTENTIONALLY DIVERGED twin of the
+    // hash worker pool in FastClone/sync_engine_client.cpp (~line 1004): same structure (task queue +
+    // CV + pop -> ComputeFileHash -> push to ready queue), but FastCheck adds a hashWorkerCap AIMD
+    // gate (myIndex < cap, with baton-passing on over-cap wake) that FastClone's pool does not have
+    // (FastClone runs all workers active). If you change the notify/cap/pairing semantics here, check
+    // the sync_client twin too -- they are not yet a shared component (see HashFallbackPipeline design
+    // discussion; not extracted because of per-engine transport/reconnect/transfer coupling).
     std::vector<std::thread> hashWorkers;
     hashWorkers.reserve(maxWorkers);
     for (size_t idx = 0; idx < maxWorkers; ++idx) {
