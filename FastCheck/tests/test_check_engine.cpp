@@ -415,8 +415,11 @@ void TestStrictHashSameAndDiff() {
     mock.inbound.push_back(ManifestEntryFrame("f1.txt", 5));
     mock.inbound.push_back(ManifestEntryFrame("f2.txt", 5));
     mock.inbound.push_back(ManifestEndFrame());
-    mock.inbound.push_back(HashResponseFrame("f1.txt", h1));      // matches -> Same
-    mock.inbound.push_back(HashResponseFrame("f2.txt", wrong));   // mismatch -> Diff
+    // Parallel compare drains in non-deterministic order -> HashRequest order is non-deterministic, so
+    // use the request-reactive responder (one HashResponse per HashRequest, in request order) instead of
+    // a fixed pre-scripted response order that could deliver a response before its request is sent.
+    mock.useResponder = true;
+    mock.hashResponder = {{"f1.txt", h1}, {"f2.txt", wrong}};
 
     CheckOptions o = BaseOptions(dir, Mode::Strict);
     FrameChannel ch = mock.Make();
@@ -570,8 +573,10 @@ void TestFastHashSameAndDiff() {
     mock.inbound.push_back(ManifestEntryFrame("f1.txt", 5));  // mtime=2023 vs local now -> needHash
     mock.inbound.push_back(ManifestEntryFrame("f2.txt", 5));
     mock.inbound.push_back(ManifestEndFrame());
-    mock.inbound.push_back(HashResponseFrame("f1.txt", h1));      // matches -> Same
-    mock.inbound.push_back(HashResponseFrame("f2.txt", wrong));   // mismatch -> Diff
+    // Parallel compare drains in non-deterministic order -> use the request-reactive responder (one
+    // HashResponse per HashRequest, in request order) instead of a fixed pre-scripted order.
+    mock.useResponder = true;
+    mock.hashResponder = {{"f1.txt", h1}, {"f2.txt", wrong}};
 
     CheckOptions o = BaseOptions(dir, Mode::Fast);
     FrameChannel ch = mock.Make();
@@ -720,9 +725,10 @@ void TestHashWorkersOneSerial() {
     mock.inbound.push_back(ManifestEntryFrame("b.txt", 5));
     mock.inbound.push_back(ManifestEntryFrame("c.txt", 5));
     mock.inbound.push_back(ManifestEndFrame());
-    mock.inbound.push_back(HashResponseFrame("a.txt", ha));
-    mock.inbound.push_back(HashResponseFrame("b.txt", hb));
-    mock.inbound.push_back(HashResponseFrame("c.txt", hc));
+    // Parallel compare drains in non-deterministic order -> use the request-reactive responder (one
+    // HashResponse per HashRequest, in request order) instead of a fixed pre-scripted order.
+    mock.useResponder = true;
+    mock.hashResponder = {{"a.txt", ha}, {"b.txt", hb}, {"c.txt", hc}};
 
     CheckOptions o = BaseOptions(dir, Mode::Strict);
     o.hashWorkers = 1;  // single local worker
@@ -753,8 +759,10 @@ void TestNoDiskioDriverDegraded() {
     mock.inbound.push_back(ManifestEntryFrame("f1.txt", 5));
     mock.inbound.push_back(ManifestEntryFrame("f2.txt", 5));
     mock.inbound.push_back(ManifestEndFrame());
-    mock.inbound.push_back(HashResponseFrame("f1.txt", h1));
-    mock.inbound.push_back(HashResponseFrame("f2.txt", wrong));
+    // Parallel compare drains in non-deterministic order -> use the request-reactive responder (one
+    // HashResponse per HashRequest, in request order) instead of a fixed pre-scripted order.
+    mock.useResponder = true;
+    mock.hashResponder = {{"f1.txt", h1}, {"f2.txt", wrong}};
 
     CheckOptions o = BaseOptions(dir, Mode::Strict);
     o.noDiskioDriver = true;  // degraded path: parallel hashing, no driver reads
@@ -1256,10 +1264,14 @@ void TestStrictMixed() {
     mock.inbound.push_back(ManifestEntryFrame("same.txt", 5));
     mock.inbound.push_back(ManifestEntryFrame("diffh.txt", 5));
     mock.inbound.push_back(ManifestEndFrame());
-    mock.inbound.push_back(HashResponseFrame("gone.txt", wrong));   // ignored (Missing)
-    mock.inbound.push_back(HashResponseFrame("s.txt", wrong));      // ignored (SizeDiff)
-    mock.inbound.push_back(HashResponseFrame("same.txt", hSame));   // -> Same
-    mock.inbound.push_back(HashResponseFrame("diffh.txt", wrong));  // -> Diff
+    // The parallel compare pipeline drains results (and thus emits HashRequests) in a non-deterministic
+    // order, so a fixed pre-scripted HashResponse order can deliver a response before its request is
+    // sent (the response is then dropped -> the file hangs -> mock EOF). Use the request-reactive
+    // responder (models the real server: one HashResponse per HashRequest, in request order). Only the
+    // two size-equal files get a response; under candidate A Missing/SizeDiff never send a HashRequest,
+    // so gone.txt/s.txt simply get no response (their verdicts are recorded on the compare drain path).
+    mock.useResponder = true;
+    mock.hashResponder = {{"same.txt", hSame}, {"diffh.txt", wrong}};
 
     CheckOptions o = BaseOptions(dir, Mode::Strict);
     FrameChannel ch = mock.Make();

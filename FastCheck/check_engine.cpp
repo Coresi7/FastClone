@@ -321,21 +321,36 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         hashWorkers.emplace_back([&, myIndex = idx]() {
             while (true) {
                 HashTask task;
+                bool gotTask = false;
                 {
                     std::unique_lock<std::mutex> lk(hashTaskMu);
+                    // Wake on stop OR any task available. The cap gate is applied AFTER waking, not in the
+                    // predicate: a notify_one may land on an over-cap worker (the pool has maxWorkers
+                    // threads but only hashWorkerCap are active). If that worker simply re-parked, the
+                    // notify would be consumed without processing and the sole active worker could starve
+                    // forever (hang). So an over-cap worker that finds queued work passes the baton
+                    // (notify_one) to give an active worker a chance to pick it up before re-parking.
                     hashTaskCv.wait(lk, [&]() {
-                        return hashStop.load() ||
-                               (!hashTaskQueue.empty() && myIndex < hashWorkerCap.load());
+                        return hashStop.load() || !hashTaskQueue.empty();
                     });
-                    if (hashTaskQueue.empty()) {
-                        // Only woken with an empty queue when stopping (predicate) -> exit.
-                        if (hashStop.load()) {
-                            return;
-                        }
-                        continue;  // spurious wakeup
+                    if (hashStop.load() && hashTaskQueue.empty()) {
+                        return;
                     }
-                    task = std::move(hashTaskQueue.front());
-                    hashTaskQueue.pop_front();
+                    if (!hashTaskQueue.empty() && myIndex < hashWorkerCap.load()) {
+                        task = std::move(hashTaskQueue.front());
+                        hashTaskQueue.pop_front();
+                        gotTask = true;
+                    } else if (!hashTaskQueue.empty()) {
+                        // Work is available but this worker is over the cap: pass the baton so an active
+                        // worker is woken instead of letting the notify be lost. Re-loop to re-evaluate.
+                        hashTaskCv.notify_one();
+                    }
+                }
+                if (!gotTask) {
+                    if (hashStop.load()) {
+                        return;
+                    }
+                    continue;  // spurious / baton-passed: re-wait
                 }
                 localHashInFlight.fetch_add(1, std::memory_order_relaxed);
                 // Worker job: hash the (already size-equal) file. The local existence/size verdict was
