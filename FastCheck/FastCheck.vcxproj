@@ -186,6 +186,7 @@
     <ClInclude Include="..\FastClone\disk_io_driver.h" />
     <ClInclude Include="..\FastClone\parallel_dir_walk.h" />
     <ClInclude Include="..\FastClone\sync_util.h" />
+    <ClInclude Include="..\FastClone\version.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="check_main.cpp" />

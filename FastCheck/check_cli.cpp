@@ -5,6 +5,8 @@
 #include <iostream>
 #include <stdexcept>
 
+#include "version.h"
+
 namespace fs = std::filesystem;
 
 namespace fc::check {
@@ -138,10 +140,20 @@ void PrintUsage() {
         << "  --port          default port for --server without one (default 27842)\n"
         << "\n"
         << "  Exit codes: 0=identical, 1=differences, 2=connection/argument error,\n"
-        << "              3=local path precondition failed, 4=interrupted (partial report)\n";
+        << "              3=local path precondition failed, 4=interrupted (partial report)\n"
+        << "  --version / -v / version  print \"FastCheck <version>\" and exit.\n";
 }
 
 CheckOptions ParseCheckArgs(const std::vector<std::string>& args) {
+    // --version / -v / version: print and exit before any validation. Handled up front
+    // so a bare `FastCheck --version` probe never touches Winsock or the network.
+    for (const std::string& a : args) {
+        if (a == "--version" || a == "-v" || a == "version") {
+            std::cout << "FastCheck " << ::fc::kFastCloneVersion << std::endl;
+            std::exit(0);
+        }
+    }
+
     CheckOptions options;
     std::string serverArg;
     for (size_t i = 0; i < args.size(); ++i) {

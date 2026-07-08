@@ -1,4 +1,5 @@
 #include "cli.h"
+#include "version.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -77,7 +78,8 @@ void PrintUsage() {
         << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
         << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
         << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
-        << "      is permanently disabled once the first valid connection arrives.\n";
+        << "      is permanently disabled once the first valid connection arrives.\n"
+        << "  --version / -v / version  print \"FastClone <version>\" and exit.\n";
 }
 
 long ParseLongStrict(const std::string& value, const char* name) {
@@ -245,6 +247,14 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (args.empty()) {
         PrintUsage();
         throw std::runtime_error("Mode is required");
+    }
+
+    // --version / -v / version: print and exit before any mode/validation work.
+    // Handled here (not as a Mode) so it never initializes Winsock, sockets, or
+    // the hash workers -- it must work as a bare `FastClone --version` probe.
+    if (args[0] == "--version" || args[0] == "-v" || args[0] == "version") {
+        std::cout << "FastClone " << kFastCloneVersion << std::endl;
+        std::exit(0);
     }
 
     CliOptions options;

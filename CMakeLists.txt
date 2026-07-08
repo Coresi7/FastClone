@@ -3,6 +3,19 @@ project(FastClone LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
+# Version is authored in FastClone/version.h (single source of truth, consumed by both
+# the hand-maintained VS solution and this CMake build). Parse it here for metadata so
+# the zip name, the binary's --version, and the release tag all stay in lock-step.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/FastClone/version.h" _fc_version_line
+     REGEX "kFastCloneVersion[ \t]*=[ \t]*\"[^\"]+\"")
+if(_fc_version_line)
+    string(REGEX MATCH "\"([^\"]+)\"" _fc_version_match "${_fc_version_line}")
+    set(FASTCLONE_VERSION "${CMAKE_MATCH_1}")
+else()
+    message(FATAL_ERROR "Cannot parse FastClone/version.h: kFastCloneVersion not found.")
+endif()
+message(STATUS "FastClone version: ${FASTCLONE_VERSION}")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
