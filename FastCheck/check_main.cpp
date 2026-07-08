@@ -119,8 +119,6 @@ int wmain(int argc, wchar_t** argv) {
 #else
 int main(int argc, char** argv) {
 #endif
-    fc::WsaContext wsa;  // RAII Winsock init.
-
     std::vector<std::string> args;
     if (argc > 1) {
         args.reserve(static_cast<size_t>(argc - 1));
@@ -141,6 +139,11 @@ int main(int argc, char** argv) {
         std::cerr << "argument error: " << ex.what() << std::endl;
         return fc::check::kConnFailed;  // parameter error: not 0/1 (FR-11), use 2 (D-03).
     }
+
+    // Winsock is initialized only after argument parsing succeeds, so a bare
+    // `FastCheck --version` (which exits inside ParseCheckArgs) never touches
+    // Winsock -- matching the design intent documented in check_cli.cpp.
+    fc::WsaContext wsa;  // RAII Winsock init.
 
     return fc::check::RunMain(options);
 }
