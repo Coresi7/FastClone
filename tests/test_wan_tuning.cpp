@@ -265,20 +265,44 @@ void TC_NextWriteActiveCap() {
                     "W-03/S-01/AC-22: empty backlog + write failure halves with failure reason");
         }
         {
-            // rate drop >25% wins over the (now-benign) empty backlog.
+            // rate drop >25% with backlog > 0 (unmet demand) halves with the rate reason. Gated on
+            // backlog > 0 since the trickle-rate-drop fix: an empty-backlog rate drop is demand
+            // oscillation, not deterioration (see the trickle guard below).
             fc::WriteCapControllerState st; st.activeCap = 8;
             st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed prevRate=100
-            st = fc::NextWriteActiveCap(st, healthy(0, 70.0, 1000.0), 32);
+            st = fc::NextWriteActiveCap(st, healthy(20, 70.0, 1000.0), 32);   // backlog>0, rate 70<75
             Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveRateDrop,
-                    "W-03/S-01/AC-22: empty backlog + rate drop halves with rate reason");
+                    "W-03/S-01/AC-22: backlog>0 + rate drop halves with rate reason");
         }
         {
-            // latency rise >50% wins over the (now-benign) empty backlog.
+            // latency rise >50% with backlog > 0 halves with the latency reason (same backlog gate).
             fc::WriteCapControllerState st; st.activeCap = 8;
             st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed prevLat=1000
-            st = fc::NextWriteActiveCap(st, healthy(0, 100.0, 1600.0), 32);
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1600.0), 32);  // backlog>0, lat 1600>1500
             Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveLatency,
-                    "W-03/S-01/AC-22: empty backlog + latency rise halves with latency reason");
+                    "W-03/S-01/AC-22: backlog>0 + latency rise halves with latency reason");
+        }
+        {
+            // Trickle-rate-drop guard (regression for the real 1.22M-file run): empty backlog + rate
+            // oscillation must NOT halve. A trickle workload (few files/sec) naturally alternates
+            // rate 0<->~2; the previous logic halved on every zero-rate window and collapsed cap
+            // 8->1, never recovering. With the backlog>0 gate, cap stays at 8 across the oscillation.
+            fc::WriteCapControllerState st; st.activeCap = 8;
+            for (int i = 0; i < 6; ++i) {
+                const double rate = (i % 2 == 0) ? 2.0 : 0.0;  // alternate 2,0,2,0,...
+                st = fc::NextWriteActiveCap(st, healthy(0, rate, 46000.0), 32);  // backlog=0, lat 46us
+                Require(st.activeCap == 8 && st.lastReason == fc::WriteCapAdjustReason::Hold,
+                        "W-03/S-01/trickle: empty-backlog rate oscillation holds cap at 8 (no false halve)");
+            }
+        }
+        {
+            // Empty backlog + latency rise must also NOT halve (a single high-latency completion
+            // with no queued work is meaningless).
+            fc::WriteCapControllerState st; st.activeCap = 8;
+            st = fc::NextWriteActiveCap(st, healthy(0, 100.0, 1000.0), 32);   // seed prevLat=1000
+            st = fc::NextWriteActiveCap(st, healthy(0, 100.0, 1600.0), 32);   // backlog=0, lat 1600>1500
+            Require(st.activeCap == 8 && st.lastReason == fc::WriteCapAdjustReason::Hold,
+                    "W-03/S-01: empty-backlog latency rise holds (no unmet demand, no false halve)");
         }
     }
     {

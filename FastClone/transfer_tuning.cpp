@@ -108,10 +108,18 @@ WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
         reason = WriteCapAdjustReason::HalveBackpressure;
     } else if (writePressure > s.recvSoftBudgetBytes) {
         reason = WriteCapAdjustReason::HalveBudget;
-    } else if (prev.havePrev && s.completionRate < prev.prevCompletionRate * kWriteCapRateDropFactor) {
+    } else if (prev.havePrev && s.backlog > 0 &&
+               s.completionRate < prev.prevCompletionRate * kWriteCapRateDropFactor) {
+        // Gated on backlog > 0 (unmet demand): a rate drop only means the write side is failing to
+        // keep up when there is queued work. With backlog == 0 a zero-rate window is just demand
+        // oscillation in a trickle workload (few files/sec), NOT deterioration. Without this gate the
+        // cap self-collapses to kActiveCapMin=1 via repeated halve_rate_drop on natural 0<->rate
+        // oscillation and can never recover (backlog==0 is not healthy) -- a throughput cliff on the
+        // next burst. Observed in a real 1.22M-file run: cap 8->1 pinned, reason=halve_rate_drop.
         reason = WriteCapAdjustReason::HalveRateDrop;
-    } else if (prev.havePrev && prev.prevLatencyEwmaNs > 0.0 &&
+    } else if (prev.havePrev && s.backlog > 0 && prev.prevLatencyEwmaNs > 0.0 &&
                s.latencyEwmaNs > prev.prevLatencyEwmaNs * kWriteCapLatencyHalveFactor) {
+        // Same backlog>0 gate: a single high-latency completion with no queued work is meaningless.
         reason = WriteCapAdjustReason::HalveLatency;
     } else if (s.writeFailures > 0) {
         reason = WriteCapAdjustReason::HalveFailure;

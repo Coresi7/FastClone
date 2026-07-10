@@ -118,7 +118,7 @@
 - **CLI 帮助文案与写策略一致**：文案是意图描述，禁止 `all writes bypass OS cache` 及近似绝对承诺；由 `test_cli.cpp` 静态子串断言守回归。
 - **写池 cap→并发 worker 集成断言（已知 NFR-07 约束）**：`writeActiveCap`/`writeActiveWorkers`/`writeCapState` 是 `RunClient` 局部变量，不重构生产代码无法注入；cap 计算由 `TC_NextWriteActiveCap` 纯函数覆盖（AC-21/22/23 + 增长序列），取号门 `writeActiveWorkers < writeActiveCap.load()` 为单行 `<` 比较、检视即正确。"cap 提升后并发 worker 数确实增加"的端到端集成断言留作已知缺口，不阻塞合入。
 - **写 worker 异常安全**：per-task 体包 try/catch（镜像 hash worker），异常 → `ok=false` 走 retryOrFail；`ioInFlightBytes.fetch_sub` + `IoWriteResult` push 在 try 之外、所有路径必行，保证预算/`ioOutstanding` 永不失衡（防末尾 hang）；`results` 已 reserve 且 move 为 noexcept，push 不会抛。
-- **healthy 门控 `backlog > activeCap`（待基准验证）**：突发/间歇式小文件负载下 backlog 频繁归零 → 永不 healthy → cap 不增长；若瞬时背压减半后 backlog 仍频繁为 0，恢复需连续 2 个 healthy 窗口（`backlog>cap`）可能不满足 → cap 卡在减半值，最坏塌到 `kActiveCapMin=1`（与 no-throughput-cliff 取向相悖）。这是保守防抖的设计取向，**不在本提交改动**（避免污染即将进行的真实大库 AIMD 表征）；若基准复现 cap 塌缩不回升，候选放宽：healthy = `(backlog>0 || completedThisWindow>0) && 无恶化 && rate/latency 稳定`，让健康连击在稳态突发中积累。
+- **healthy 门控 `backlog > activeCap` + 涓流率减半误报（已修）**：真实 1.22M 文件大库跑复现 cap 从 8 塌到 1 并卡死（`reason=halve_rate_drop`/`hold`，`backlog=0`）。根因不是 healthy 门控，而是 `halve_rate_drop`/`halve_latency` 在 **backlog==0（无未满足需求）** 时对涓流负载的速率 0↔~2 振荡误报为恶化，反复减半至 `kActiveCapMin=1` 且永不恢复。修复：把 `halve_rate_drop`/`halve_latency` 门控在 `s.backlog > 0`（有排队工作才算恶化）；backpressure/budget/failure 仍无条件减半（资源/错误信号）。效果：涓流 backlog==0 → 不误减半、cap 稳在初始 8（空闲 worker park，零成本）；突发 backlog>0 → 真恶化仍减半、backlog>cap 仍增长。修订 AC-22：空 backlog + rate_drop/latency → Hold（不再减半），新增涓流振荡回归守卫。
 
 ## FastCheck 并行哈希管线（fastcheck-parallel-hash）
 
