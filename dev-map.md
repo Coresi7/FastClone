@@ -85,7 +85,7 @@
 
 | 落点 | 文件 / 符号 | 做法 |
 |---|---|---|
-| CLI 开关 | `cli.h` `CliOptions::unbufferedWrites`；`cli.cpp` 解析分支 + server-only 校验(`"--unbuffered-writes is client-only"`) + `PrintUsage` | 无值幂等；`RunClient` 取 `const bool unbufferedWrites`。 |
+| CLI 开关 | `cli.h` `CliOptions::unbufferedWrites`；`cli.cpp` 解析分支 + server-only 校验(`"--unbuffered-writes is client-only"`) + `PrintUsage`（内部流 `BuildUsageText()`，S-03） | 无值幂等；`RunClient` 取 `const bool unbufferedWrites`。帮助文案是**无缓冲写入意图**，明示 small file / unaligned / tail 的 buffered fallback，不承诺 all writes bypass OS cache（S-03/FR-17）。 |
 | 逐文件透传 | `sync_engine_client.cpp` 三条写路径 `openFile(..., unbufferedWrites, expectedSize)` | D-01：读路径恒缓冲、写路径按开关；不改驱动/`sync_engine.h` 接口。 |
 | 写完成门禁 | `submitDriverWrite`/`reapDriverWrites`/`drainFileWritesToCompletion`（RunClient 局部 lambda） | 单文件 `FileEnd`、delta `finalizeDelta` 校验读前阻塞收割至 `completed==submitted`（FR-08/D-06）；写错→`writeError`→`retryOrFail`/`reconstruct_io`（FR-16）。 |
 | 写背压预算 | `driverWriteOutstandingBytes`(atomic) + `applyRecvBackpressure` | submit `+len`/收割 `-requested`；`pressure = incomingQueuedBytes + ioInFlightBytes + driverWriteOutstandingBytes` 比 `incomingSoftLimitBytes` 有界 sleep（FR-09/10/11）。 |
@@ -98,6 +98,25 @@
 - **单文件流式对齐**：`pumpDownloadWrites` 每满 `chunkBytes`（1MiB，扇区对齐）提交一块，尾块在 `FileEnd` 提交；`writeBuffer` 常驻 ~1 chunk，不整文件驻留（AC-04）。
 - **驱动 fileId 必须 closeFile**：单文件 `FileEnd`/`FileError`、delta `finalizeDelta`/`DeltaError`、`failoverScan`、会话拆解均收割+closeFile；后端 `shutdown` 额外兜底关闭遗留句柄（防会话重连泄漏）。
 - **delta temp 保持无缓冲意图**：copy/range 写落点两两互斥、对齐 op 独占整扇区（D-03），压测 12/12 逐字节一致；极少数写失败按 FR-16 回退全量下载（内容仍正确）。
+
+## 小文件写入路径优化 — 静态审核修订（optimize-small-file-write-path S-01..S-04）
+
+`docs/tasks/optimize-small-file-write-path/`。W-03 自适应写 active cap（`transfer_tuning.h/.cpp` `NextWriteActiveCap` 纯函数 + `WriteCapControllerState`）、W-01/W-04/W-05 写路径已落地；本轮 S-01..S-04 为静态审核缺陷的局部收敛。
+
+| 落点 | 文件 / 符号 | 做法 |
+|---|---|---|
+| S-01 空 backlog 不减半 | `transfer_tuning.{h,cpp}` `NextWriteActiveCap` / `WriteCapAdjustReason` | 删除恶化链末尾 `backlog==0 → HalveBacklogEmpty` 分支：空 backlog 落入第 3 分支 Hold（保持 cap + `consecutiveHealthy=0`），reason=`Hold`。**移除 `HalveBacklogEmpty` 枚举项 + name case**（D-13-B：诊断永不输出该原因由编译期保证）。恶化仍由 backpressure/budget/rate/latency/failure 五信号驱动（均在 backlog 前判定，空 backlog+恶化仍按对应原因减半）。 |
+| S-02 POSIX mtime 归一化 | `file_index.{h,cpp}` `fc::NormalizeManifestMtimeToUnixNs`（移出匿名命名空间、去掉 `#if !defined(_WIN32)` 守卫以便全平台单测）；`SetFileModifyTime` `#else` 分支；`WriteSmallFileFastPath` `#else` 分支复用；POSIX/uring backend `ToTimespecFromNs` 同向 | 阈值 5e17 **夹在**两种编码之间：现代 Unix-ns（~1.7e18，>5e17）直通；现代 Windows FILETIME ticks（~1.3e17，<5e17 且 >= 纪元差 1.16e17）→ `(raw-1.16e17)*100` 转 ns；0/负值（含 0 哨兵）直通（负值夹 0）。方向**镜像**权威 `compare_phase.cpp::TryNormalizeMtimeToUnixNs` 与 Windows 侧 `ToFileTimeFromNs`（>5e17 当 Unix-ns 转 ticks）。纯 int64 算术、不泄漏 `<windows.h>`；三处逐值一致（C3/D-14-A）。**修正了原 S-02 把方向写反的回归**（原版 >5e17 当 ticks 转换，把 POSIX→POSIX 的 2026 写成公元 7375 年、WIN→POSIX 的 2020 写成 1970-01-02）。Windows 分支不变。 |
+| S-03 help 文案 | `cli.h` 声明 `BuildUsageText()`；`cli.cpp` `BuildUsageText()` 定义 + `PrintUsage` 改流该串 | 抽 `std::string BuildUsageText()`（D-15-A）便于测试子串断言，`PrintUsage`/调用点行为不变。`--unbuffered-writes` 文案改为“无缓冲写入意图 + small file/unaligned/tail 的 buffered fallback”，不含 `all writes bypass OS cache`。不改解析/默认/开关名/写策略（N6）。 |
+| S-04 删无用 include | `cli.cpp` 删 `#include "sync_util.h"` | `cli.cpp` 未引用 sync_util 任一符号；`<Windows.h>` 已直接包含，无传递依赖。 |
+| 测试 | `tests/test_wan_tuning.cpp` `TC_NextWriteActiveCap`（S-01：AC-21/22/23 取代旧 HalveBacklogEmpty 用例）；`tests/test_cli.cpp`（S-03 `BuildUsageText` 子串断言 AC-26；S-04 静态源扫描 AC-27，源路径经 CMake `FASTCLONE_CLI_SRC` 注入）；`tests/test_disk_io_driver.cpp` POSIX mtime 往返（S-02，`#if !defined(_WIN32)` 守卫）。 | `CMakeLists.txt` `FastCloneTests` 新增 `target_compile_definitions(... FASTCLONE_CLI_SRC="…/FastClone/cli.cpp")`。 |
+| 测试（S-02 增补） | `tests/test_disk_io_driver.cpp`：`TestNormalizeManifestMtimeToUnixNsDirection`（纯函数方向，全平台，钉死 >5e17=Unix-ns 直通 / [1.16e17,5e17]=ticks→ns）；`TestWritePathsMtimeYearSanity` + `RequireMtimeYearIsSane`（独立于 `NormalizeManifestMtimeToUnixNs` 的年份健全性断言，覆盖 `SetFileModifyTime`/`WriteSmallFileFastPath`/driver 三条 POSIX 写路径，ticks 输入断言落盘 ~2020 而非 1970/7375）；`RequireMtimeMatches` POSIX 分支改为对比 `NormalizeManifestMtimeToUnixNs(wantNs)`（修正原先拿 ticks 与 Unix-ns 直接比的 Linux 误失败/同义反复）。 | 修正了原 S-02 测试同义反复（写读自洽、无法发现方向反转）的覆盖缺口。 |
+
+### 惯用法 / 约束
+- **空 backlog 是批次间隙的健康信号**（R6）：只 Hold + reset 健康窗口连续计数，绝不单独减半（否则批次间锯齿拖低吞吐）。
+- **POSIX mtime 单一归一化源**：`SetFileModifyTime`、`WriteSmallFileFastPath`、backend `ToTimespecFromNs` 三处逐值一致，且**方向镜像**权威 `compare_phase.cpp::TryNormalizeMtimeToUnixNs`：阈值 5e17 **夹在** Unix-ns（>5e17，直通）与 FILETIME ticks（[1.16e17,5e17]，转 ns）之间；0/负值直通（负值夹 0）。改归一化只改 `NormalizeManifestMtimeToUnixNs`，方向由 `TestNormalizeManifestMtimeToUnixNsDirection` 在全平台守回归。
+- **CLI 帮助文案与写策略一致**：文案是意图描述，禁止 `all writes bypass OS cache` 及近似绝对承诺；由 `test_cli.cpp` 静态子串断言守回归。
+- **写池 cap→并发 worker 集成断言（已知 NFR-07 约束）**：`writeActiveCap`/`writeActiveWorkers`/`writeCapState` 是 `RunClient` 局部变量，不重构生产代码无法注入；cap 计算由 `TC_NextWriteActiveCap` 纯函数覆盖（AC-21/22/23 + 增长序列），取号门 `writeActiveWorkers < writeActiveCap.load()` 为单行 `<` 比较、检视即正确。"cap 提升后并发 worker 数确实增加"的端到端集成断言留作已知缺口，不阻塞合入。
 
 ## FastCheck 并行哈希管线（fastcheck-parallel-hash）
 

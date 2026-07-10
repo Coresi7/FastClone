@@ -1,10 +1,19 @@
 #include "cli.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
+
+#ifndef FC_STRINGIZE_DETAIL
+#define FC_STRINGIZE_DETAIL(x) #x
+#define FC_STRINGIZE(x) FC_STRINGIZE_DETAIL(x)
+#endif
 
 void Require(bool cond, const char* msg) {
     if (!cond) {
@@ -437,4 +446,79 @@ void RunCliTests() {
                         "FastClone", "server", "--password", "pw", "--unbuffered-writes",
                     },
                     "client-only");
+
+    // ---- optimize-small-file-write-path W-03 (NFR-07 / AC-09): NO public write-worker knob -------
+    // Write concurrency is an internal adaptive active cap; the client exposes no --write-workers
+    // flag and ignores FASTCLONE_WRITE_WORKERS. These are negative assertions.
+    auto setEnv = [](const char* name, const char* val) {
+#if defined(_WIN32)
+        _putenv_s(name, val);
+#else
+        setenv(name, val, 1);
+#endif
+    };
+    auto clearEnv = [](const char* name) {
+#if defined(_WIN32)
+        _putenv_s(name, "");  // empty value removes the variable on Windows
+#else
+        unsetenv(name);
+#endif
+    };
+
+    // AC-09: --write-workers is no longer a valid client argument -> it must throw as an unknown
+    // argument, and the message must carry the flag text proving it is not accepted anywhere.
+    ExpectThrowWith(clientArgs({"--write-workers", "8"}), "write-workers");
+    ExpectThrowWith(clientArgs({"--write-workers"}), "write-workers");
+
+    // AC-09: FASTCLONE_WRITE_WORKERS must NOT change parsing behavior (it is ignored). A normal
+    // client parses successfully with the env set, and there is no write-worker field to read.
+    setEnv("FASTCLONE_WRITE_WORKERS", "12");
+    {
+        const fc::CliOptions opt = Parse(clientArgs({}));
+        Require(opt.mode == fc::Mode::Client, "Expected FASTCLONE_WRITE_WORKERS to be ignored");
+    }
+    // Even a garbage env value is ignored (no throw, no parse change).
+    setEnv("FASTCLONE_WRITE_WORKERS", "not-a-number");
+    {
+        const fc::CliOptions opt = Parse(clientArgs({}));
+        Require(opt.mode == fc::Mode::Client, "Expected invalid FASTCLONE_WRITE_WORKERS ignored");
+    }
+    clearEnv("FASTCLONE_WRITE_WORKERS");
+
+    // AC-09: the server also rejects --write-workers as an unknown argument (not "client-only").
+    ExpectThrowWith({
+                        "FastClone", "server", "--password", "pw", "--write-workers", "4",
+                    },
+                    "Unknown argument");
+
+    // ---- S-03 (AC-26 / FR-17 / NFR-10 / B12): --unbuffered-writes help wording is accurate --------
+    // The help text must express an unbuffered write INTENT and name the small-file / unaligned /
+    // tail buffered-fallback cases, and must NOT promise that all writes bypass the OS page cache.
+    {
+        const std::string usage = fc::BuildUsageText();
+        Require(usage.find("small file") != std::string::npos,
+                "S-03/AC-26: help must mention small-file buffered fallback");
+        Require(usage.find("unaligned") != std::string::npos,
+                "S-03/AC-26: help must mention unaligned-write buffered fallback");
+        Require(usage.find("tail") != std::string::npos,
+                "S-03/AC-26: help must mention tail-write buffered fallback");
+        Require(usage.find("buffered") != std::string::npos,
+                "S-03/AC-26: help must mention the buffered fallback");
+        Require(usage.find("all writes bypass OS cache") == std::string::npos,
+                "S-03/AC-26: help must NOT promise all writes bypass the OS cache");
+    }
+
+    // ---- S-04 (AC-27 / FR-18 / NFR-11 / B13): cli.cpp must not include sync_util.h ---------------
+    // Static source scan: the CLI translation unit must carry no unused #include "sync_util.h". The
+    // source path is injected by CMake (FASTCLONE_CLI_SRC). Presence of the include is a failure.
+#ifdef FASTCLONE_CLI_SRC
+    {
+        std::ifstream in(FC_STRINGIZE(FASTCLONE_CLI_SRC), std::ios::binary);
+        Require(in.good(), "S-04/AC-27: cli.cpp source is readable for the static include scan");
+        const std::string src((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+        Require(src.find("#include \"sync_util.h\"") == std::string::npos,
+                "S-04/AC-27/B13: cli.cpp must not #include \"sync_util.h\"");
+    }
+#endif
 }

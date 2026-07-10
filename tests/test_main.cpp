@@ -17,6 +17,7 @@ void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
 void RunWanTuningTests();
+void RunWritePathAccountingTests();
 void RunComparePhaseTests();
 void RunComparePipelineTests();
 void RunProtocolCodecTests();
@@ -39,6 +40,7 @@ int main() {
         RunRouteSelectionTests();
         RunLinkSchedulerTests();
         RunWanTuningTests();
+        RunWritePathAccountingTests();
         RunComparePhaseTests();
         RunComparePipelineTests();
         RunProtocolCodecTests();

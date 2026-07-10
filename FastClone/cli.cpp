@@ -45,41 +45,7 @@ const std::string& ArgAt(const std::vector<std::string>& args, size_t index) {
 }
 
 void PrintUsage() {
-    std::cerr
-        << "Usage:\n"
-        << "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] --password <pwd>\n"
-        << "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
-        << "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
-        << "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
-        << "      [--delta-min-size <size>] [--unbuffered-writes]\n"
-        << "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
-        << "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
-        << "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
-        << "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
-        << "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
-        << "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
-        << "  --aux-weight sets the ordering weight of every aux link (default 1.0, range (0,16]); higher\n"
-        << "      values pull proportionally more transfers onto aux links.\n"
-        << "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
-        << "      --aux-weight >= 2.0, else primary); default auto.\n"
-        << "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
-        << "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
-        << "  --unbuffered-writes (client-only, default off) routes all client file-content writes\n"
-        << "      through the unified disk IO driver with unbuffered write intent (bypasses the OS\n"
-        << "      page cache); final file size/content are byte-identical. Combined with\n"
-        << "      --queued-file-size, the receive side is throttled by a single budget covering the\n"
-        << "      receive queue and pending/outstanding disk writes.\n"
-        << "  --tcp-send-buffer / --tcp-recv-buffer pin SO_SNDBUF/SO_RCVBUF (suffix K|M|G, range\n"
-        << "      64K..1G); default 0 = kernel autotuning (recommended on high-RTT links: the\n"
-        << "      window scales to the BDP). Pinning a value disables autotuning for that\n"
-        << "      direction. Windows caveat: if receive-window autotuning is disabled system-wide\n"
-        << "      (check 'netsh interface tcp show global'), default 0 falls back to ~64KB and\n"
-        << "      throttles high-RTT throughput -- set --tcp-recv-buffer (e.g. 32M) explicitly.\n"
-        << "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
-        << "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
-        << "      with code 6 if no valid client connection is established before the timeout; the timer\n"
-        << "      is permanently disabled once the first valid connection arrives.\n"
-        << "  --version / -v / version  print \"FastClone <version>\" and exit.\n";
+    std::cerr << BuildUsageText();
 }
 
 long ParseLongStrict(const std::string& value, const char* name) {
@@ -443,6 +409,8 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (options.mode == Mode::Server && options.unbufferedWrites) {
         throw std::runtime_error("--unbuffered-writes is client-only");
     }
+    // W-03/NFR-07: write concurrency has no public tuning knob. --write-workers is not parsed (it
+    // falls through to the Unknown argument branch above) and FASTCLONE_WRITE_WORKERS is ignored.
     if (options.mode == Mode::Client && options.exitAfterSync) {
         throw std::runtime_error("--once is server-only");
     }
@@ -478,6 +446,46 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
 }
 
 }  // namespace
+
+std::string BuildUsageText() {
+    return
+        "Usage:\n"
+        "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] --password <pwd>\n"
+        "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
+        "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
+        "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
+        "      [--delta-min-size <size>] [--unbuffered-writes]\n"
+        "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
+        "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
+        "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
+        "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
+        "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
+        "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
+        "  --aux-weight sets the ordering weight of every aux link (default 1.0, range (0,16]); higher\n"
+        "      values pull proportionally more transfers onto aux links.\n"
+        "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
+        "      --aux-weight >= 2.0, else primary); default auto.\n"
+        "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
+        "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
+        "  --unbuffered-writes (client-only, default off) sets unbuffered write INTENT for client\n"
+        "      file-content writes via the unified disk IO driver. This is an intent, not a\n"
+        "      guarantee that every write skips the OS page cache: small files, unaligned writes,\n"
+        "      and tail writes use a buffered fallback. Final file size/content are byte-identical.\n"
+        "      Combined with --queued-file-size, the receive side is throttled by a single budget\n"
+        "      covering the receive queue and pending/outstanding disk writes. Write concurrency is\n"
+        "      fully automatic (internal adaptive active cap); there is no write-worker knob.\n"
+        "  --tcp-send-buffer / --tcp-recv-buffer pin SO_SNDBUF/SO_RCVBUF (suffix K|M|G, range\n"
+        "      64K..1G); default 0 = kernel autotuning (recommended on high-RTT links: the\n"
+        "      window scales to the BDP). Pinning a value disables autotuning for that\n"
+        "      direction. Windows caveat: if receive-window autotuning is disabled system-wide\n"
+        "      (check 'netsh interface tcp show global'), default 0 falls back to ~64KB and\n"
+        "      throttles high-RTT throughput -- set --tcp-recv-buffer (e.g. 32M) explicitly.\n"
+        "  --link forces an explicit source->server pairing; the first --link is the primary link.\n"
+        "  --wait-connect-timeout (server --once/--once-multi only, default 300s, suffix s|m|h) exits\n"
+        "      with code 6 if no valid client connection is established before the timeout; the timer\n"
+        "      is permanently disabled once the first valid connection arrives.\n"
+        "  --version / -v / version  print \"FastClone <version>\" and exit.\n";
+}
 
 #if defined(_WIN32) && defined(_MSC_VER)
 CliOptions ParseCli(int argc, wchar_t** argv) {

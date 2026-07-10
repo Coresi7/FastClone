@@ -96,6 +96,12 @@ struct CliOptions {
     // IO driver so downloaded data bypasses the OS page cache. Default false = zero regression
     // (M5/FR-03); the switch never changes final file content, only the write intent.
     bool unbufferedWrites = false;
+
+    // NOTE (optimize-small-file-write-path W-03 / NFR-07): write concurrency has NO public tuning
+    // knob. There is intentionally no writeWorkers field, no --write-workers flag and no
+    // FASTCLONE_WRITE_WORKERS environment variable; the client converges an internal adaptive write
+    // active cap on its own (see transfer_tuning.h NextWriteActiveCap). --write-workers is therefore
+    // an unknown argument.
 };
 
 #if defined(_WIN32) && defined(_MSC_VER)
@@ -103,5 +109,11 @@ CliOptions ParseCli(int argc, wchar_t** argv);
 #else
 CliOptions ParseCli(int argc, char** argv);
 #endif
+
+// Full CLI usage/help text (S-03 / FR-17 / D-15-A). Exposed so the help wording can be asserted in
+// tests without redirecting std::cerr; PrintUsage() simply streams this string. The
+// --unbuffered-writes section expresses an unbuffered write INTENT and names the small-file /
+// unaligned / tail buffered-fallback cases, never promising that all writes bypass the OS cache.
+std::string BuildUsageText();
 
 }  // namespace fc

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if __has_include(<liburing.h>)
@@ -47,8 +48,33 @@ struct UringFile {
     OpKind mode = OpKind::Read;
     bool unbuffered = false;
     uint64_t expectedSize = 0;
+    int64_t modifyNs = 0;    // W-01: mtime to stamp on the write fd at close (if hasModify)
+    bool hasModify = false;  // W-01: set by setWriteModifyTime; false => close skips futimens
     AlignInfo align;
 };
+
+// See disk_io_backend_posix.cpp ToTimespecFromNs: normalize a manifest mtime to a POSIX timespec for
+// futimens (W-01/FR-01 / C3). Direction mirrors file_index.cpp::NormalizeManifestMtimeToUnixNs:
+// >5e17 is Unix ns (passthrough); [1.16e17, 5e17] is FILETIME ticks (-> Unix ns); 0/negative pass
+// through (clamped to 0).
+timespec ToTimespecFromNs(int64_t modifyNs) {
+    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
+    int64_t unixNs = modifyNs;
+    if (modifyNs > kLikelyUnixNsThreshold) {
+        // Already Unix ns, pass through.
+    } else if (modifyNs >= kWindowsEpochDiff100ns) {
+        // FILETIME ticks (100ns since 1601) -> Unix ns.
+        unixNs = (modifyNs - kWindowsEpochDiff100ns) * 100LL;
+    }
+    timespec ts{};
+    if (unixNs < 0) {
+        unixNs = 0;
+    }
+    ts.tv_sec = static_cast<time_t>(unixNs / 1000000000LL);
+    ts.tv_nsec = static_cast<long>(unixNs % 1000000000LL);
+    return ts;
+}
 
 // A submitted op kept alive until its cqe is reaped (buffer lifetime spans the ring op).
 struct UringOp {
@@ -112,25 +138,54 @@ public:
         return id;
     }
 
-    void closeFile(uint64_t fileId) override {
+    void setWriteModifyTime(uint64_t fileId, int64_t modifyNs) override {
+        // W-01/FR-01: only record; futimens on the still-open fd happens in closeFile.
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = files_.find(fileId);
+        if (it == files_.end() || it->second.mode != OpKind::Write) {
+            return;
+        }
+        it->second.modifyNs = modifyNs;
+        it->second.hasModify = true;
+    }
+
+    bool closeFile(uint64_t fileId) override {
         UringFile uf;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = files_.find(fileId);
             if (it == files_.end()) {
-                return;
+                return false;  // unknown / already closed (W-01 idempotency)
             }
             uf = std::move(it->second);
             files_.erase(it);
         }
+        bool ok = true;
+        // W-01 order (R-01): ftruncate -> (optional) futimens -> close, all on the same write fd.
         // Exact final size on every write close (ofstream-trunc-equivalent overwrite; mirrors the
         // posix pool backend so a pre-existing target is trimmed to expectedSize, incl. 0).
         if (uf.mode == OpKind::Write && uf.fd >= 0) {
-            ::ftruncate(uf.fd, static_cast<off_t>(uf.expectedSize));
+            if (::ftruncate(uf.fd, static_cast<off_t>(uf.expectedSize)) != 0) {
+                ok = false;  // ok1
+            }
+            if (uf.hasModify) {
+                timespec ts[2];
+                ts[0].tv_sec = 0;
+                ts[0].tv_nsec = UTIME_OMIT;         // leave atime untouched
+                ts[1] = ToTimespecFromNs(uf.modifyNs);  // mtime
+                if (::futimens(uf.fd, ts) != 0) {
+                    ok = false;  // ok2
+                }
+            }
+        } else if (uf.mode == OpKind::Write) {
+            ok = false;  // write fd vanished; cannot finalize
         }
         if (uf.fd >= 0) {
-            ::close(uf.fd);
+            if (::close(uf.fd) != 0) {
+                ok = false;  // ok3
+            }
         }
+        return ok;
     }
 
     bool submit(IoRequest&& req) override {

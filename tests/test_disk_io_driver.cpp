@@ -66,9 +66,47 @@ public:
         files_.emplace(id, std::move(f));
         return id;
     }
-    void closeFile(uint64_t id) override {
+    // W-01: record the mtime to stamp on a WRITE handle at close (optimize-small-file-write-path).
+    void setWriteModifyTime(uint64_t id, int64_t modifyNs) override {
         std::lock_guard<std::mutex> lk(mu_);
-        files_.erase(id);
+        auto it = files_.find(id);
+        if (it == files_.end() || it->second.mode != OpKind::Write) {
+            return;
+        }
+        it->second.modifyNs = modifyNs;
+        it->second.hasModify = true;
+    }
+    // W-01: closeFile returns the finalize + close result. Records, per file id, whether an mtime was
+    // recorded before close (V-01) and the value (V-01/V-03), so tests can assert ordering + value.
+    // `failCloseFinalize_` forces a WRITE close to report failure (V-02b); an unknown id -> false.
+    bool closeFile(uint64_t id) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = files_.find(id);
+        if (it == files_.end()) {
+            return false;  // unknown / already closed (W-01 idempotency)
+        }
+        const bool wasWrite = (it->second.mode == OpKind::Write);
+        closedHadMtime_[id] = it->second.hasModify;
+        if (it->second.hasModify) {
+            closedMtime_[id] = it->second.modifyNs;
+        }
+        files_.erase(it);
+        return !(wasWrite && failCloseFinalize_);
+    }
+    // Test probes (W-01/V-01/V-02/V-02b/V-03).
+    bool closedHadMtime(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = closedHadMtime_.find(id);
+        return it != closedHadMtime_.end() && it->second;
+    }
+    int64_t closedMtime(uint64_t id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = closedMtime_.find(id);
+        return it != closedMtime_.end() ? it->second : 0;
+    }
+    void failCloseFinalize(bool f) {
+        std::lock_guard<std::mutex> lk(mu_);
+        failCloseFinalize_ = f;
     }
 
     bool submit(IoRequest&& req) override {
@@ -144,6 +182,8 @@ private:
     struct MFile {
         std::vector<uint8_t> data;
         OpKind mode = OpKind::Read;
+        int64_t modifyNs = 0;   // W-01: mtime recorded via setWriteModifyTime
+        bool hasModify = false;
     };
     IoCompletion Execute(IoRequest&& req) {
         IoCompletion c;
@@ -195,6 +235,9 @@ private:
     bool paused_ = false;
     bool failSubmit_ = false;
     bool forceReadError_ = false;
+    bool failCloseFinalize_ = false;  // W-01/V-02b: force WRITE close to report finalize failure
+    std::unordered_map<uint64_t, bool> closedHadMtime_;   // W-01/V-01/V-02 probe
+    std::unordered_map<uint64_t, int64_t> closedMtime_;   // W-01/V-01/V-03 probe
     struct { std::atomic<uint64_t> directIo{0}; } counters_;
 };
 
@@ -869,10 +912,20 @@ void RealBackendSmallSizes() {
         DiskIoDriver drv(cfg);
         const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/true, size);
         Require(wf != 0, "ubw small: open write");
-        // D-02: writes are never downgraded to buffered by total file size (small-file gate is
-        // read-only now), so no write open bumps smallFileFallback.
+        // optimize-small-file-write-path W-02 (V-04/V-05, AC-W02): on Windows a small WRITE
+        // (known size < kSmallFileBufferedMax) with unbuffered intent now opens the buffered handle
+        // ONLY -- so it bumps smallFileFallback exactly once and never takes a direct-IO op. On POSIX
+        // the write small-file gate stays read-only (D-02): small writes remain unbuffered, so no
+        // smallFileFallback bump. Both are asserted at their exact expected values.
+#if defined(_WIN32)
+        Require(drv.counters().smallFileFallback == 1,
+                "ubw small: Windows small write opens buffered-only (W-02 smallFileFallback==1)");
+        Require(drv.counters().directIo == 0,
+                "ubw small: Windows small write takes no direct IO (W-02)");
+#else
         Require(drv.counters().smallFileFallback == 0,
-                "ubw small: write open must not smallFileFallback (D-02)");
+                "ubw small: POSIX write small-file gate is read-only (D-02)");
+#endif
         std::vector<IoRequest> batch(1);
         batch[0].kind = OpKind::Write;
         batch[0].fileId = wf;
@@ -1503,6 +1556,364 @@ void TestNonAsciiPathIoRoundTrip() {
     fs::remove_all(root, ec);
 }
 
+// -------- optimize-small-file-write-path: W-01 close/mtime, W-04 zero-byte, W-05 fast path --------
+
+// Fixed FILETIME-tick mtime (~2020-11). Below kLikelyUnixNsThreshold (5e17) so the Windows backend
+// passes it through unchanged; ReadFileMtimeCanonical returns ticks on Windows -> exact compare
+// (V-01/V-03/V-05). On POSIX this is a FILETIME-ticks value from a (synthetic) Windows peer, so the
+// write paths normalize it to Unix ns before stamping; RequireMtimeMatches/RequireMtimeYearIsSane
+// below verify the on-disk result in Unix ns.
+constexpr int64_t kTestMtimeTicks = 132500000000000000LL;
+
+// Convert a canonical mtime (what ReadFileMtimeCanonical returns) to whole seconds since the Unix
+// epoch, INDEPENDENT of NormalizeManifestMtimeToUnixNs. Windows canonical = FILETIME ticks (100ns
+// since 1601); POSIX canonical = Unix ns. Used only by the year-sanity guard so that a reversed
+// normalization direction (writing 1970 or year 7375) is caught without coupling to the function
+// under test.
+int64_t CanonicalMtimeToUnixSeconds(int64_t canonical) {
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
+#if defined(_WIN32)
+    if (canonical < kWindowsEpochDiff100ns) {
+        return canonical / 10000000LL;  // pre-1970, approximate (not used by the 2020 guard)
+    }
+    return (canonical - kWindowsEpochDiff100ns) / 10000000LL;
+#else
+    return canonical / 1000000000LL;
+#endif
+}
+
+// Assert an on-disk mtime matches what we asked for. `wantNs` is a manifest mtime (Unix ns OR Windows
+// FILETIME ticks). Exact on Windows (FILETIME ticks round-trip via ToFileTimeFromNs); on POSIX the
+// write path normalizes ticks->Unix ns before stamping, so the expected on-disk value is
+// NormalizeManifestMtimeToUnixNs(wantNs) and we allow a couple seconds tolerance for ns quantisation.
+void RequireMtimeMatches(const std::filesystem::path& p, int64_t wantNs, const std::string& what) {
+    const int64_t got = fc::ReadFileMtimeCanonical(p);
+#if defined(_WIN32)
+    Require(got == wantNs, what + " (exact mtime)");
+#else
+    const int64_t expected = fc::NormalizeManifestMtimeToUnixNs(wantNs);
+    const int64_t diff = got > expected ? got - expected : expected - got;
+    Require(diff < 2000000000LL, what + " (mtime within 2s of normalized manifest value)");
+#endif
+}
+
+// INDEPENDENT year-sanity guard (does NOT use NormalizeManifestMtimeToUnixNs). A manifest mtime of
+// ~2020 must land on disk as a ~2020 date -- never 1970 (ticks passed through as if they were Unix
+// ns) and never year 7375 (Unix ns misread as ticks and multiplied). This is the check that catches a
+// reversed normalization direction on POSIX; on Windows it is consistent with the exact-ticks path.
+void RequireMtimeYearIsSane(const std::filesystem::path& p, const std::string& what) {
+    const int64_t got = fc::ReadFileMtimeCanonical(p);
+    const int64_t secs = CanonicalMtimeToUnixSeconds(got);
+    // 2019-01-01 = 1546300800, 2022-01-01 = 1640995200. kTestMtimeTicks is ~2020-11.
+    Require(secs >= 1546300800LL && secs <= 1640995200LL,
+            what + " on-disk mtime year is ~2020 (got " + std::to_string(secs) +
+            " s = " + std::to_string(secs / 31557600LL + 1970) + "-ish), not 1970 / 7375");
+}
+
+// Whole-file write through the REAL driver: openFile(Write) -> submit all bytes -> drain ->
+// setWriteModifyTime -> closeFile. Returns the closeFile() bool (W-01 finalize+close result).
+bool WriteWholeFileViaDriver(const std::string& path, const std::vector<uint8_t>& payload,
+                             int64_t mtimeNs) {
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.chunkBytes = 1u << 20;
+    DiskIoDriver drv(cfg);
+    const uint64_t wf = drv.openFile(path, OpKind::Write, /*unbuffered=*/true, payload.size());
+    Require(wf != 0, "whole-file: open write");
+    std::vector<IoRequest> batch;
+    for (uint64_t off = 0; off < payload.size(); off += cfg.chunkBytes) {
+        IoRequest r;
+        r.kind = OpKind::Write;
+        r.fileId = wf;
+        r.offset = off;
+        const uint64_t n = std::min<uint64_t>(cfg.chunkBytes, payload.size() - off);
+        r.data.assign(payload.begin() + static_cast<std::ptrdiff_t>(off),
+                      payload.begin() + static_cast<std::ptrdiff_t>(off + n));
+        r.length = static_cast<uint32_t>(n);
+        batch.push_back(std::move(r));
+    }
+    const size_t count = batch.size();
+    while (!batch.empty()) {
+        if (drv.submit(batch) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (count > 0) {
+        std::vector<IoCompletion> comps;
+        Require(DrainUntil(drv, count, comps, 15000) == count, "whole-file: write completions");
+        for (auto& c : comps) Require(c.status != IoStatus::Error, "whole-file: write op error");
+    }
+    drv.setWriteModifyTime(wf, mtimeNs);
+    return drv.closeFile(wf);  // W-01: exact-size truncate + SetFileTime + close, reported as bool
+}
+
+std::vector<uint8_t> ReadWholeFile(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+// V-01/V-02/V-02b (W-01/FR-01/FR-02/B7): closeFile is a bool; the mtime is recorded BEFORE close and
+// only stamped once; a forced finalize failure is reported so the caller can withhold the count.
+void TestCloseMtimeContractMock() {
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+
+    // V-01: happy path -- setWriteModifyTime is recorded before closeFile, close returns true.
+    {
+        auto mock = std::make_unique<MockBackend>(cfg);
+        MockBackend* raw = mock.get();
+        DiskIoDriver drv(cfg, std::move(mock));
+        const uint64_t wf = drv.openFile("w", OpKind::Write, false, 8);
+        IoRequest r;
+        r.kind = OpKind::Write;
+        r.fileId = wf;
+        r.offset = 0;
+        r.data = RandomBytes(8, 5u);
+        r.length = 8;
+        SubmitSingle(drv, std::move(r));
+        std::vector<IoCompletion> comps;
+        Require(DrainUntil(drv, 1, comps, 5000) == 1, "V-01: write completion");
+        drv.setWriteModifyTime(wf, kTestMtimeTicks);
+        Require(drv.closeFile(wf) == true, "V-01: successful close returns true");
+        Require(raw->closedHadMtime(wf), "V-01: mtime was recorded before close");
+        Require(raw->closedMtime(wf) == kTestMtimeTicks, "V-01: recorded mtime value matches");
+    }
+    // V-02: a failed content write => the caller never calls setWriteModifyTime, so close records no
+    // mtime (mtime must not be stamped on a write that did not fully succeed).
+    {
+        auto mock = std::make_unique<MockBackend>(cfg);
+        MockBackend* raw = mock.get();
+        DiskIoDriver drv(cfg, std::move(mock));
+        const uint64_t wf = drv.openFile("w", OpKind::Write, false, 8);
+        // (simulate write failure: skip setWriteModifyTime entirely)
+        Require(drv.closeFile(wf) == true, "V-02: close of an unstamped file still returns true");
+        Require(!raw->closedHadMtime(wf), "V-02: no mtime recorded when write did not stamp it");
+    }
+    // V-02b: a finalize (SetEndOfFile/SetFileTime/CloseHandle-equivalent) failure is surfaced as
+    // closeFile()==false, so the write success path can refuse to count the file as transferred.
+    {
+        auto mock = std::make_unique<MockBackend>(cfg);
+        MockBackend* raw = mock.get();
+        DiskIoDriver drv(cfg, std::move(mock));
+        const uint64_t wf = drv.openFile("w", OpKind::Write, false, 8);
+        drv.setWriteModifyTime(wf, kTestMtimeTicks);
+        raw->failCloseFinalize(true);
+        Require(drv.closeFile(wf) == false, "V-02b: finalize failure => closeFile returns false");
+    }
+    // W-01 idempotency: closing an unknown/second-time id returns false, never crashes.
+    {
+        auto mock = std::make_unique<MockBackend>(cfg);
+        DiskIoDriver drv(cfg, std::move(mock));
+        Require(drv.closeFile(9999) == false, "V-02b: unknown fileId close returns false");
+    }
+}
+
+// V-01 real backend: a whole-file driver write stamps the exact mtime on the still-open handle and
+// closeFile reports true; the on-disk content, size and mtime all match.
+void TestCloseMtimeContractReal() {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "fc_w01_close_mtime.bin";
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    const std::vector<uint8_t> payload = RandomBytes(4096, 71u);
+    Require(WriteWholeFileViaDriver(tmp.string(), payload, kTestMtimeTicks),
+            "V-01 real: closeFile returns true on success");
+    Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == payload.size(), "V-01 real: exact size");
+    Require(ReadWholeFile(tmp) == payload, "V-01 real: bytes match");
+    RequireMtimeMatches(tmp, kTestMtimeTicks, "V-01 real: driver close stamps mtime");
+    RequireMtimeYearIsSane(tmp, "V-01 real: driver close mtime year ~2020 (WIN->POSIX direction guard)");
+    fs::remove(tmp, ec);
+}
+
+// V-11 / W-04: a zero-byte file must be creatable purely through the driver write path (openFile ->
+// setWriteModifyTime -> closeFile), i.e. what the async worker does -- no main-thread ofstream. The
+// result is an empty file with the exact mtime.
+void TestZeroByteDriverWrite() {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "fc_w04_zero.bin";
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    Require(WriteWholeFileViaDriver(tmp.string(), {}, kTestMtimeTicks),
+            "V-11: zero-byte driver write closeFile returns true");
+    Require(fs::exists(tmp, ec), "V-11: zero-byte file created");
+    Require(static_cast<uint64_t>(fs::file_size(tmp, ec)) == 0, "V-11: zero-byte file is empty");
+    RequireMtimeMatches(tmp, kTestMtimeTicks, "V-11: zero-byte file mtime stamped");
+    fs::remove(tmp, ec);
+}
+
+// W-05 (FR-13): ShouldUseSmallFileFastPath boundary + WriteSmallFileFastPath equivalence with the
+// driver whole-file path (content/size/mtime), truncating overwrite, and the failure return.
+void TestSmallFileFastPath() {
+    namespace fs = std::filesystem;
+    // Boundary: <= 256 KiB uses the fast path; 256 KiB + 1 does not (design section 3.5.1).
+    Require(fc::ShouldUseSmallFileFastPath(0), "W-05: 0 bytes uses fast path");
+    Require(fc::ShouldUseSmallFileFastPath(1), "W-05: 1 byte uses fast path");
+    Require(fc::ShouldUseSmallFileFastPath(fc::kSmallFileFastPathMax), "W-05: 256 KiB uses fast path");
+    Require(!fc::ShouldUseSmallFileFastPath(fc::kSmallFileFastPathMax + 1),
+            "W-05: 256 KiB + 1 does NOT use fast path");
+
+    // Equivalence: same payload + mtime via the fast path vs the driver whole-file path must produce
+    // byte-identical content, identical size and identical mtime.
+    for (uint64_t size : {uint64_t(0), uint64_t(1), uint64_t(4097),
+                          fc::kSmallFileFastPathMax}) {
+        const std::vector<uint8_t> payload = RandomBytes(static_cast<size_t>(size), 33u);
+        const fs::path fastP = fs::temp_directory_path() / ("fc_w05_fast_" + std::to_string(size));
+        const fs::path drvP = fs::temp_directory_path() / ("fc_w05_drv_" + std::to_string(size));
+        std::error_code ec;
+        fs::remove(fastP, ec);
+        fs::remove(drvP, ec);
+
+        Require(fc::WriteSmallFileFastPath(fastP, payload.data(), payload.size(), kTestMtimeTicks),
+                "W-05: fast path write succeeds");
+        Require(WriteWholeFileViaDriver(drvP.string(), payload, kTestMtimeTicks),
+                "W-05: driver write succeeds");
+
+        Require(static_cast<uint64_t>(fs::file_size(fastP, ec)) == size, "W-05: fast path exact size");
+        Require(static_cast<uint64_t>(fs::file_size(drvP, ec)) == size, "W-05: driver exact size");
+        const std::vector<uint8_t> fastBytes = ReadWholeFile(fastP);
+        const std::vector<uint8_t> drvBytes = ReadWholeFile(drvP);
+        Require(fastBytes == payload, "W-05: fast path bytes == payload");
+        Require(fastBytes == drvBytes, "W-05: fast path bytes == driver bytes (equivalence)");
+        RequireMtimeMatches(fastP, kTestMtimeTicks, "W-05: fast path mtime");
+        RequireMtimeYearIsSane(fastP, "W-05: fast path mtime year ~2020 (WIN->POSIX direction guard)");
+        RequireMtimeYearIsSane(drvP, "W-05: driver mtime year ~2020 (WIN->POSIX direction guard)");
+        fs::remove(fastP, ec);
+        fs::remove(drvP, ec);
+    }
+
+    // Truncating overwrite: a fast-path write over a larger existing file leaves the exact new size.
+    {
+        const fs::path p = fs::temp_directory_path() / "fc_w05_overwrite.bin";
+        std::error_code ec;
+        const std::vector<uint8_t> big = RandomBytes(200000, 8u);
+        Require(fc::WriteSmallFileFastPath(p, big.data(), big.size(), kTestMtimeTicks),
+                "W-05: overwrite seed write");
+        const std::vector<uint8_t> small = RandomBytes(1234, 9u);
+        Require(fc::WriteSmallFileFastPath(p, small.data(), small.size(), kTestMtimeTicks),
+                "W-05: overwrite shrink write");
+        Require(static_cast<uint64_t>(fs::file_size(p, ec)) == small.size(),
+                "W-05: overwrite truncates to exact new size");
+        Require(ReadWholeFile(p) == small, "W-05: overwrite content is the new bytes");
+        fs::remove(p, ec);
+    }
+
+    // Failure return: a target whose parent directory does not exist cannot be created -> false.
+    {
+        const fs::path bad = fs::temp_directory_path() / "fc_w05_no_such_dir" / "nested" / "f.bin";
+        std::error_code ec;
+        fs::remove_all(fs::temp_directory_path() / "fc_w05_no_such_dir", ec);
+        const std::vector<uint8_t> payload = RandomBytes(16, 1u);
+        Require(!fc::WriteSmallFileFastPath(bad, payload.data(), payload.size(), kTestMtimeTicks),
+                "W-05: write into a missing parent dir returns false");
+    }
+}
+
+// S-02 (FR-16 / AC-24/25): SetFileModifyTime must stamp the same mtime as the driver/fast-path write
+// helpers. On Windows the manifest carries raw FILETIME ticks; on POSIX the helper normalizes before
+// calling into the filesystem (see NormalizeManifestMtimeToUnixNs in file_index.cpp).
+void TestSetFileModifyTime() {
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "fc_s02_mtime.bin";
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        Require(out.good(), "S-02: seed file for mtime-only update");
+    }
+    fc::SetFileModifyTime(tmp, kTestMtimeTicks);
+    RequireMtimeMatches(tmp, kTestMtimeTicks, "S-02: SetFileModifyTime stamps manifest mtime");
+    // Independent year-sanity guard (catches a reversed normalization direction on POSIX that the
+    // self-consistent RequireMtimeMatches compare above cannot).
+    RequireMtimeYearIsSane(tmp, "S-02: SetFileModifyTime (WIN->POSIX) writes ~2020, not 1970/7375");
+    fs::remove(tmp, ec);
+}
+
+// S-02 integration guard: all THREE POSIX write paths (SetFileModifyTime, WriteSmallFileFastPath,
+// driver setWriteModifyTime+closeFile) must stamp a ~2020 on-disk year for a FILETIME-ticks manifest
+// input (WIN->POSIX). This is the cross-platform-branch coverage the pure-function direction test
+// and the self-consistent RequireMtimeMatches cannot provide: it asserts the actual on-disk year via
+// CanonicalMtimeToUnixSeconds, which is independent of NormalizeManifestMtimeToUnixNs. A reversed
+// direction would write 1974 (ticks passed through as Unix ns) or year 7375 (Unix ns misread as
+// ticks) and fail the 2019-2022 window here.
+void TestWritePathsMtimeYearSanity() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // Path 1: WriteSmallFileFastPath.
+    {
+        const fs::path p = fs::temp_directory_path() / "fc_s02_year_fast.bin";
+        fs::remove(p, ec);
+        const std::vector<uint8_t> payload = RandomBytes(64, 21u);
+        Require(fc::WriteSmallFileFastPath(p, payload.data(), payload.size(), kTestMtimeTicks),
+                "S-02 year: fast path write succeeds");
+        RequireMtimeYearIsSane(p, "S-02 year: WriteSmallFileFastPath (WIN->POSIX) ~2020");
+        fs::remove(p, ec);
+    }
+
+    // Path 2: driver whole-file write (setWriteModifyTime + closeFile).
+    {
+        const fs::path p = fs::temp_directory_path() / "fc_s02_year_drv.bin";
+        fs::remove(p, ec);
+        const std::vector<uint8_t> payload = RandomBytes(4096, 22u);
+        Require(WriteWholeFileViaDriver(p.string(), payload, kTestMtimeTicks),
+                "S-02 year: driver write succeeds");
+        RequireMtimeYearIsSane(p, "S-02 year: driver write (WIN->POSIX) ~2020");
+        fs::remove(p, ec);
+    }
+
+    // Path 3: SetFileModifyTime on a pre-existing file.
+    {
+        const fs::path p = fs::temp_directory_path() / "fc_s02_year_set.bin";
+        fs::remove(p, ec);
+        {
+            std::ofstream out(p, std::ios::binary);
+            Require(out.good(), "S-02 year: seed file for SetFileModifyTime");
+        }
+        fc::SetFileModifyTime(p, kTestMtimeTicks);
+        RequireMtimeYearIsSane(p, "S-02 year: SetFileModifyTime (WIN->POSIX) ~2020");
+        fs::remove(p, ec);
+    }
+}
+
+// S-02 regression guard: NormalizeManifestMtimeToUnixNs direction. The threshold 5e17 sits BETWEEN
+// modern Unix-ns (~1.7e18, ABOVE 5e17) and modern Windows FILETIME ticks (~1.3e17, BELOW 5e17), so
+// the direction is load-bearing. A previous version of this function treated >5e17 as ticks and
+// <5e17 as Unix ns (backwards), which wrote year-7375 mtimes on POSIX->POSIX and 1970-01-02 on
+// WIN->POSIX. This test pins the correct direction (mirrors compare_phase.cpp::TryNormalizeMtimeToUnixNs)
+// on ALL platforms (the helper is pure int64 arithmetic, compiled everywhere for this purpose).
+void TestNormalizeManifestMtimeToUnixNsDirection() {
+    using fc::NormalizeManifestMtimeToUnixNs;
+    // POSIX peer: genuine Unix ns (~2026) must pass through unchanged.
+    const int64_t unixNs2026 = 1778000000000000000LL;  // ~2026
+    Require(NormalizeManifestMtimeToUnixNs(unixNs2026) == unixNs2026,
+            "S-02: Unix ns (>5e17) passes through unchanged (POSIX->POSIX)");
+
+    // Windows peer: FILETIME ticks (~2020, 1.325e17) must convert to Unix ns, NOT pass through.
+    const int64_t ticks2020 = 132500000000000000LL;  // ~2020 FILETIME ticks
+    const int64_t expect2020Ns = (ticks2020 - 116444736000000000LL) * 100LL;  // ~1.6055e18 ns
+    Require(NormalizeManifestMtimeToUnixNs(ticks2020) == expect2020Ns,
+            "S-02: FILETIME ticks ([1.16e17,5e17]) convert to Unix ns (WIN->POSIX)");
+    Require(expect2020Ns > 1500000000000000000LL && expect2020Ns < 1700000000000000000LL,
+            "S-02: WIN->POSIX converted mtime lands near 2018-2024, not year 7375 / 1970-01-02");
+
+    // The 0 "unknown" sentinel and small pre-epoch values pass through (0 stays 0).
+    Require(NormalizeManifestMtimeToUnixNs(0) == 0, "S-02: 0 sentinel passes through as 0");
+    // Negative clamps to 0.
+    Require(NormalizeManifestMtimeToUnixNs(-1) == 0, "S-02: negative clamps to 0");
+
+    // A value just above the threshold is treated as Unix ns (not ticks).
+    Require(NormalizeManifestMtimeToUnixNs(500000000000000001LL) == 500000000000000001LL,
+            "S-02: just-above-threshold treated as Unix ns");
+
+    // A realistic upper-band ticks value (year ~2100, ~1.57e17, still < 5e17) converts to Unix ns
+    // without overflowing int64 (max ~9.2e18). Pins that the ticks branch covers the upper band.
+    const int64_t ticks2100 = 157374000000000000LL;
+    const int64_t expect2100Ns = (ticks2100 - 116444736000000000LL) * 100LL;
+    Require(NormalizeManifestMtimeToUnixNs(ticks2100) == expect2100Ns,
+            "S-02: upper-band FILETIME ticks still convert to Unix ns");
+    Require(expect2100Ns > 4000000000000000000LL && expect2100Ns < 5000000000000000000LL,
+            "S-02: year-2100 ticks map to ~4e18 ns (post-2038, sane)");
+}
+
 }  // namespace
 
 void RunDiskIoDriverTests() {
@@ -1519,6 +1930,13 @@ void RunDiskIoDriverTests() {
     TestSequentialReaderEarlyError();
     TestSequentialReaderEarlyEof();
     TestSequentialReaderCleanEof();
+    TestCloseMtimeContractMock();
+    TestCloseMtimeContractReal();
+    TestZeroByteDriverWrite();
+    TestSmallFileFastPath();
+    TestSetFileModifyTime();
+    TestNormalizeManifestMtimeToUnixNsDirection();
+    TestWritePathsMtimeYearSanity();
     TestRealBackend();
     RealBackendReadKnownSize();
     RealBackendSmallSizes();

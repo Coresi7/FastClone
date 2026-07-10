@@ -69,6 +69,34 @@ int64_t ToUnixNs(const std::filesystem::file_time_type& value);
 std::filesystem::file_time_type FromUnixNs(int64_t valueNs);
 void SetFileModifyTime(const std::filesystem::path& path, int64_t modifyNs);
 
+// S-02 (FR-16 / C3 / D-14-A): normalize a manifest mtime to Unix ns. Pure int64 arithmetic, compiled
+// on ALL platforms (no <windows.h> dependency) so it is unit-testable everywhere and shared by the
+// POSIX SetFileModifyTime / WriteSmallFileFastPath and the POSIX/uring backends' ToTimespecFromNs.
+// Direction mirrors the authoritative compare_phase.cpp::TryNormalizeMtimeToUnixNs:
+//   - modifyNs > 5e17: genuine Unix ns (POSIX peer) -> pass through unchanged.
+//   - [1.16e17, 5e17]: Windows FILETIME ticks (100ns since 1601) -> (raw - 1.16e17) * 100 ns.
+//   - < 1.16e17 (incl. the 0 "unknown" sentinel): pass through; negative clamps to 0.
+int64_t NormalizeManifestMtimeToUnixNs(int64_t modifyNs);
+
+// optimize-small-file-write-path W-05: max file size (bytes) eligible for the small-file synchronous
+// fast path. Files strictly larger take the DiskIoDriver whole-file write path. Note this is smaller
+// than kSmallFileBufferedMax (1 MiB) on purpose (design section 3.5.1).
+inline constexpr uint64_t kSmallFileFastPathMax = 256ull * 1024;
+
+// True when a fully-buffered whole-file write of `size` bytes should take the small-file synchronous
+// fast path (W-05/FR-13): size <= kSmallFileFastPathMax. So 256 KiB -> true, 256 KiB + 1 -> false.
+bool ShouldUseSmallFileFastPath(uint64_t size);
+
+// Write `data` (size bytes) to `path` in one synchronous pass (W-05/FR-13), producing a file
+// byte-identical to the DiskIoDriver whole-file path: truncating overwrite (CREATE_ALWAYS /
+// O_TRUNC), exact final size (SetEndOfFile / ftruncate), and mtime stamped from modifyNs on the same
+// handle before close. The parent directory must already exist (the caller does EnsureParentDir, B6).
+// Returns true only when every write/truncate/mtime/close step succeeds; on any failure it returns
+// false and leaves the target for the caller's existing retry/fallback path (FR-14/AC-16). `data`
+// may be null iff size == 0.
+bool WriteSmallFileFastPath(const std::filesystem::path& path, const uint8_t* data, size_t size,
+                            int64_t modifyNs);
+
 // Canonical mtime read used by both manifest build and client local probe so the
 // two sides compare values in the same unit/epoch.
 //  - Windows: raw FILETIME ticks (100ns since 1601), matching the manifest writer;

@@ -2,6 +2,7 @@
 
 #include "compare_phase.h"
 #include "compare_pipeline.h"
+#include "write_path_accounting.h"
 
 namespace fs = std::filesystem;
 
@@ -957,10 +958,17 @@ int RunClient(const CliOptions& options) {
         std::string relPath;
         std::vector<uint8_t> data;
         int64_t mtimeNs = 0;
+        // W-03/FR-08: steady_clock nanoseconds at dispatch, so the worker can report the write
+        // completion latency the active-cap controller samples (0 == unset).
+        int64_t enqueueSteadyNs = 0;
     };
     struct IoWriteResult {
         std::string relPath;
         bool ok = false;
+        bool fastPath = false;  // W-05/FR-15: true when written via the small-file sync fast path
+        // W-03/FR-08 controller signals: bytes written and enqueue->complete latency (ns).
+        uint64_t bytes = 0;
+        int64_t latencyNs = 0;
     };
     std::mutex ioTaskMu;
     std::condition_variable ioTaskCv;
@@ -978,6 +986,12 @@ int RunClient(const CliOptions& options) {
     // yet been handled. Used as a completion-gate term so the sync does not finish while
     // writes are still pending.
     size_t ioOutstanding = 0;
+    // FR-15 diagnostics (main-thread only, no atomics): count of successfully written whole files by
+    // path. driverPathFiles = files finished via the DiskIoDriver write path (batch worker driver
+    // branch + single-file streaming FileEnd + delta reconstruct); fastPathFiles = files finished via
+    // the W-05 small-file synchronous fast path. Surfaced on the --diag line (AC-17).
+    uint64_t driverPathFiles = 0;
+    uint64_t fastPathFiles = 0;
 
     // Unified async disk IO driver (unified-disk-io-driver C7/C8/C10): the single client-side
     // locus for old-file reads (streaming delta plan), download/temp writes, and the finalize
@@ -1198,6 +1212,9 @@ int RunClient(const CliOptions& options) {
     std::atomic<bool> recvStop = false;
     std::atomic<bool> recvClosed = false;
     std::string recvError;
+    // W-03/FR-08 signal: incremented (recv thread) every time recv backpressure actually sleeps, so
+    // the active-cap controller can tell whether the receive side stalled during a sampling window.
+    std::atomic<uint64_t> backpressureSleepCount{0};
     auto applyRecvBackpressure = [&](uint64_t queuedBytesSnapshot) {
         // unbuffered-writes M3/FR-09/FR-10/D-05: throttle recv against the SINGLE budget = network
         // receive queue + write-pool buffered bytes + bytes outstanding in the driver write queue,
@@ -1205,23 +1222,21 @@ int RunClient(const CliOptions& options) {
         // off driverWriteOutstandingBytes is still maintained by the batch whole-file path; the
         // extra terms only raise pressure when writes genuinely fall behind (bounded sleeps only,
         // control frames keep flowing -> FR-11 / R-03).
-        const uint64_t pressure = queuedBytesSnapshot +
-                                  ioInFlightBytes.load(std::memory_order_relaxed) +
-                                  driverWriteOutstandingBytes.load(std::memory_order_relaxed);
-        if (pressure <= incomingSoftLimitBytes) {
+        // W-03/FR-09/D-07: pressure and the sleep ladder are extracted into pure functions
+        // (ComposeWritePressure / NextWriteBackpressureSleepUs, unit-tested by AC-10). Behaviour is
+        // byte-for-byte the previous inline formula; neither the write active cap nor the worker
+        // COUNT ever enters either function, so the internal cap adapting never changes backpressure
+        // for a given set of byte inputs (FR-09 decoupling).
+        const uint64_t pressure = ComposeWritePressure(
+            queuedBytesSnapshot, ioInFlightBytes.load(std::memory_order_relaxed),
+            driverWriteOutstandingBytes.load(std::memory_order_relaxed));
+        const uint32_t sleepUs = NextWriteBackpressureSleepUs(pressure, incomingSoftLimitBytes);
+        if (sleepUs == 0) {
             return;
         }
-        const uint64_t over = pressure - incomingSoftLimitBytes;
-        uint64_t sleepUs = 300;
-        if (over > incomingSoftLimitBytes * 2) {
-            sleepUs = 5000;
-        } else if (over > incomingSoftLimitBytes) {
-            sleepUs = 3000;
-        } else if (over > (incomingSoftLimitBytes / 2)) {
-            sleepUs = 1500;
-        } else if (over > (incomingSoftLimitBytes / 4)) {
-            sleepUs = 700;
-        }
+        // W-03/FR-08: record that a sleep happened this window (a deterioration signal for the
+        // active-cap controller). The cap / worker count never feed back into `pressure` above.
+        backpressureSleepCount.fetch_add(1, std::memory_order_relaxed);
         std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
     };
     // Per-connection receiver (design section 7.5). One thread per lane, all feeding the SAME
@@ -1657,7 +1672,7 @@ int RunClient(const CliOptions& options) {
     // [0,size) overwrite + SetEndOfFile is byte-identical to the former ofstream trunc+write. Blocks
     // until the file is fully written so the surrounding pool's completion accounting is unchanged.
     auto driverWriteWholeFile = [&](const std::string& path,
-                                    const std::vector<uint8_t>& data) -> bool {
+                                    const std::vector<uint8_t>& data, int64_t mtimeNs) -> bool {
         const uint64_t sz = data.size();
         // unbuffered-writes FR-04/FR-12: express the CLI intent (was hard-coded true) so the switch
         // controls the whole-file batch write too; off => buffered, content/size/mtime unchanged.
@@ -1709,8 +1724,17 @@ int RunClient(const CliOptions& options) {
                 }
             }
         }
-        clientDriver.closeFile(fid);
-        return ok;
+        // W-01/FR-01/FR-02/B7: on a successful content write, record the mtime so it is stamped on
+        // the SAME write handle inside closeFile (no second open of the target). closeFile now
+        // returns whether the finalize (SetEndOfFile + SetFileTime) and the handle close all
+        // succeeded; fold that into the result so a truncate/mtime/close failure does NOT count as a
+        // transferred file (it flows to retryOrFail via ioResults). On a content-write failure we
+        // deliberately do NOT set the mtime but still close to release the handle (result ignored).
+        if (ok) {
+            clientDriver.setWriteModifyTime(fid, mtimeNs);
+        }
+        const bool closeOk = clientDriver.closeFile(fid);
+        return ok && closeOk;
     };
 
     // unbuffered-writes C8 (section 3.4/section 3.5): reap + account WRITE completions for ONE driver file handle.
@@ -1773,10 +1797,27 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Async file-write worker pool (see IoWriteTask declaration). I/O-bound, so size it
-    // a bit above core count to keep the disk queue full of concurrent small-file
-    // create/write/close/set-mtime operations.
-    const uint32_t ioWorkerCount = std::clamp<uint32_t>(workerCount, 4u, 16u);
+    // Async file-write worker pool (see IoWriteTask declaration). W-03/FR-07/NFR-07: the pool is a
+    // FIXED max-capacity pool (poolMax = clamp(hw,8,32), ResolveWriteWorkerPoolMax) that provides
+    // the physical concurrency ceiling; there is NO public write-worker knob. At any instant only
+    // `writeActiveCap` workers may claim a batch (park/unpark gating below); the cap is converged by
+    // the internal adaptive controller sampled every 500ms in the main loop (§3.3.3/§3.3.4).
+    const uint32_t ioWorkerCount = ResolveWriteWorkerPoolMax(workerCount);
+    // Adaptive active cap: how many pool workers may execute a write task at the same instant.
+    // Starts at min(kActiveCapInitial, poolMax) and is stored by the main-loop controller.
+    std::atomic<uint32_t> writeActiveCap{std::min<uint32_t>(kActiveCapInitial, ioWorkerCount)};
+    // Number of workers currently holding an active slot. Guarded by ioTaskMu; a worker may only
+    // claim (++) inside the lock when writeActiveWorkers < writeActiveCap, so the cap is never
+    // exceeded (D-09). Not touched on the shutdown-drain path (which ignores the cap).
+    uint32_t writeActiveWorkers = 0;
+    // W-03/FR-08 controller state + running signal totals (main-thread only; sampled every 500ms).
+    WriteCapControllerState writeCapState;
+    writeCapState.activeCap = writeActiveCap.load(std::memory_order_relaxed);
+    uint64_t writeCompletedFilesTotal = 0;
+    uint64_t writeCompletedBytesTotal = 0;
+    uint64_t writeFailuresTotal = 0;
+    double writeLatencyEwmaNs = 0.0;
+    WriteCapSample lastCapSampleSnapshot;  // last sampled window signals (for --diag summary, FR-09)
     constexpr size_t kIoBatchPop = 16;
     std::vector<std::thread> ioWorkers;
     ioWorkers.reserve(ioWorkerCount);
@@ -1791,11 +1832,25 @@ int RunClient(const CliOptions& options) {
             PerWorkerDirCache dirCache;
             while (true) {
                 batch.clear();
+                bool claimedSlot = false;
                 {
                     std::unique_lock<std::mutex> lock(ioTaskMu);
-                    ioTaskCv.wait(lock, [&]() { return ioStop.load() || !ioTasks.empty(); });
-                    if (ioStop.load() && ioTasks.empty()) {
-                        return;
+                    // Wake on stop, or when there is work AND a free active slot (W-03 gating).
+                    ioTaskCv.wait(lock, [&]() {
+                        return ioStop.load(std::memory_order_relaxed) ||
+                               (!ioTasks.empty() &&
+                                writeActiveWorkers < writeActiveCap.load(std::memory_order_relaxed));
+                    });
+                    if (ioStop.load(std::memory_order_relaxed)) {
+                        if (ioTasks.empty()) {
+                            return;
+                        }
+                        // Shutdown drain: ignore the active cap so every worker helps empty the
+                        // queue and the join never starves on a low cap (do NOT touch the counter).
+                    } else {
+                        // Predicate guarantees a pending task and a free slot -> claim one.
+                        ++writeActiveWorkers;
+                        claimedSlot = true;
                     }
                     const size_t take = std::min<size_t>(kIoBatchPop, ioTasks.size());
                     for (size_t j = 0; j < take; ++j) {
@@ -1805,19 +1860,52 @@ int RunClient(const CliOptions& options) {
                 }
                 results.clear();
                 for (IoWriteTask& t : batch) {
-                    // C8: the file payload write is now issued through the unified disk IO driver
+                    // C8: the file payload write is issued through the unified disk IO driver
                     // (design section 5.4) instead of an inline ofstream, so all client file-content IO
                     // shares one locus with read/write fairness + backpressure. Bytes and final
-                    // size are identical to the former trunc+write path.
+                    // size are identical to the former trunc+write path. W-01: mtime is stamped on
+                    // the same write handle at close (driverWriteWholeFile takes mtimeNs), so there
+                    // is no separate SetFileModifyTime open here anymore.
                     const fs::path abs = JoinRel(options.rootDir, t.relPath);
-                    EnsureParentDir(abs, dirCache);
-                    const bool ok = driverWriteWholeFile(fc::PathToUtf8(abs), t.data);
-                    if (ok) {
-                        SetFileModifyTime(abs, t.mtimeNs);
+                    EnsureParentDir(abs, dirCache);  // B6: parent dir for both paths
+                    const uint64_t bytes = static_cast<uint64_t>(t.data.size());
+                    bool ok;
+                    bool fastPath = false;
+                    if (ShouldUseSmallFileFastPath(t.data.size())) {
+                        // W-05/FR-13: <=256KiB fully-buffered files bypass the driver scheduling /
+                        // aligned-bounce / completion-gate and write synchronously, producing a
+                        // byte/size/mtime-identical result. On any failure it returns false and
+                        // flows to the same retryOrFail path (FR-14). The write-pool buffered-bytes
+                        // budget (ioInFlightBytes) still bounds memory, keeping backpressure
+                        // equivalent (design section 3.5.3).
+                        fastPath = true;
+                        ok = WriteSmallFileFastPath(abs, t.data.data(), t.data.size(), t.mtimeNs);
+                    } else {
+                        ok = driverWriteWholeFile(fc::PathToUtf8(abs), t.data, t.mtimeNs);
                     }
                     ioInFlightBytes.fetch_sub(t.data.size(), std::memory_order_relaxed);
-                    results.push_back(IoWriteResult{std::move(t.relPath), ok});
+                    // W-03/FR-08: enqueue->complete latency for the controller (0 enqueue == unset).
+                    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count();
+                    const int64_t latencyNs =
+                        (t.enqueueSteadyNs != 0) ? (nowNs - t.enqueueSteadyNs) : 0;
+                    IoWriteResult r;
+                    r.relPath = std::move(t.relPath);
+                    r.ok = ok;
+                    r.fastPath = fastPath;
+                    r.bytes = bytes;
+                    r.latencyNs = latencyNs;
+                    results.push_back(std::move(r));
                 }
+                // Release the active slot (normal path only) and wake one parked worker so it can
+                // re-check for a free slot; a raised cap / new work is also woken by the controller
+                // and dispatchBatchWrite respectively (D-09).
+                if (claimedSlot) {
+                    std::lock_guard<std::mutex> lock(ioTaskMu);
+                    --writeActiveWorkers;
+                }
+                ioTaskCv.notify_one();
                 {
                     std::lock_guard<std::mutex> lock(ioResultMu);
                     for (IoWriteResult& r : results) {
@@ -2169,26 +2257,21 @@ int RunClient(const CliOptions& options) {
         if (entry.finalized) {
             return;
         }
-        if (entry.shouldWrite) {
-            if (entry.output.is_open()) {
-                entry.output.flush();
-                entry.output.close();
-            }
-            SetFileModifyTime(JoinRel(options.rootDir, entry.relPath), entry.mtimeNs);
-            ++compared;
-            ++transferred;
+        // W-04/FR-10/FR-12: successful writes (incl. zero-byte files) never reach here anymore -- they
+        // are dispatched to the async write pool via completeBatchEntry/dispatchBatchWrite and their
+        // compared/transferred counts converge only through the ioResults drain. finalizeBatchEntry
+        // is now purely the failure / not-to-write definer, so the main thread performs NO synchronous
+        // file create and NO SetFileModifyTime for files that need writing (removes the former
+        // zero-byte main-thread finalize).
+        if (entry.output.is_open()) {
+            entry.output.close();
+        }
+        if (!entry.serverOk) {
+            // Server explicitly reported this entry as unavailable; retrying won't help.
+            markTransferFailed(entry.relPath);
             transferRetryCounts.erase(entry.relPath);
         } else {
-            if (entry.output.is_open()) {
-                entry.output.close();
-            }
-            if (!entry.serverOk) {
-                // Server explicitly reported this entry as unavailable; retrying won't help.
-                markTransferFailed(entry.relPath);
-                transferRetryCounts.erase(entry.relPath);
-            } else {
-                retryOrFail(entry.relPath);
-            }
+            retryOrFail(entry.relPath);
         }
         entry.finalized = true;
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
@@ -2202,6 +2285,10 @@ int RunClient(const CliOptions& options) {
         task.relPath = entry.relPath;
         task.mtimeNs = entry.mtimeNs;
         task.data = std::move(entry.buffer);
+        // W-03/FR-08: stamp the dispatch time so the worker reports write completion latency.
+        task.enqueueSteadyNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
         ioInFlightBytes.fetch_add(task.data.size(), std::memory_order_relaxed);
         ++ioOutstanding;
         {
@@ -2212,16 +2299,24 @@ int RunClient(const CliOptions& options) {
         entry.finalized = true;
     };
 
-    // Complete a batch entry: data-bearing successful writes go to the async pool; empty
-    // files and failures keep the original synchronous finalize path (cheap, no bulk I/O).
+    // Complete a batch entry: ALL successful writes -- including zero-byte files -- go to the async
+    // pool (W-04/FR-10). A zero-byte entry has an empty buffer; the worker's write path creates and
+    // truncates it to 0 and stamps mtime at close, and the count converges only through ioResults
+    // drain (FR-11). Only failures / not-to-write entries take the synchronous finalize path.
     auto completeBatchEntry = [&](BatchDownloadEntry& entry) {
         if (entry.finalized) {
             return;
         }
-        if (entry.shouldWrite && entry.fileSize > 0) {
-            dispatchBatchWrite(entry);
-        } else {
-            finalizeBatchEntry(entry);
+        // Pure routing (write_path_accounting.h): a server-ok entry -- INCLUDING a zero-byte one --
+        // is Dispatched to the async write pool (the only file-creating path), never taken through a
+        // synchronous main-thread create (W-04/FR-12/AC-13). Failure / incomplete -> SyncFail.
+        switch (RouteBatchEntry(entry.shouldWrite)) {
+            case BatchWriteRoute::Dispatch:
+                dispatchBatchWrite(entry);
+                break;
+            case BatchWriteRoute::SyncFail:
+                finalizeBatchEntry(entry);
+                break;
         }
     };
 
@@ -2365,11 +2460,17 @@ int RunClient(const CliOptions& options) {
         // temp handle (SetEndOfFile/ftruncate -> exact size, trimming any tail beyond newFileBytes).
         drainFileWritesToCompletion(st.tempFileId, st.submittedWrites, st.completedWrites,
                                     st.writeError);
-        const bool tempWriteOk = !st.writeError;
+        // W-01: closeFile now returns whether the finalize (ftruncate/SetEndOfFile) + close
+        // succeeded; fold it into the temp-write success so a finalize failure falls back to a full
+        // download instead of proceeding to verify a truncated/short temp (FR-02/B7). The delta temp
+        // has no recorded mtime (mtime is stamped on the renamed target below), so close does size
+        // finalize + handle close only.
+        bool closeOk = true;
         if (st.tempFileId != 0) {
-            clientDriver.closeFile(st.tempFileId);
+            closeOk = clientDriver.closeFile(st.tempFileId);
             st.tempFileId = 0;
         }
+        const bool tempWriteOk = !st.writeError && closeOk;
         if (!tempWriteOk) {
             // A copy/range write failed: discard + fall back to a full download (FR-16), same as
             // the former ofstream/reconstruct_io failure path.
@@ -2473,6 +2574,7 @@ int RunClient(const CliOptions& options) {
             ++compared;
             ++transferred;
             ++deltaReconstructed;
+            ++driverPathFiles;  // FR-15: delta temp was written via the driver path
             transferRetryCounts.erase(rel);
             // Capture before erase(): `st` is a reference into deltaStates and is dangling
             // after the erase, so the log line must not read it post-erase.
@@ -2905,14 +3007,15 @@ int RunClient(const CliOptions& options) {
                 entry.mtimeNs = rec.mtimeNs;
                 entry.serverOk = rec.ok;
                 entry.shouldWrite = entry.serverOk;
-                if (entry.serverOk && entry.fileSize == 0) {
-                    const fs::path abs = JoinRel(options.rootDir, entry.relPath);
-                    EnsureParentDir(abs, mainThreadDirCache);
-                    std::ofstream out(abs, std::ios::binary | std::ios::trunc);
-                    entry.shouldWrite = out.good();
-                }
-                if (!entry.serverOk || (entry.fileSize == 0 && entry.serverOk)) {
+                // W-04/FR-10/FR-12: the main thread no longer synchronously creates zero-byte files
+                // or sets their mtime. A server-unavailable entry is defined now on the failure path
+                // (no write); a server-ok zero-byte entry is dispatched to the async write pool
+                // (worker creates + truncates to 0 + stamps mtime, count converges via ioResults).
+                // Non-zero entries wait for their FileBatchChunk payload.
+                if (!entry.serverOk) {
                     finalizeBatchEntry(entry);
+                } else if (entry.fileSize == 0) {
+                    completeBatchEntry(entry);
                 }
                 batch.entries.push_back(std::move(entry));
             }
@@ -3011,19 +3114,26 @@ int RunClient(const CliOptions& options) {
             pumpDownloadWrites(d, /*flushTail=*/true);
             drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites, d.writeError);
             const bool writeOk = !d.writeError;
-            clientDriver.closeFile(d.fileId);
+            // W-01/FR-01/FR-03: stamp mtime on the still-open write handle (only when content wrote
+            // cleanly), then close; closeFile's return folds the SetEndOfFile + SetFileTime + close
+            // result into the success decision (FR-02/B7) so a finalize failure does not count.
+            if (writeOk) {
+                const FileEntry& meta = remoteFiles.at(rel);
+                clientDriver.setWriteModifyTime(d.fileId, meta.mtimeNs);
+            }
+            const bool closeOk = clientDriver.closeFile(d.fileId);
+            const bool ok = writeOk && closeOk;
             d.fileId = 0;
             activeDownloads.erase(it);
             streamToPath.erase(key);
             releaseSlot();
-            if (writeOk) {
-                const FileEntry& meta = remoteFiles.at(rel);
-                SetFileModifyTime(JoinRel(options.rootDir, rel), meta.mtimeNs);
+            if (ok) {
                 ++compared;
                 ++transferred;
+                ++driverPathFiles;  // FR-15: single-file streaming write completed via the driver
                 transferRetryCounts.erase(rel);
             } else {
-                // A driver write failed: do NOT count success; route through the existing
+                // A driver write / finalize failed: do NOT count success; route through the existing
                 // retry / delta-fallback machinery (FR-16 / AC-14).
                 retryOrFail(rel);
             }
@@ -3488,6 +3598,11 @@ int RunClient(const CliOptions& options) {
 
     try {
         auto lastDebugPrint = std::chrono::steady_clock::now();
+        // W-03/FR-08 active-cap sampling window baselines (main-thread only).
+        auto lastCapSampleAt = std::chrono::steady_clock::now();
+        uint64_t lastSampleCompletedFiles = 0;
+        uint64_t lastSampleFailures = 0;
+        uint64_t lastSampleBackpressure = 0;
         while (true) {
             bool loopHadForwardProgress = false;
             failoverScan();
@@ -3546,11 +3661,29 @@ int RunClient(const CliOptions& options) {
                 }
                 for (auto& r : ioDone) {
                     --ioOutstanding;
-                    if (r.ok) {
-                        ++compared;
-                        ++transferred;
+                    // Pure accounting (write_path_accounting.h): a finished file bumps
+                    // compared/transferred exactly once and is attributed to exactly one FR-15
+                    // diagnostic (AC-12/AC-17); a failed write (content OR close/finalize failure)
+                    // counts nothing and routes to retryOrFail (AC-02).
+                    const WriteResultAccounting acc = AccountWriteResult(r.ok, r.fastPath);
+                    compared += acc.comparedDelta;
+                    transferred += acc.transferredDelta;
+                    driverPathFiles += acc.driverPathDelta;
+                    fastPathFiles += acc.fastPathDelta;
+                    // W-03/FR-08 controller signals (main-thread running totals sampled every 500ms):
+                    // a successful completion feeds the throughput + latency EWMA; a failure feeds
+                    // the write-failure signal that halves the active cap.
+                    if (acc.countedSuccess) {
+                        ++writeCompletedFilesTotal;
+                        writeCompletedBytesTotal += r.bytes;
+                        if (r.latencyNs > 0) {
+                            writeLatencyEwmaNs = UpdateEwma(writeLatencyEwmaNs,
+                                                            static_cast<double>(r.latencyNs),
+                                                            kWriteLatencyEwmaAlpha);
+                        }
                         transferRetryCounts.erase(r.relPath);
                     } else {
+                        ++writeFailuresTotal;
                         retryOrFail(r.relPath);
                     }
                     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
@@ -3558,6 +3691,62 @@ int RunClient(const CliOptions& options) {
                 }
                 if (!ioDone.empty()) {
                     loopHadForwardProgress = true;
+                }
+            }
+            {
+                // W-03/FR-08/FR-09: sample the write signals once per ~500ms window and advance the
+                // internal adaptive active-cap controller (pure NextWriteActiveCap). No per-file
+                // logging (NFR-08): this runs at most every 500ms on the main thread and reads a
+                // handful of atomics plus one ioTasks.size() snapshot.
+                const auto nowCap = std::chrono::steady_clock::now();
+                if ((nowCap - lastCapSampleAt) >=
+                    std::chrono::milliseconds(kWriteCapSampleIntervalMs)) {
+                    const double windowSec = std::max<double>(
+                        1e-9, std::chrono::duration<double>(nowCap - lastCapSampleAt).count());
+                    uint64_t backlog = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(ioTaskMu);
+                        backlog = ioTasks.size();
+                    }
+                    const uint64_t completedNow = writeCompletedFilesTotal;
+                    const uint64_t failuresNow = writeFailuresTotal;
+                    const uint64_t bpNow = backpressureSleepCount.load(std::memory_order_relaxed);
+
+                    WriteCapSample sample;
+                    sample.backlog = backlog;
+                    sample.ioInFlightBytes = ioInFlightBytes.load(std::memory_order_relaxed);
+                    sample.driverWriteOutstandingBytes =
+                        driverWriteOutstandingBytes.load(std::memory_order_relaxed);
+                    sample.recvSoftBudgetBytes = incomingSoftLimitBytes;
+                    sample.completionRate =
+                        static_cast<double>(completedNow - lastSampleCompletedFiles) / windowSec;
+                    sample.latencyEwmaNs = writeLatencyEwmaNs;
+                    sample.backpressureSleep = (bpNow - lastSampleBackpressure) > 0;
+                    sample.writeFailures = failuresNow - lastSampleFailures;
+
+                    writeCapState = NextWriteActiveCap(writeCapState, sample, ioWorkerCount);
+                    writeActiveCap.store(writeCapState.activeCap, std::memory_order_relaxed);
+                    // Wake any parked workers so a raised cap takes effect immediately (D-09).
+                    ioTaskCv.notify_all();
+                    lastCapSampleSnapshot = sample;
+
+                    if (debugEnabled) {
+                        std::cerr << "[write-cap] cap=" << writeCapState.activeCap
+                                  << " min=" << fc::kActiveCapMin
+                                  << " max=" << std::min<uint32_t>(fc::kActiveCapMax, ioWorkerCount)
+                                  << " reason=" << fc::WriteCapAdjustReasonName(writeCapState.lastReason)
+                                  << " backlog=" << sample.backlog
+                                  << " io_inflight=" << sample.ioInFlightBytes
+                                  << " drv_out=" << sample.driverWriteOutstandingBytes
+                                  << " rate=" << sample.completionRate
+                                  << " lat_ewma_us=" << (sample.latencyEwmaNs / 1000.0)
+                                  << " bp=" << (sample.backpressureSleep ? 1 : 0) << std::endl;
+                    }
+
+                    lastCapSampleAt = nowCap;
+                    lastSampleCompletedFiles = completedNow;
+                    lastSampleFailures = failuresNow;
+                    lastSampleBackpressure = bpNow;
                 }
             }
             while (!delayedCompareEntries.empty() &&
@@ -3979,6 +4168,30 @@ int RunClient(const CliOptions& options) {
                   << " size_dist_256k_1m=" << smallFileSizeHist[4]
                   << " size_dist_ge1m=" << smallFileSizeHist[5]
                   << std::endl;
+
+        // FR-15/AC-17: files finished per write path. Phase-1-only builds (W-05 fast path disabled)
+        // would show fast_path_files=0; with the W-05 fast path active, <=256KiB whole files are
+        // counted there and everything else under driver_path_files.
+        std::cout << "[diag][write-path] driver_path_files=" << driverPathFiles
+                  << " fast_path_files=" << fastPathFiles << std::endl;
+
+        // W-03/FR-09: internal adaptive write active-cap state + last sampled window signals. The
+        // active cap / worker count are diagnostic-only here; they never enter the backpressure
+        // pressure (that stays queue + io-inflight + driver-outstanding bytes, FR-09 decoupling).
+        std::cout << "[diag][write-cap] cap=" << writeCapState.activeCap
+                  << " min=" << fc::kActiveCapMin
+                  << " max=" << std::min<uint32_t>(fc::kActiveCapMax, ioWorkerCount)
+                  << " pool_max=" << ioWorkerCount
+                  << " reason=" << fc::WriteCapAdjustReasonName(writeCapState.lastReason)
+                  << " backlog=" << lastCapSampleSnapshot.backlog
+                  << " io_inflight=" << lastCapSampleSnapshot.ioInFlightBytes
+                  << " drv_out=" << lastCapSampleSnapshot.driverWriteOutstandingBytes
+                  << " rate=" << lastCapSampleSnapshot.completionRate
+                  << " lat_ewma_us=" << (lastCapSampleSnapshot.latencyEwmaNs / 1000.0)
+                  << " bp=" << (lastCapSampleSnapshot.backpressureSleep ? 1 : 0)
+                  << " completed_files=" << writeCompletedFilesTotal
+                  << " completed_bytes=" << writeCompletedBytesTotal
+                  << " write_failures=" << writeFailuresTotal << std::endl;
     }
 
     // SAFETY: only delete local "extras" if the manifest was received in full (see

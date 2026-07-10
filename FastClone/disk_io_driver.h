@@ -58,7 +58,13 @@ public:
     uint64_t openFile(const std::string& path, OpKind mode, bool unbuffered, uint64_t expectedSize) {
         return backend_->openFile(path, mode, unbuffered, expectedSize);
     }
-    void closeFile(uint64_t fileId) { backend_->closeFile(fileId); }
+    // Record the mtime to stamp on a WRITE handle at close (optimize-small-file-write-path W-01).
+    void setWriteModifyTime(uint64_t fileId, int64_t modifyNs) {
+        backend_->setWriteModifyTime(fileId, modifyNs);
+    }
+    // Finalize (exact-size truncate + optional mtime) and close; returns false on any failure so the
+    // write success path can gate transfer counting on it (W-01/FR-02/B7). Read callers may ignore.
+    bool closeFile(uint64_t fileId) { return backend_->closeFile(fileId); }
 
     // Batch submit. Returns the number accepted; fewer than batch.size() signals backpressure
     // (the target queue reached its bound, FR-27). Accepted requests are moved out of `batch`.

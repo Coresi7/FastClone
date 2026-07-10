@@ -121,12 +121,17 @@ add_executable(FastCloneTests
     tests/test_route_selection.cpp
     tests/test_link_scheduler.cpp
     tests/test_wan_tuning.cpp
+    tests/test_write_path_accounting.cpp
 )
 target_include_directories(FastCloneTests PRIVATE FastClone)
 target_link_libraries(FastCloneTests PRIVATE Threads::Threads)
 # CMake build includes test_cli.cpp (RunCliTests is defined); enable its call in test_main.cpp.
 # The VS FastCloneTests.vcxproj excludes test_cli.cpp and leaves this macro undefined.
 target_compile_definitions(FastCloneTests PRIVATE FASTCLONE_ENABLE_CLI_TESTS)
+# S-04 (AC-27/B13): inject the cli.cpp source path so the static include-scan test can assert the
+# translation unit carries no unused #include "sync_util.h".
+target_compile_definitions(FastCloneTests PRIVATE
+    FASTCLONE_CLI_SRC=${CMAKE_CURRENT_SOURCE_DIR}/FastClone/cli.cpp)
 
 # file_index.cpp pulls in xxhash; reuse the same resolution as the main target.
 if(XXHASH_FOUND)

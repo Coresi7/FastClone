@@ -42,8 +42,35 @@ struct PoolFile {
     OpKind mode = OpKind::Read;
     bool unbuffered = false;
     uint64_t expectedSize = 0;
+    int64_t modifyNs = 0;    // W-01: mtime to stamp on the write fd at close (if hasModify)
+    bool hasModify = false;  // W-01: set by setWriteModifyTime; false => close skips futimens
     AlignInfo align;
 };
+
+// Convert a manifest modify time (Unix ns or, for legacy round-trips, Windows FILETIME ticks) to a
+// POSIX timespec for futimens (W-01/FR-01). The threshold 5e17 sits between the two encodings:
+// values >5e17 are Unix ns (POSIX peer) -> pass through; values in [1.16e17, 5e17] are FILETIME ticks
+// (Windows peer, 100ns since 1601) -> convert to Unix ns. Mirrors the authoritative
+// NormalizeManifestMtimeToUnixNs in file_index.cpp / TryNormalizeMtimeToUnixNs in compare_phase.cpp
+// so the stamped mtime round-trips against the manifest (C3 / D-14-A).
+timespec ToTimespecFromNs(int64_t modifyNs) {
+    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
+    int64_t unixNs = modifyNs;
+    if (modifyNs > kLikelyUnixNsThreshold) {
+        // Already Unix ns, pass through.
+    } else if (modifyNs >= kWindowsEpochDiff100ns) {
+        // FILETIME ticks (100ns since 1601) -> Unix ns.
+        unixNs = (modifyNs - kWindowsEpochDiff100ns) * 100LL;
+    }
+    timespec ts{};
+    if (unixNs < 0) {
+        unixNs = 0;
+    }
+    ts.tv_sec = static_cast<time_t>(unixNs / 1000000000LL);
+    ts.tv_nsec = static_cast<long>(unixNs % 1000000000LL);
+    return ts;
+}
 
 class PosixPoolBackend : public PlatformIoBackend {
 public:
@@ -117,26 +144,55 @@ public:
         return id;
     }
 
-    void closeFile(uint64_t fileId) override {
+    void setWriteModifyTime(uint64_t fileId, int64_t modifyNs) override {
+        // W-01/FR-01: only record; futimens on the still-open fd happens in closeFile.
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = files_.find(fileId);
+        if (it == files_.end() || it->second.mode != OpKind::Write) {
+            return;
+        }
+        it->second.modifyNs = modifyNs;
+        it->second.hasModify = true;
+    }
+
+    bool closeFile(uint64_t fileId) override {
         PoolFile pf;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = files_.find(fileId);
             if (it == files_.end()) {
-                return;
+                return false;  // unknown / already closed (W-01 idempotency)
             }
             pf = std::move(it->second);
             files_.erase(it);
         }
+        bool ok = true;
+        // W-01 order (R-01): ftruncate -> (optional) futimens -> close, all on the same write fd.
         // Exact final size on every write close (FR-11). Truncating unconditionally also gives the
         // driver write path ofstream-trunc-equivalent overwrite semantics (a pre-existing target is
         // trimmed to expectedSize, incl. 0 for an empty file, so no stale tail bytes survive).
         if (pf.mode == OpKind::Write && pf.fd >= 0) {
-            ::ftruncate(pf.fd, static_cast<off_t>(pf.expectedSize));
+            if (::ftruncate(pf.fd, static_cast<off_t>(pf.expectedSize)) != 0) {
+                ok = false;  // ok1
+            }
+            if (pf.hasModify) {
+                timespec ts[2];
+                ts[0].tv_sec = 0;
+                ts[0].tv_nsec = UTIME_OMIT;         // leave atime untouched
+                ts[1] = ToTimespecFromNs(pf.modifyNs);  // mtime
+                if (::futimens(pf.fd, ts) != 0) {
+                    ok = false;  // ok2
+                }
+            }
+        } else if (pf.mode == OpKind::Write) {
+            ok = false;  // write fd vanished; cannot finalize
         }
         if (pf.fd >= 0) {
-            ::close(pf.fd);
+            if (::close(pf.fd) != 0) {
+                ok = false;  // ok3
+            }
         }
+        return ok;
     }
 
     bool submit(IoRequest&& req) override {

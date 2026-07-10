@@ -100,7 +100,23 @@ public:
     // fall back to buffered (small files, unsupported FS, O_DIRECT EINVAL) without changing results.
     virtual uint64_t openFile(const std::string& path, OpKind mode, bool unbuffered,
                               uint64_t expectedSize) = 0;
-    virtual void closeFile(uint64_t fileId) = 0;
+
+    // Record the modify time (Unix ns or Windows FILETIME ticks, same encoding as the manifest) to
+    // apply to a WRITE handle just before it is closed (optimize-small-file-write-path W-01/FR-01).
+    // This ONLY records intent; the actual SetFileTime/futimens happens inside closeFile, on the
+    // still-open write handle, so a successful whole-file write no longer re-opens the target just to
+    // stamp mtime. May be called multiple times (last value wins). No-op / harmless on read handles
+    // and unknown ids. Not calling it leaves closeFile without an mtime step (legacy behaviour).
+    virtual void setWriteModifyTime(uint64_t fileId, int64_t modifyNs) = 0;
+
+    // Finalize + close a file handle. For a WRITE handle this applies, in order on the SAME handle:
+    // (1) exact-size truncate (SetEndOfFile / ftruncate, C2 hard constraint), (2) if a modify time
+    // was recorded via setWriteModifyTime, SetFileTime / futimens, (3) the handle close. Returns the
+    // AND of every finalize + close syscall succeeding; any failure returns false so the write
+    // success path can refuse to count a transfer whose truncate/mtime/close failed (W-01/FR-02/B7).
+    // For a READ handle there is no finalize; it returns the close result. An unknown/already-closed
+    // id returns false with no side effect. Read/cleanup callers may ignore the result.
+    virtual bool closeFile(uint64_t fileId) = 0;
 
     // Submit one op; multiple ops may be in flight at once (FR-12). Returns false only on a hard
     // backend failure (the driver then emits an Error completion for the op).

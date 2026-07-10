@@ -42,6 +42,26 @@ std::wstring Widen(const std::string& s) {
     return w;
 }
 
+// Convert a manifest modify time to a Windows FILETIME. The raw value may be either Unix
+// nanoseconds (legacy) or raw FILETIME ticks (100ns since 1601). This MUST stay byte-for-byte
+// identical to file_index.cpp's ToFileTimeFromNs (optimize-small-file-write-path W-01/C3): the two
+// copies exist only so this backend TU does not have to pull mtime conversion out of file_index.h
+// (which would leak <windows.h>). If you change one, change the other; V-05 asserts equivalence.
+FILETIME ToFileTimeFromNsWin(int64_t unixNs) {
+    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;
+    int64_t ticks = unixNs;
+    if (unixNs > kLikelyUnixNsThreshold) {
+        ticks = (unixNs / 100LL) + kWindowsEpochDiff100ns;
+    }
+    ULARGE_INTEGER v{};
+    v.QuadPart = static_cast<ULONGLONG>(ticks < 0 ? 0 : ticks);
+    FILETIME ft{};
+    ft.dwLowDateTime = v.LowPart;
+    ft.dwHighDateTime = v.HighPart;
+    return ft;
+}
+
 struct WinFile {
     HANDLE hUnbuf = INVALID_HANDLE_VALUE;
     HANDLE hBuf = INVALID_HANDLE_VALUE;
@@ -50,6 +70,8 @@ struct WinFile {
     bool unbuffered = false;
     uint64_t expectedSize = 0;   // write: exact final size to SetEndOfFile at close
     uint64_t fileSize = 0;       // read: size for tail clamping
+    int64_t modifyNs = 0;        // W-01: mtime to stamp on the write handle at close (if hasModify)
+    bool hasModify = false;      // W-01: set by setWriteModifyTime; false => close skips SetFileTime
     AlignInfo align;
 };
 
@@ -85,10 +107,10 @@ public:
         // Change 3 (fastcheck-redundant-syscall-elim, FR-15/FR-16): on the read path, a positive
         // expectedSize is the caller's already-known read size/bound, so use it directly and skip
         // the redundant FileSizeOnDisk (GetFileAttributesExW) metadata syscall. expectedSize==0
-        // keeps the old behaviour (query FileSizeOnDisk; 0 stays the unknown/failure sentinel and
-        // still drives the small-file buffered fallback + tail clamp). Write mode is unchanged:
-        // expectedSize remains the final SetEndOfFile size (FR-17).
-        const bool sizeKnown = (mode == OpKind::Read) || expectedSize > 0;
+        // keeps the old read behaviour (query FileSizeOnDisk; 0 stays the unknown/failure sentinel
+        // and still drives the small-file buffered fallback + tail clamp). Write mode is different:
+        // expectedSize is always the exact final SetEndOfFile size, including a valid 0-byte file.
+        const bool sizeKnown = (mode == OpKind::Write) || (mode == OpKind::Read) || expectedSize > 0;
         uint64_t sizeForPolicy;
         if (mode == OpKind::Read) {
             sizeForPolicy = (expectedSize > 0) ? expectedSize : FileSizeOnDisk(wf.wpath);
@@ -96,13 +118,16 @@ public:
             sizeForPolicy = expectedSize;
         }
         wf.fileSize = (mode == OpKind::Read) ? sizeForPolicy : 0;
-        // unbuffered-writes M4/FR-13/D-02: the small-file (< kSmallFileBufferedMax) whole-file
-        // downgrade is kept ONLY for the read path (no dirty-page concern, zero regression). Write
-        // opens with unbuffered intent stay unbuffered regardless of size; sub-sector tails and
-        // unaligned middle fragments fall back per-op in submit() (D-03), so bytes stay exact.
+        // optimize-small-file-write-path W-02/FR-04/FR-05/D-02: the small-file
+        // (< kSmallFileBufferedMax) whole-file downgrade now covers BOTH read and write. A write
+        // whose exact size is known and below the threshold opens only the buffered handle -- no
+        // unbuffered (NO_BUFFERING) handle, no second IOCP association -- since a single-shot small
+        // write gets no benefit from direct IO and pays double open + IOCP cost. Large writes
+        // (>= threshold) keep the unbuffered intent; sub-sector tails and unaligned middle
+        // fragments still fall back per-op in submit() (D-03), so bytes stay exact (FR-06/C2).
         const bool wantUnbuf = unbuffered && !cfg_.forceBuffered && sizeKnown &&
-                               (mode == OpKind::Read ? sizeForPolicy >= kSmallFileBufferedMax : true);
-        if (unbuffered && !wantUnbuf && mode == OpKind::Read) {
+                               (sizeForPolicy >= kSmallFileBufferedMax);
+        if (unbuffered && !wantUnbuf && sizeKnown) {
             counters_.smallFileFallback.fetch_add(1);
         }
 
@@ -141,36 +166,67 @@ public:
         return id;
     }
 
-    void closeFile(uint64_t fileId) override {
+    void setWriteModifyTime(uint64_t fileId, int64_t modifyNs) override {
+        // W-01/FR-01: only record; the actual SetFileTime happens on the still-open write handle in
+        // closeFile, so a successful whole-file write never re-opens the target to stamp mtime.
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = files_.find(fileId);
+        if (it == files_.end() || it->second.mode != OpKind::Write) {
+            return;
+        }
+        it->second.modifyNs = modifyNs;
+        it->second.hasModify = true;
+    }
+
+    bool closeFile(uint64_t fileId) override {
         WinFile wf;
         {
             std::lock_guard<std::mutex> lk(mu_);
             auto it = files_.find(fileId);
             if (it == files_.end()) {
-                return;
+                return false;  // unknown / already closed: no side effect (W-01 idempotency)
             }
             wf = it->second;
             files_.erase(it);
         }
+        bool ok = true;
         // Restore the exact final size on every write close (unbuffered-writes: this also gives the
         // driver write path ofstream-trunc-equivalent overwrite semantics, incl. truncating a
         // pre-existing target down to an empty/expectedSize file so no stale tail bytes survive).
+        // W-01 order (R-01): SetEndOfFile -> (optional) SetFileTime -> CloseHandle, all on the same
+        // write handle; the returned bool is the AND of every step so the caller can refuse to count
+        // a transfer whose truncate/mtime/close failed (FR-02/B7).
         if (wf.mode == OpKind::Write) {
             HANDLE h = wf.hBuf != INVALID_HANDLE_VALUE ? wf.hBuf : wf.hUnbuf;
             if (h != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER li;
                 li.QuadPart = static_cast<LONGLONG>(wf.expectedSize);
-                if (SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
-                    SetEndOfFile(h);
+                if (SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && SetEndOfFile(h)) {
+                    // ok1
+                } else {
+                    ok = false;
                 }
+                if (wf.hasModify) {
+                    const FILETIME ft = ToFileTimeFromNsWin(wf.modifyNs);
+                    if (!SetFileTime(h, nullptr, nullptr, &ft)) {
+                        ok = false;  // ok2
+                    }
+                }
+            } else {
+                ok = false;  // write handle vanished; cannot finalize
             }
         }
         if (wf.hUnbuf != INVALID_HANDLE_VALUE) {
-            CloseHandle(wf.hUnbuf);
+            if (!CloseHandle(wf.hUnbuf)) {
+                ok = false;  // ok3
+            }
         }
         if (wf.hBuf != INVALID_HANDLE_VALUE) {
-            CloseHandle(wf.hBuf);
+            if (!CloseHandle(wf.hBuf)) {
+                ok = false;  // ok3
+            }
         }
+        return ok;
     }
 
     bool submit(IoRequest&& req) override {

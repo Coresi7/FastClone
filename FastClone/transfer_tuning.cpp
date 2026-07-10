@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <thread>
 
 namespace fc {
@@ -57,6 +58,142 @@ size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effective
         return std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2);
     }
     return std::max<size_t>(512 * 1024, static_cast<size_t>(effectiveChunkSize));
+}
+
+uint32_t ResolveWriteWorkerPoolMax(uint32_t hardwareThreads) {
+    const uint32_t hw = std::max<uint32_t>(1, hardwareThreads);
+    // Physical pool size (poolMax) = clamp(hw, 8, 32) (D-04): never below the initial active cap so
+    // it is always reachable, never above 32 so AV / filter-driver jitter stays bounded (R3).
+    return std::clamp<uint32_t>(hw, kActiveCapInitial, kActiveCapMax);
+}
+
+double UpdateEwma(double prev, double sample, double alpha) {
+    if (prev <= 0.0) {
+        return sample;  // unseeded -> take the first sample verbatim
+    }
+    return alpha * sample + (1.0 - alpha) * prev;
+}
+
+const char* WriteCapAdjustReasonName(WriteCapAdjustReason reason) {
+    switch (reason) {
+        case WriteCapAdjustReason::Init:               return "init";
+        case WriteCapAdjustReason::Grow:               return "grow";
+        case WriteCapAdjustReason::Hold:               return "hold";
+        case WriteCapAdjustReason::HalveBackpressure:  return "halve_backpressure";
+        case WriteCapAdjustReason::HalveBudget:        return "halve_budget";
+        case WriteCapAdjustReason::HalveRateDrop:      return "halve_rate_drop";
+        case WriteCapAdjustReason::HalveLatency:       return "halve_latency";
+        case WriteCapAdjustReason::HalveFailure:       return "halve_failure";
+    }
+    return "unknown";
+}
+
+WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
+                                           const WriteCapSample& s, uint32_t workerCapacity) {
+    // Effective ceiling: never above kActiveCapMax, never above the physical pool (FR-07 / AC-07).
+    const uint32_t effectiveMax =
+        std::clamp<uint32_t>(workerCapacity, kActiveCapMin, kActiveCapMax);
+
+    // Write pressure for the controller = write-pool bytes + driver outstanding bytes (saturating).
+    // Note: this is only a controller INPUT; the active cap / worker count never enter the
+    // backpressure pressure (FR-09 decoupling lives in ComposeWritePressure).
+    const uint64_t kMax = (std::numeric_limits<uint64_t>::max)();
+    uint64_t writePressure = s.ioInFlightBytes;
+    writePressure = (writePressure > kMax - s.driverWriteOutstandingBytes)
+                        ? kMax
+                        : writePressure + s.driverWriteOutstandingBytes;
+
+    WriteCapControllerState next = prev;
+
+    // 1) Deterioration (any true -> halve). Priority order maps 1:1 to the FR-08 halve list.
+    WriteCapAdjustReason reason = WriteCapAdjustReason::Hold;
+    bool deteriorated = true;
+    if (s.backpressureSleep) {
+        reason = WriteCapAdjustReason::HalveBackpressure;
+    } else if (writePressure > s.recvSoftBudgetBytes) {
+        reason = WriteCapAdjustReason::HalveBudget;
+    } else if (prev.havePrev && s.completionRate < prev.prevCompletionRate * kWriteCapRateDropFactor) {
+        reason = WriteCapAdjustReason::HalveRateDrop;
+    } else if (prev.havePrev && prev.prevLatencyEwmaNs > 0.0 &&
+               s.latencyEwmaNs > prev.prevLatencyEwmaNs * kWriteCapLatencyHalveFactor) {
+        reason = WriteCapAdjustReason::HalveLatency;
+    } else if (s.writeFailures > 0) {
+        reason = WriteCapAdjustReason::HalveFailure;
+    } else {
+        // S-01 (FR-08 / M7 / R6): backlog == 0 is the normal gap between batches, NOT a
+        // deterioration signal. With no other deterioration, it falls through to the healthy check
+        // (which fails on `backlog > cap`) and lands in the Hold branch below -- keeping the cap
+        // and resetting the healthy streak. The HalveBacklogEmpty reason was removed entirely.
+        deteriorated = false;
+    }
+
+    uint32_t newCap = prev.activeCap;
+    if (deteriorated) {
+        newCap = std::max<uint32_t>(kActiveCapMin, prev.activeCap / 2);  // floor-halve (FR-08)
+        next.consecutiveHealthy = 0;
+        next.lastReason = reason;
+    } else {
+        // 2) Healthy (all true) -> accumulate streak, grow +1 from the 2nd consecutive window.
+        const bool healthy =
+            s.backlog > prev.activeCap &&
+            !s.backpressureSleep &&
+            writePressure <= s.recvSoftBudgetBytes &&
+            (!prev.havePrev || s.completionRate >= prev.prevCompletionRate) &&
+            (!prev.havePrev || prev.prevLatencyEwmaNs <= 0.0 ||
+             s.latencyEwmaNs <= prev.prevLatencyEwmaNs * kWriteCapLatencyGrowFactor);
+        if (healthy) {
+            next.consecutiveHealthy = prev.consecutiveHealthy + 1;
+            if (next.consecutiveHealthy >= kWriteCapHealthyWindowsToGrow &&
+                prev.activeCap < effectiveMax) {
+                newCap = prev.activeCap + 1;  // NFR-08: at most +1 per window
+                next.lastReason = WriteCapAdjustReason::Grow;
+            } else {
+                newCap = prev.activeCap;  // first healthy window (or already at ceiling) -> Hold
+                next.lastReason = WriteCapAdjustReason::Hold;
+            }
+        } else {
+            // 3) Neither deteriorating nor healthy -> Hold, reset the streak.
+            newCap = prev.activeCap;
+            next.consecutiveHealthy = 0;
+            next.lastReason = WriteCapAdjustReason::Hold;
+        }
+    }
+
+    next.activeCap = std::clamp<uint32_t>(newCap, kActiveCapMin, effectiveMax);
+    next.prevCompletionRate = s.completionRate;
+    next.prevLatencyEwmaNs = s.latencyEwmaNs;
+    next.havePrev = true;
+    return next;
+}
+
+uint64_t ComposeWritePressure(uint64_t queuedBytes, uint64_t ioInFlightBytes,
+                              uint64_t driverWriteOutstandingBytes) {
+    // Saturating add so a pathological set of inputs never wraps to a tiny pressure (FR-09/NFR-04).
+    const uint64_t kMax = (std::numeric_limits<uint64_t>::max)();
+    uint64_t p = queuedBytes;
+    p = (p > kMax - ioInFlightBytes) ? kMax : p + ioInFlightBytes;
+    p = (p > kMax - driverWriteOutstandingBytes) ? kMax : p + driverWriteOutstandingBytes;
+    return p;
+}
+
+uint32_t NextWriteBackpressureSleepUs(uint64_t pressure, uint64_t softLimitBytes) {
+    if (pressure <= softLimitBytes) {
+        return 0;
+    }
+    const uint64_t over = pressure - softLimitBytes;
+    if (over > softLimitBytes * 2) {
+        return 5000;
+    }
+    if (over > softLimitBytes) {
+        return 3000;
+    }
+    if (over > (softLimitBytes / 2)) {
+        return 1500;
+    }
+    if (over > (softLimitBytes / 4)) {
+        return 700;
+    }
+    return 300;
 }
 
 bool IsWanRtt(long rttMs) {

@@ -17,6 +17,117 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options);
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit);
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize);
 
+// --- Write-worker pool + adaptive active cap (optimize-small-file-write-path W-03) --------------
+// W-03 has NO public tuning knob (NFR-07): there is no --write-workers / FASTCLONE_WRITE_WORKERS
+// and no CliOptions field. Write concurrency is a fixed max worker pool whose physical size derives
+// from the hardware thread count, gated at runtime by an internal adaptive "active cap" the client
+// converges on its own from the observed write backlog / in-flight bytes / completion rate /
+// latency / backpressure signals (design section 3.3).
+
+// Adaptive active-cap bounds (FR-07). The active cap is the number of workers allowed to execute a
+// write task at the same instant; it starts at kActiveCapInitial and moves inside
+// [kActiveCapMin, min(kActiveCapMax, poolMax)] where poolMax is the physical pool size.
+inline constexpr uint32_t kActiveCapInitial = 8;   // FR-07 initial value
+inline constexpr uint32_t kActiveCapMin     = 1;   // FR-07 lower bound
+inline constexpr uint32_t kActiveCapMax     = 32;  // FR-07 upper bound
+
+// Controller sampling interval (FR-08): the main loop samples the write signals once per window.
+inline constexpr long kWriteCapSampleIntervalMs = 500;
+
+// Adaptive thresholds (all constexpr-tunable, FR-08). A completion-rate drop below
+// kWriteCapRateDropFactor of the previous window (i.e. >25% drop) halves the cap; a latency EWMA
+// rise above kWriteCapLatencyHalveFactor (>50%) halves it; the healthy branch additionally requires
+// the latency EWMA to stay at or below kWriteCapLatencyGrowFactor (<=+25%) of the previous window.
+inline constexpr double kWriteCapRateDropFactor    = 0.75;
+inline constexpr double kWriteCapLatencyGrowFactor = 1.25;
+inline constexpr double kWriteCapLatencyHalveFactor = 1.50;
+// FR-08 / D-12: the cap only grows after this many CONSECUTIVE healthy windows, then +1 per window.
+inline constexpr uint32_t kWriteCapHealthyWindowsToGrow = 2;
+// EWMA smoothing factor for the write-completion latency signal (UpdateEwma alpha).
+inline constexpr double kWriteLatencyEwmaAlpha = 0.2;
+
+// Physical write-worker pool size (max concurrency ceiling, D-04): clamp(max(1,hw), 8, 32). This is
+// the active cap's hard upper bound (poolMax); when hw < 32 the effective cap ceiling becomes poolMax
+// (FR-07 "must not exceed the real worker capacity" / AC-07 "capacity below the ceiling"). Replaces
+// the removed ResolveWriteWorkerCount (no explicit-config path anymore, NFR-07).
+uint32_t ResolveWriteWorkerPoolMax(uint32_t hardwareThreads);
+
+// Exponentially-weighted moving average update (pure, unit-testable). `prev <= 0` seeds the EWMA
+// with the sample verbatim (write latency is strictly positive, so 0 is the "unseeded" sentinel).
+double UpdateEwma(double prev, double sample, double alpha);
+
+// Reason the active cap last changed (diagnostics FR-09; the halve reasons map 1:1 to the FR-08
+// deterioration list, evaluated in this priority order). S-01 (FR-08/FR-09/M7): an empty backlog is
+// no longer a deterioration signal, so there is deliberately no HalveBacklogEmpty reason -- the
+// diagnostics can never emit it (D-13-B: the constraint is enforced at the type level).
+enum class WriteCapAdjustReason {
+    Init,
+    Grow,
+    Hold,
+    HalveBackpressure,
+    HalveBudget,
+    HalveRateDrop,
+    HalveLatency,
+    HalveFailure
+};
+
+// Stable string for a reason (diagnostics + test assertions).
+const char* WriteCapAdjustReasonName(WriteCapAdjustReason reason);
+
+// One sampling-window observation fed to the controller (FR-08). All fields are read-only signals;
+// the active cap and the real worker count are NEVER inputs to backpressure (FR-09 decoupling).
+struct WriteCapSample {
+    uint64_t backlog = 0;                     // ioTasks.size() snapshot
+    uint64_t ioInFlightBytes = 0;             // write-pool buffered-but-unwritten bytes
+    uint64_t driverWriteOutstandingBytes = 0; // driver submitted-not-reaped write bytes
+    uint64_t recvSoftBudgetBytes = 0;         // receive-side soft budget (read-only observation)
+    double   completionRate = 0.0;            // files completed this window / window seconds
+    double   latencyEwmaNs = 0.0;             // current write-completion latency EWMA
+    bool     backpressureSleep = false;       // receive side slept at least once this window
+    uint64_t writeFailures = 0;               // write failures this window (delta)
+};
+
+// Explicit controller state carried across windows (main-thread only, D-10). NextWriteActiveCap is a
+// pure function of (prev state, sample, pool capacity), so the FR-08 rules are unit-testable with no
+// network / disk (AC-07 / AC-08).
+struct WriteCapControllerState {
+    uint32_t activeCap = kActiveCapInitial;
+    uint32_t consecutiveHealthy = 0;
+    double   prevCompletionRate = 0.0;
+    double   prevLatencyEwmaNs = 0.0;
+    bool     havePrev = false;
+    WriteCapAdjustReason lastReason = WriteCapAdjustReason::Init;
+};
+
+// Advance the active-cap controller by exactly one sampling window (FR-08 / NFR-08 / AC-07 / AC-08 /
+// B9). `workerCapacity` is the physical pool size (poolMax); the effective ceiling is
+// min(kActiveCapMax, workerCapacity). Rules (evaluated in order):
+//   1. deterioration (ANY true -> halve, floor kActiveCapMin, reset healthy streak): backpressure
+//      sleep; write pressure (ioInFlight + driverOutstanding) over the soft budget; completion rate
+//      drop >25%; latency EWMA rise >50%; write failures > 0. (S-01: an empty backlog is NOT a
+//      deterioration signal; it Holds the cap and resets the healthy streak via rule 3.)
+//   2. healthy (ALL true): backlog > current cap; no backpressure sleep; write pressure <= soft
+//      budget; completion rate not dropping; latency EWMA rise <=25%. First healthy window only
+//      accumulates the streak (Hold); from the 2nd consecutive window on, +1 per window (Grow),
+//      never above the effective ceiling.
+//   3. otherwise Hold (reset healthy streak).
+// The result cap is always clamped to [kActiveCapMin, min(kActiveCapMax, workerCapacity)].
+WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
+                                           const WriteCapSample& sample, uint32_t workerCapacity);
+
+// Single write-backpressure pressure term (FR-09 / AC-10): the sum of the network receive queue,
+// the write-pool buffered-but-unwritten bytes, and the driver's outstanding (submitted-not-reaped)
+// write bytes. A byte budget, independent of the worker COUNT, so raising write workers never
+// changes the pressure for a given set of byte inputs (NFR-04). Saturating add.
+uint64_t ComposeWritePressure(uint64_t queuedBytes, uint64_t ioInFlightBytes,
+                              uint64_t driverWriteOutstandingBytes);
+
+// Backpressure sleep (microseconds) for a given pressure vs the soft byte limit (FR-09). Byte-for-
+// byte the legacy ladder: at or below the limit -> 0 (no sleep); otherwise 300us base, stepping to
+// 700/1500/3000/5000us as the overshoot crosses limit/4, limit/2, limit, 2*limit. Pure so AC-10 can
+// assert it depends only on the byte inputs (never on the worker count).
+uint32_t NextWriteBackpressureSleepUs(uint64_t pressure, uint64_t softLimitBytes);
+
 // --- WAN small-file tuning (design docs/design/wan-smallfile-perf.md section 3.2/section 3.3) ----------
 // Everything below is a pure function of the measured session RTT plus the already-resolved
 // base tuning, so it is unit-testable without the network (V-01/V-02/V-09). All thresholds

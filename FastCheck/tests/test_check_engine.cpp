@@ -178,11 +178,15 @@ public:
         return id;
     }
 
-    void closeFile(uint64_t fileId) override {
+    // optimize-small-file-write-path W-01: record-only mtime hook (no-op for this read-oriented mock).
+    void setWriteModifyTime(uint64_t /*fileId*/, int64_t /*modifyNs*/) override {}
+
+    // W-01: closeFile now returns the finalize+close result; this mock always succeeds on a known id.
+    bool closeFile(uint64_t fileId) override {
         std::lock_guard<std::mutex> lk(mu_);
         ++closeCalls_;
         lastClosedFileId_ = fileId;
-        files_.erase(fileId);
+        return files_.erase(fileId) > 0;
     }
 
     bool submit(fc::io::IoRequest&& req) override {

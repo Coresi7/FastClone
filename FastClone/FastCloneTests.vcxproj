@@ -87,13 +87,16 @@
        or FastCloneRouteProbe's IntDir (design §3.6 / R-05). -->
   <PropertyGroup>
     <IntDir>$(Platform)\$(Configuration)\FastCloneTests\</IntDir>
+    <!-- Forward slashes so FASTCLONE_CLI_SRC is a valid C string literal (backslashes escape). -->
+    <FastCloneCliSrc>$(ProjectDir)cli.cpp</FastCloneCliSrc>
+    <FastCloneCliSrc>$(FastCloneCliSrc.Replace('\','/'))</FastCloneCliSrc>
   </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -112,7 +115,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -129,7 +132,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -148,7 +151,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -182,6 +185,7 @@
     <ClInclude Include="parallel_dir_walk.h" />
     <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="win_socket.h" />
+    <ClInclude Include="write_path_accounting.h" />
   </ItemGroup>
   <ItemGroup>
     <!-- Production sources under test (mirrors CMake FastCloneTests; no sync_engine.cpp /
@@ -226,6 +230,7 @@
     <ClCompile Include="..\tests\test_route_selection.cpp" />
     <ClCompile Include="..\tests\test_link_scheduler.cpp" />
     <ClCompile Include="..\tests\test_wan_tuning.cpp" />
+    <ClCompile Include="..\tests\test_write_path_accounting.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

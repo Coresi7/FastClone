@@ -176,6 +176,7 @@
     <ClInclude Include="transfer_tuning.h" />
     <ClInclude Include="version.h" />
     <ClInclude Include="win_socket.h" />
+    <ClInclude Include="write_path_accounting.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="cli.cpp" />

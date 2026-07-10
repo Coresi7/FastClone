@@ -5,6 +5,10 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 #include <xxhash.h>
 
@@ -52,6 +56,35 @@ FILETIME ToFileTimeFromNs(int64_t unixNs) {
     return ft;
 }
 #endif
+
+}  // namespace
+
+// S-02 (FR-16 / NFR-09 / M8 / R7 / C3): normalize a manifest mtime to Unix ns before handing it to a
+// POSIX filesystem. The threshold 5e17 sits BETWEEN the two encodings, so the direction matters:
+//   - Unix ns for any date after ~1985 is ~1.7e18 and ABOVE 5e17  -> pass through unchanged.
+//   - Windows FILETIME ticks (100ns since 1601) for any modern date is ~1.3e17 and BELOW 5e17, but
+//     at/above the Windows-Unix epoch delta 1.16e17 -> convert: (raw - 1.16e17) * 100.
+// This mirrors the authoritative compare_phase.cpp::TryNormalizeMtimeToUnixNs and the Windows-side
+// ToFileTimeFromNs (which treats >5e17 as "Unix ns, convert to ticks"). 0 and small values (< the
+// epoch delta, including the 0 "unknown" sentinel) pass through untouched; negative clamps to 0.
+// Pure int64 arithmetic, NO <windows.h> dependency; compiled on all platforms so it is unit-testable
+// and value-for-value identical to WriteSmallFileFastPath's POSIX branch and the backend
+// ToTimespecFromNs (SetFileModifyTime / driver write / small-file fast path share one mtime, D-14-A/C3).
+int64_t NormalizeManifestMtimeToUnixNs(int64_t modifyNs) {
+    constexpr int64_t kLikelyUnixNsThreshold = 500000000000000000LL;      // 5e17
+    constexpr int64_t kWindowsEpochDiff100ns = 116444736000000000LL;      // 1.16e17
+    if (modifyNs > kLikelyUnixNsThreshold) {
+        return modifyNs;  // genuine Unix ns (POSIX peer), pass through
+    }
+    if (modifyNs < kWindowsEpochDiff100ns) {
+        return modifyNs < 0 ? 0 : modifyNs;  // 0 sentinel / pre-1970 small values: pass through
+    }
+    // [1.16e17, 5e17]: Windows FILETIME ticks -> Unix ns.
+    const int64_t unixNs = (modifyNs - kWindowsEpochDiff100ns) * 100LL;
+    return unixNs < 0 ? 0 : unixNs;
+}
+
+namespace {
 
 // Streaming read chunk / read-ahead window for ComputeFileHashViaDriver. Values match the server's
 // signature/hash single-pass constants (kServerSigChunkBytes / kServerReadAhead in
@@ -582,8 +615,98 @@ void SetFileModifyTime(const fs::path& path, int64_t modifyNs) {
     SetFileTime(handle, nullptr, nullptr, &writeFt);
     CloseHandle(handle);
 #else
+    // S-02: normalize a possible Windows FILETIME-ticks input to Unix ns first (FR-16 / C3), so this
+    // path matches the driver write path and the small-file fast path. master did FromUnixNs(modifyNs)
+    // directly, which was correct for POSIX-peer (Unix-ns) inputs but wrote raw ticks when the manifest
+    // came from a Windows peer. NormalizeManifestMtimeToUnixNs fixes that without breaking Unix-ns.
     std::error_code ec;
-    fs::last_write_time(path, FromUnixNs(modifyNs), ec);
+    fs::last_write_time(path, FromUnixNs(NormalizeManifestMtimeToUnixNs(modifyNs)), ec);
+#endif
+}
+
+bool ShouldUseSmallFileFastPath(uint64_t size) {
+    return size <= kSmallFileFastPathMax;
+}
+
+bool WriteSmallFileFastPath(const fs::path& path, const uint8_t* data, size_t size,
+                            int64_t modifyNs) {
+    // W-05: a single-shot synchronous write that mirrors the DiskIoDriver whole-file path's on-disk
+    // result exactly (content, exact size, mtime, truncating overwrite) without the driver's
+    // scheduling / aligned-bounce / completion-gate overhead. Parent dir is the caller's job (B6).
+#ifdef _WIN32
+    HANDLE h = CreateFileW(ToExtendedLengthPath(path).c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool ok = true;
+    size_t written = 0;
+    while (ok && written < size) {
+        const DWORD chunk =
+            static_cast<DWORD>(std::min<size_t>(size - written, static_cast<size_t>(1u << 20)));
+        DWORD wrote = 0;
+        if (!WriteFile(h, data + written, chunk, &wrote, nullptr) || wrote != chunk) {
+            ok = false;
+            break;
+        }
+        written += wrote;
+    }
+    // Exact final size (CREATE_ALWAYS already truncated to 0; writing `size` bytes leaves it at size,
+    // but keep SetEndOfFile for parity with the driver close path, incl. the size==0 empty file).
+    if (ok) {
+        LARGE_INTEGER li;
+        li.QuadPart = static_cast<LONGLONG>(size);
+        if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN) || !SetEndOfFile(h)) {
+            ok = false;
+        }
+    }
+    if (ok) {
+        const FILETIME writeFt = ToFileTimeFromNs(modifyNs);
+        if (!SetFileTime(h, nullptr, nullptr, &writeFt)) {
+            ok = false;
+        }
+    }
+    if (!CloseHandle(h)) {
+        ok = false;
+    }
+    return ok;
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    size_t written = 0;
+    while (ok && written < size) {
+        const ssize_t w = ::write(fd, data + written, size - written);
+        if (w < 0) {
+            ok = false;
+            break;
+        }
+        written += static_cast<size_t>(w);
+    }
+    if (ok && ::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        ok = false;
+    }
+    if (ok) {
+        timespec ts[2];
+        ts[0].tv_sec = 0;
+        ts[0].tv_nsec = UTIME_OMIT;  // leave atime untouched
+        // S-02 / D-14-A: single normalization source shared with SetFileModifyTime. Direction mirrors
+        // compare_phase.cpp::TryNormalizeMtimeToUnixNs: >5e17 is Unix ns (passthrough), [1.16e17,5e17]
+        // is FILETIME ticks (-> ns), 0/negative pass through (clamped to 0).
+        const int64_t unixNs = NormalizeManifestMtimeToUnixNs(modifyNs);
+        ts[1].tv_sec = static_cast<time_t>(unixNs / 1000000000LL);
+        ts[1].tv_nsec = static_cast<long>(unixNs % 1000000000LL);
+        if (::futimens(fd, ts) != 0) {
+            ok = false;
+        }
+    }
+    if (::close(fd) != 0) {
+        ok = false;
+    }
+    return ok;
 #endif
 }
 
