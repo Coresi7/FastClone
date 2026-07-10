@@ -1862,26 +1862,41 @@ int RunClient(const CliOptions& options) {
                 for (IoWriteTask& t : batch) {
                     // C8: the file payload write is issued through the unified disk IO driver
                     // (design section 5.4) instead of an inline ofstream, so all client file-content IO
-                    // shares one locus with read/write fairness + backpressure. Bytes and final
-                    // size are identical to the former trunc+write path. W-01: mtime is stamped on
-                    // the same write handle at close (driverWriteWholeFile takes mtimeNs), so there
-                    // is no separate SetFileModifyTime open here anymore.
-                    const fs::path abs = JoinRel(options.rootDir, t.relPath);
-                    EnsureParentDir(abs, dirCache);  // B6: parent dir for both paths
+                    // shares one locus with read/write fairness + backpressure. Bytes and final size
+                    // are identical to the former trunc+write path. W-01: mtime is stamped on the same
+                    // write handle at close (driverWriteWholeFile takes mtimeNs), so there is no
+                    // separate SetFileModifyTime open here anymore.
+                    //
+                    // Exception safety (mirror the hash worker at line ~1049): driverWriteWholeFile
+                    // allocates 1 MiB driver chunks and the EnsureParentDir/JoinRel/PathToUtf8 helpers
+                    // can throw std::bad_alloc. An uncaught exception here would std::terminate the
+                    // process AND leave ioInFlightBytes/ioOutstanding unbalanced (the task was already
+                    // popped but emitted no result), hanging the end-of-sync completion gate. Wrap the
+                    // file-write work so an exception becomes a normal write failure (ok=false ->
+                    // retryOrFail). The ioInFlightBytes debit + IoWriteResult emit below run on EVERY
+                    // path (outside the try) so the budget and outstanding counts never desynchronize;
+                    // `results` is reserved (kIoBatchPop) and IoWriteResult move is noexcept, so the
+                    // push cannot throw.
                     const uint64_t bytes = static_cast<uint64_t>(t.data.size());
-                    bool ok;
+                    bool ok = false;
                     bool fastPath = false;
-                    if (ShouldUseSmallFileFastPath(t.data.size())) {
-                        // W-05/FR-13: <=256KiB fully-buffered files bypass the driver scheduling /
-                        // aligned-bounce / completion-gate and write synchronously, producing a
-                        // byte/size/mtime-identical result. On any failure it returns false and
-                        // flows to the same retryOrFail path (FR-14). The write-pool buffered-bytes
-                        // budget (ioInFlightBytes) still bounds memory, keeping backpressure
-                        // equivalent (design section 3.5.3).
-                        fastPath = true;
-                        ok = WriteSmallFileFastPath(abs, t.data.data(), t.data.size(), t.mtimeNs);
-                    } else {
-                        ok = driverWriteWholeFile(fc::PathToUtf8(abs), t.data, t.mtimeNs);
+                    try {
+                        const fs::path abs = JoinRel(options.rootDir, t.relPath);
+                        EnsureParentDir(abs, dirCache);  // B6: parent dir for both paths
+                        if (ShouldUseSmallFileFastPath(t.data.size())) {
+                            // W-05/FR-13: <=256KiB fully-buffered files bypass the driver scheduling /
+                            // aligned-bounce / completion-gate and write synchronously, producing a
+                            // byte/size/mtime-identical result. On any failure it returns false and
+                            // flows to the same retryOrFail path (FR-14). The write-pool buffered-bytes
+                            // budget (ioInFlightBytes) still bounds memory, keeping backpressure
+                            // equivalent (design section 3.5.3).
+                            fastPath = true;
+                            ok = WriteSmallFileFastPath(abs, t.data.data(), t.data.size(), t.mtimeNs);
+                        } else {
+                            ok = driverWriteWholeFile(fc::PathToUtf8(abs), t.data, t.mtimeNs);
+                        }
+                    } catch (...) {
+                        ok = false;  // exception -> treated as a write failure, flows to retryOrFail
                     }
                     ioInFlightBytes.fetch_sub(t.data.size(), std::memory_order_relaxed);
                     // W-03/FR-08: enqueue->complete latency for the controller (0 enqueue == unset).

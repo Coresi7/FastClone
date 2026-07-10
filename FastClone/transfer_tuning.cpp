@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <thread>
 
 namespace fc {
 
@@ -11,9 +10,6 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
     TunedTransferOptions tuned;
     tuned.streamLimit = options.streamLimit;
     tuned.chunkSize = options.chunkSize;
-
-    const uint32_t hw = std::max<uint32_t>(1, std::thread::hardware_concurrency());
-    (void)hw;
 
     if (options.streamAutoTune) {
         // Keep default stream count conservative to reduce failure rate
@@ -181,7 +177,11 @@ uint32_t NextWriteBackpressureSleepUs(uint64_t pressure, uint64_t softLimitBytes
         return 0;
     }
     const uint64_t over = pressure - softLimitBytes;
-    if (over > softLimitBytes * 2) {
+    // Saturating double: a pathological softLimitBytes near 2^63 must not wrap softLimitBytes*2 to a
+    // tiny value and mis-route to a lighter sleep tier (defensive; real budgets are far below 2^63).
+    const uint64_t kMax = (std::numeric_limits<uint64_t>::max)();
+    const uint64_t doubleLimit = (softLimitBytes > (kMax / 2)) ? kMax : (softLimitBytes * 2);
+    if (over > doubleLimit) {
         return 5000;
     }
     if (over > softLimitBytes) {

@@ -420,6 +420,13 @@ void TC_NextWriteBackpressureSleepUs() {
     Require(fc::NextWriteBackpressureSleepUs(L + 2 * L + 1, L) == 5000, "over > 2*limit -> 5000us");
     // NFR-04: the sleep depends only on the byte inputs; there is no worker-count parameter to vary.
     Require(fc::NextWriteBackpressureSleepUs(5000, 1000) == 5000, "far over -> ladder top 5000us");
+    // Saturating double guard: with softLimitBytes = 2^63 (kMax/2+1), an unsaturated limit*2 wraps
+    // to 0, so any over>=1 would mis-route to the 5000us top tier. The saturating guard maps 2*limit
+    // to kMax, so a tiny over (1 byte) correctly lands in the 300us base tier. This pins the guard.
+    const uint64_t kMax = (std::numeric_limits<uint64_t>::max)();
+    const uint64_t huge = (kMax / 2) + 1;  // 2^63; huge*2 would wrap to 0 without saturation
+    Require(fc::NextWriteBackpressureSleepUs(huge + 1, huge) == 300,
+            "near-2^63 soft limit: tiny over -> 300us base tier (saturated 2*limit, no wrap to 5000us)");
 }
 
 }  // namespace
