@@ -2083,6 +2083,15 @@ int RunServer(const CliOptions& options) {
         g_inFlightHandshakes.fetch_add(1, std::memory_order_acq_rel);
         std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
                      client = std::move(client)]() mutable {
+            // Surface who connected: the peer's numeric IP via getpeername + NI_NUMERICHOST
+            // (metadata only -- no DNS, no socket data consumed, non-blocking). The result is a
+            // numeric address literal with no C0/C1 control characters, so it is safe to splice
+            // into stdout (no log-injection risk from a peer-controlled string). Printed before
+            // the handshake so it appears for every accepted connection, including ones that later
+            // fail authentication (then followed by [mp] conn_error below).
+            const std::string clientIp = PeerAddressOf(client);
+            std::cout << "[mp] client_connected conn=" << connSeq
+                      << " ip=" << (clientIp.empty() ? "(unknown)" : clientIp) << std::endl;
             std::shared_ptr<ServerSession> session;
             try {
                 session = HandshakeAndResolveSession(client, options.password, serverAddrs,

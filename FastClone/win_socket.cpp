@@ -321,6 +321,27 @@ std::string LocalAddressOf(const SocketHandle& socket) {
     return std::string(host);
 }
 
+std::string PeerAddressOf(const SocketHandle& socket) {
+    if (!socket.Valid()) {
+        return std::string();
+    }
+    sockaddr_storage ss{};
+#ifdef _WIN32
+    int len = sizeof(ss);
+#else
+    socklen_t len = sizeof(ss);
+#endif
+    if (getpeername(socket.Get(), reinterpret_cast<sockaddr*>(&ss), &len) != 0) {
+        return std::string();
+    }
+    char host[NI_MAXHOST] = {0};
+    if (getnameinfo(reinterpret_cast<sockaddr*>(&ss), len, host, sizeof(host), nullptr, 0,
+                    NI_NUMERICHOST) != 0) {
+        return std::string();
+    }
+    return std::string(host);
+}
+
 SocketHandle CreateServer(uint16_t port) {
     SocketHandle listener(socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP));
     if (!listener.Valid()) {

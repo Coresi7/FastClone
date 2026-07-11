@@ -92,6 +92,11 @@ SocketHandle ConnectTo(const std::string& host, uint16_t port, const ConnectBind
 // numeric literal. Empty on failure. Used so the primary lane's real NIC participates in
 // the multipath same-side dedup even when it was connected via the OS default route.
 std::string LocalAddressOf(const SocketHandle& socket);
+// Return the peer (client) IP a connected/accepted socket is talking to (getpeername), as
+// a numeric literal. Empty on failure. Used by the server to show who connected. Non-blocking:
+// getpeername + NI_NUMERICHOST only format the already-known socket address, no DNS lookup. The
+// result is a numeric address literal (no C0/C1 control characters), safe to splice into logs.
+std::string PeerAddressOf(const SocketHandle& socket);
 SocketHandle CreateServer(uint16_t port);
 SocketHandle AcceptClient(const SocketHandle& listener);
 // Like AcceptClient but waits at most timeoutMs for an incoming connection. Returns nullopt
