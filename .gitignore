@@ -42,3 +42,6 @@ temp/buildWin.ps1
 temp/buildLinux.sh
 temp/buildMac.sh
 
+# Local dev notes / scratch map (not for the repo)
+dev-map.md
+
