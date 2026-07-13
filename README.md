@@ -52,7 +52,7 @@ At startup the server prints its configuration banner followed by the list of ad
 ### Client
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>]
 ```
 
 - `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted); accepts a comma-separated list and/or may be repeated to supply multiple multipath endpoints
@@ -68,8 +68,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--unbuffered-writes`: **client-only**, default **off**. When set, **all** client file-content writes — whole-file / small-file batch, ordinary single-file downloads, and delta copy/range reconstruction — are routed through the unified disk-IO driver with **unbuffered write intent** (Windows `FILE_FLAG_NO_BUFFERING`, Linux `O_DIRECT`, macOS `F_NOCACHE`), so downloaded data bypasses the OS page cache and does not pile up as dirty pages under filter drivers. Sub-sector tails and unaligned fragments transparently fall back to a buffered write, and the final file size/content are byte-identical whether the switch is on or off. Combined with `--queued-file-size`, the receive side is throttled by a **single budget** covering the receive queue **and** pending/outstanding disk writes, so disk-write lag cannot grow the resident/dirty set past the limit. Off by default = existing behavior unchanged. (Rejected on the server: `server --unbuffered-writes` exits with a client-only usage error.)
 - `--tcp-send-buffer` / `--tcp-recv-buffer`: pin `SO_SNDBUF` / `SO_RCVBUF` in bytes (range `64K..1G`, suffixes `K/M/G`); default `0` = let the kernel autotune the window. Leaving these at `0` is recommended on high-RTT links: the kernel's receive-window auto-tuning (Linux `tcp_moderate_rcvbuf`, Windows Receive Window Auto-Tuning) scales the window to the bandwidth-delay product so a single connection can fill a high-BDP link. Pinning a value **disables** auto-tuning for that direction and fixes the window. **Windows caveat:** if receive-window auto-tuning has been disabled system-wide (some "optimizer" tools or group policy set it to `disabled`; check with `netsh interface tcp show global`), the default `0` falls back to the small Windows system default (~64KB) and will throttle high-RTT throughput. On such machines, set `--tcp-recv-buffer` explicitly (e.g. `--tcp-recv-buffer 32M`) to restore a large fixed window, or re-enable auto-tuning with `netsh int tcp set global autotuninglevel=normal`
 - `--link`: explicit `<localIP|iface>=<serverIP[:port]>` pairing (repeatable); bypasses automatic selection, and the first `--link` is the primary link
-- `--reconnect-retries`: max session reconnect attempts on transient drops (default `10`, `0` disables)
-- `--reconnect-window`: total reconnect time window (default `30m`, suffixes `s`/`m`/`h`)
+- `--reconnect-retries`: max reconnect attempts per network drop (default `10`, `0` disables); the count resets every time a session is successfully (re)established, so each drop independently gets up to `10` tries. There is no total time window -- a long transfer that drops after >30min still retries its full budget.
 
 
 
@@ -241,8 +240,9 @@ Diagnostics: the solution ships an **optionally-built** `FastCloneRouteProbe` pr
 
 If the connection drops before the manifest is fully received, the client automatically reconnects and resumes without rerunning the whole command:
 
-- Up to **10** session reconnects within a **30-minute** window by default, with exponential backoff (1s → 2s → 4s … capped at 30s)
-- Connect failures while the server is not yet ready also consume the reconnect budget and back off instead of exiting immediately
+- Up to **10** session reconnects **per network drop** by default (the count resets each time a session is re-established), with exponential backoff (1s → 2s → 4s … capped at 30s)
+- Connect failures while the server is not yet ready also consume that drop's reconnect budget and back off instead of exiting immediately
+- There is **no total time window**: a long-lived healthy session that drops after >30min of transfer still retries its full per-drop budget instead of being abandoned by an elapsed-time cap
 - `--reconnect-retries 0` disables auto-reconnect (legacy behavior: exit code `3` on interruption)
 - Files already on disk with matching `size+mtime` are skipped after reconnect
 - **No block-level resume**: an interrupted large file is re-sent from the start (the protocol has no offset field)

@@ -99,12 +99,9 @@ void RunCliTests() {
             "pw",
             "--reconnect-retries",
             "0",
-            "--reconnect-window",
-            "5m",
         });
         Require(opt.mode == fc::Mode::Client, "Expected client mode");
         Require(opt.reconnectRetries == 0, "Expected reconnect retries 0");
-        Require(opt.reconnectWindowMs == 5ULL * 60ULL * 1000ULL, "Expected reconnect window 5m");
     }
 
     ExpectThrowWith({
@@ -119,7 +116,7 @@ void RunCliTests() {
                         "--reconnect-window",
                         "bad",
                     },
-                    "reconnect-window");
+                    "Unknown argument");
 
     // V-01 (AC-01/AC-11.1): server --once parses cleanly into exitAfterSync.
     {

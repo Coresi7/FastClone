@@ -16,11 +16,17 @@ namespace {
 // server-not-ready connect/handshake). Returns the process exit code when the
 // caller must terminate; std::nullopt means backoff completed and the outer session
 // loop should continue (retry ConnectTo).
+//
+// The reconnect budget is a per-(re)connection attempt COUNT only: reconnectAttemptsUsed
+// is reset to 0 every time a session is successfully established (see the reset just
+// before `ClientConnection& primary = *pool[0]`), so each network drop independently
+// gets up to reconnectRetries attempts. There is deliberately NO time-window limit: a
+// long-lived healthy session that drops after >30min of transfer still retries its full
+// budget instead of being abandoned by an elapsed-time cap (the legacy 30-minute
+// reconnect-window was removed).
 std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
                                                   uint32_t reconnectRetries,
-                                                  uint64_t reconnectWindowMs,
                                                   uint32_t& reconnectAttemptsUsed,
-                                                  const std::chrono::steady_clock::time_point& reconnectWindowStart,
                                                   int exitWhenDisabled) {
     if (IsFatalClientDisconnectReason(reason)) {
         std::cerr << "[reconnect] fatal error, not retrying: \"" << reason << "\"" << std::endl;
@@ -29,10 +35,7 @@ std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
     if (reconnectRetries == 0) {
         return exitWhenDisabled;
     }
-    const auto reconnectNow = std::chrono::steady_clock::now();
-    const auto reconnectWindowLimit = std::chrono::milliseconds(reconnectWindowMs);
-    if (reconnectAttemptsUsed >= reconnectRetries ||
-        (reconnectNow - reconnectWindowStart) > reconnectWindowLimit) {
+    if (reconnectAttemptsUsed >= reconnectRetries) {
         std::cerr << "[reconnect] budget exhausted attempts=" << reconnectAttemptsUsed
                   << "/" << reconnectRetries << " reason=\"" << reason << "\"" << std::endl;
         return kExitReconnectExhausted;
@@ -632,8 +635,11 @@ int RunClient(const CliOptions& options) {
     }
 
     // --- Session reconnect loop: cross-session vs per-session state ---
-    // PERSIST across reconnect attempts (declared outside while):
-    //   reconnectAttemptsUsed, reconnectWindowStart/Limit -- reconnect budget
+    // PERSIST across reconnect attempts of a single drop (declared outside while):
+    //   reconnectAttemptsUsed -- reconnect attempt count for the CURRENT drop; reset to 0
+    //                            whenever a session is successfully established (see the reset
+    //                            just before `ClientConnection& primary = *pool[0]`), so each
+    //                            network drop independently gets up to reconnectRetries tries.
     //   syncStartTime/formatElapsed -- total wall time for the CLI run
     //   tuned/streamLimit/effectiveChunkSize -- CLI transfer tuning (fixed at start)
     //   selfPath, options, diagnostics/debug flags -- run configuration
@@ -649,7 +655,6 @@ int RunClient(const CliOptions& options) {
     //   ManifestRequest. Already-synced local files persist on DISK only; the next session
     //   re-enumerates and skips them via size+mtime compare (no in-memory carry-over).
     uint32_t reconnectAttemptsUsed = 0;
-    const auto reconnectWindowStart = std::chrono::steady_clock::now();
 
     // ConnectTo + handshake failures (server not ready) reuse the same reconnect budget
     // as mid-session drops; see ScheduleClientReconnectOrExit().
@@ -739,8 +744,8 @@ int RunClient(const CliOptions& options) {
     } catch (const std::exception& ex) {
         const std::string connectReason = ex.what();
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
-                connectReason, options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitUsage)) {
+                connectReason, options.reconnectRetries, reconnectAttemptsUsed,
+                /*exitWhenDisabled=*/kExitUsage)) {
             if (*exitCode == kExitUsage) {
                 std::cerr << "FastClone error: " << connectReason << std::endl;
             }
@@ -748,6 +753,11 @@ int RunClient(const CliOptions& options) {
         }
         continue;
     }
+    // A session was successfully established (primary handshake + pool built). Reset the
+    // reconnect attempt count so the NEXT network drop independently gets the full
+    // reconnectRetries budget (per-drop semantics: each drop retries up to reconnectRetries
+    // times; the budget is not shared across drops within a single run).
+    reconnectAttemptsUsed = 0;
     ClientConnection& primary = *pool[0];
     if (debugEnabled) {
         std::cout << "[mp] pool_size=" << pool.size() << " sessionId=" << sessionId << std::endl;
@@ -810,8 +820,8 @@ int RunClient(const CliOptions& options) {
         std::cout << "Sync aborted (incomplete manifest). changed_files=0 failed_files=0"
                   << " enumerated=0 elapsed=" << formatElapsed() << std::endl;
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
-                ex.what(), options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
+                ex.what(), options.reconnectRetries, reconnectAttemptsUsed,
+                /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
             return *exitCode;
         }
         continue;
@@ -4240,8 +4250,8 @@ int RunClient(const CliOptions& options) {
         const std::string disconnectReason =
             recvError.empty() ? "connection_closed" : recvError;
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
-                disconnectReason, options.reconnectRetries, options.reconnectWindowMs,
-                reconnectAttemptsUsed, reconnectWindowStart, /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
+                disconnectReason, options.reconnectRetries, reconnectAttemptsUsed,
+                /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
             return *exitCode;
         }
         continue;

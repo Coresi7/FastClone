@@ -46,7 +46,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>] [--reconnect-window <duration>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
@@ -63,7 +63,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--tcp-send-buffer` / `--tcp-recv-buffer`：以字节为单位固定（pin）`SO_SNDBUF` / `SO_RCVBUF`（范围 `64K..1G`，支持 `K/M/G` 后缀）；默认 `0` = 交给内核自动伸缩窗口。高 RTT 链路上推荐保持 `0`：内核的接收窗口自动伸缩（Linux `tcp_moderate_rcvbuf`、Windows Receive Window Auto-Tuning）会按带宽时延积（BDP）放大窗口，使单条连接也能跑满高 BDP 链路。显式指定一个值会**关闭**该方向的自动伸缩并把窗口钉死。**Windows 注意事项：** 若系统级关闭了接收窗口自动伸缩（部分「优化工具」或组策略会将其设为 `disabled`，可用 `netsh interface tcp show global` 查看），默认 `0` 会回退到 Windows 较小的系统默认值（约 64KB），从而拖慢高 RTT 吞吐。这类机器上请显式设置 `--tcp-recv-buffer`（例如 `--tcp-recv-buffer 32M`）以恢复较大的固定窗口，或用 `netsh int tcp set global autotuninglevel=normal` 重新启用自动伸缩
 - `--link`：显式指定 `<本地IP|网卡名>=<服务端IP[:端口]>` 的链路配对（可重复）；指定后跳过自动选路，列表第一条为首要链路
 - `--reconnect-retries`：网络闪断时会话重连次数上限；默认 `10`，`0` 禁用
-- `--reconnect-window`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+- `--reconnect-retries`：每次网络断连的会话重连次数上限；默认 `10`，`0` = 禁用。计数在每次成功（重）连接后清零，因此每次断连独立享有最多 `10` 次重试；**没有总时长窗口**——跑了 30 分钟以上的大传输中途断网，仍会重试满额预算，不会因超时而被放弃。
 
 
 
@@ -193,8 +193,9 @@ FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程�
 
 客户端在连接中断（manifest 未完整接收）时会自动重连并继续同步，无需手动重跑整条命令：
 
-- 默认最多 **10** 次会话重连，总窗口 **30 分钟**，指数退避（1s → 2s → 4s … 上限 30s）
-- 重连等待期间若服务端尚未就绪（`connect failed` 等），同样计入重连预算并退避重试，不会立即退出
+- 默认**每次网络断连**最多 **10** 次会话重连（每次成功重连后计数清零），指数退避（1s → 2s → 4s … 上限 30s）
+- 重连等待期间若服务端尚未就绪（`connect failed` 等），同样计入该次断连的重连预算并退避重试，不会立即退出
+- **没有总时长窗口**：跑了 30 分钟以上的大传输中途断网，仍会重试满额预算，不会因超时而被放弃
 - `--reconnect-retries 0` 可禁用自动重连（行为与旧版一致：中断后退出码 `3`）
 - 已落盘且 `size+mtime` 一致的文件在重连后自动跳过，无需二次传输
 - **非块级断点续传**：大文件若传输中断，重连后从文件头重传（协议无 offset 字段）
@@ -204,8 +205,7 @@ FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程�
 
 新增 CLI 参数：
 
-- `--reconnect-retries <n>`：最大会话重连次数；默认 `10`，`0` = 禁用
-- `--reconnect-window <duration>`：重连总时间窗口；默认 `30m`，支持 `s`/`m`/`h` 后缀
+- `--reconnect-retries <n>`：每次网络断连的会话重连次数上限；默认 `10`，`0` = 禁用（见上文"网络闪断与自动重连"）
 
 
 

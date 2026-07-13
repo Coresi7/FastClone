@@ -135,7 +135,7 @@ try {
     Start-Sleep -Seconds 1
     $code1 = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt,
-        "--password", "wrong-password", "--reconnect-retries", "10", "--reconnect-window", "5m"
+        "--password", "wrong-password", "--reconnect-retries", "10"
     ) -OutLog "$logDir\it1-client.out" -ErrLog "$logDir\it1-client.err"
     Stop-Process -Id $srv1.Id -Force -ErrorAction SilentlyContinue
     if ($code1 -ne 1) { throw "IT-1: expected exit 1, got $code1" }
@@ -147,7 +147,7 @@ try {
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $cli2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt,
-        "--password", $password, "--reconnect-retries", "10", "--reconnect-window", "5m",
+        "--password", $password, "--reconnect-retries", "10",
         "--streams", "1", "--chunk-kb", "1"
     ) -OutLog "$logDir\it2-client.out" -ErrLog "$logDir\it2-client.err"
     Start-Sleep -Seconds 5
@@ -210,7 +210,7 @@ try {
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $code4 = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt,
-        "--password", $password, "--reconnect-retries", "1", "--reconnect-window", "1m"
+        "--password", $password, "--reconnect-retries", "1"
     ) -OutLog "$logDir\it4-client.out" -ErrLog "$logDir\it4-client.err"
     if ($code4 -ne 4) { throw "IT-4: expected exit 4, got $code4" }
     Assert-Contains -Path "$logDir\it4-client.err" -Pattern "\[reconnect\] budget exhausted" -Scenario "IT-4"

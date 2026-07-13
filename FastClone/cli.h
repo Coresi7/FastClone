@@ -54,8 +54,12 @@ struct CliOptions {
     bool streamAutoTune = true;
     bool chunkAutoTune = true;
     bool diagnostics = false;
+    // Max reconnect attempts per network drop (FR-016 / NFR-002). Default 10; 0 disables
+    // auto-reconnect. The count is reset to 0 every time a session is successfully
+    // established, so each drop independently gets up to reconnectRetries tries -- there is
+    // no total time window; a long transfer that drops after >30min still retries its full
+    // budget (the legacy 30-minute reconnect-window cap was removed).
     uint32_t reconnectRetries = 10;
-    uint64_t reconnectWindowMs = 30ULL * 60ULL * 1000ULL;
 
     // --- Multipath transfer (FC6) ---
     // Files >= this size are pinned to the primary link (FR-011/012). Default 1GB,

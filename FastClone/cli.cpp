@@ -382,11 +382,6 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --reconnect-retries");
             }
             options.reconnectRetries = static_cast<uint32_t>(retries);
-        } else if (arg == "--reconnect-window") {
-            options.reconnectWindowMs = ParseDurationMsStrict(ArgAt(args, ++i), "--reconnect-window");
-            if (options.reconnectWindowMs == 0) {
-                throw std::runtime_error("Invalid --reconnect-window (must be > 0)");
-            }
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
@@ -457,7 +452,7 @@ std::string BuildUsageText() {
         "      [--delta-min-size <size>] [--unbuffered-writes]\n"
         "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
-        "      [--reconnect-retries <n>] [--reconnect-window <duration>] [--diag]\n"
+        "      [--reconnect-retries <n>] [--diag]\n"
         "  (When --streams or --chunk-kb is omitted, FastClone auto-tunes that parameter.)\n"
         "  --server accepts a comma-separated list and/or may be repeated (multipath endpoints).\n"
         "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
