@@ -2967,7 +2967,15 @@ int RunClient(const CliOptions& options) {
                 return;
             }
             remoteFiles[e.relativePath] = e;
-            ++enumerated;
+            // enumerated = max(enumerated, receivedFileCount). A late ManifestProgress frame can set
+            // enumerated to the server's running total (which already counts files the client has not
+            // yet processed); a per-entry ++ on top of that would double-count those files, inflating
+            // Enumerated beyond the real file count by however many entries arrive after the last
+            // progress frame. Using max against remoteFiles.size() (the received file count) keeps
+            // enumerated = max(client received, server estimate) and converges to the true total.
+            if (remoteFiles.size() > enumerated) {
+                enumerated = remoteFiles.size();
+            }
             // AC-12 acceptance metrics: total bytes + small-file size distribution.
             manifestTotalBytes += e.fileSize;
             {
