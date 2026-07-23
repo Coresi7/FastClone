@@ -36,7 +36,8 @@ Hash256 ComputeFileHash(const std::filesystem::path& path);
 // server hash-miss path and the FastCheck client local-hash worker (fastcheck-parallel-hash M1/M3/
 // FR-01). Throws std::runtime_error on any open/read failure, matching ComputeFileHash's failure
 // contract so callers can keep their existing try/catch handling.
-Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const std::filesystem::path& path);
+Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const std::filesystem::path& path,
+                                 std::optional<uint64_t> knownSize = std::nullopt);
 // Diagnostics: cumulative per-phase wall-clock time spent inside ComputeFileHashViaDriver
 // (microseconds, relaxed atomics). Only meaningful in a process that actually calls the function
 // (FastCheck client / FastClone server). Intended for the FastCheck progress line to locate where

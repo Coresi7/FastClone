@@ -1296,6 +1296,12 @@ fc::Hash256 ReconstructOldServerHashMiss(DiskIoDriver& drv, const std::filesyste
 // FR-01/FR-02/FR-03 (AC-02..AC-05): for every size in the matrix, the old inline hash-miss path,
 // ComputeFileHashViaDriver and ComputeFileHash must all produce the identical Hash256. All reads go
 // through a REAL DiskIoDriver against a Windows temp file (no mock, M5/D-05).
+//
+// FR-19 (redundant-syscall elimination): the SAME matrix also asserts the new
+// ComputeFileHashViaDriver(drv, path, knownSize) overload (caller threads the already-probed
+// size) yields a byte-identical Hash256 to (a) the no-knownSize fallback path and (b) the inline
+// ComputeFileHash ground truth. This pins the optimization to be result-preserving and proves the
+// known-size branch does not silently diverge from the legacy size-probe branch.
 void TestServerHashMissThreeWayEquivalence() {
     namespace fs = std::filesystem;
     const uint64_t sizes[] = {0,       1,       64,      4096,    65535,   65536,  262143,
@@ -1325,6 +1331,7 @@ void TestServerHashMissThreeWayEquivalence() {
 
         const fc::Hash256 inlineHash = fc::ComputeFileHash(p);
         const fc::Hash256 viaDriver = fc::ComputeFileHashViaDriver(drv, p);
+        const fc::Hash256 viaDriverKnown = fc::ComputeFileHashViaDriver(drv, p, size);
         const fc::Hash256 oldServer = ReconstructOldServerHashMiss(drv, p);
 
         Require(fc::HashEquals(inlineHash, viaDriver),
@@ -1333,6 +1340,12 @@ void TestServerHashMissThreeWayEquivalence() {
                 "gapA: old-server-inline == ComputeFileHash size " + std::to_string(size));
         Require(fc::HashEquals(viaDriver, oldServer),
                 "gapA: old-server-inline == ComputeFileHashViaDriver size " + std::to_string(size));
+        // FR-19: the known-size overload must be result-identical to both the fallback (no-knownSize)
+        // path and the inline ground truth across the full size matrix.
+        Require(fc::HashEquals(inlineHash, viaDriverKnown),
+                "gapA(FR-19): known-size path == ComputeFileHash size " + std::to_string(size));
+        Require(fc::HashEquals(viaDriver, viaDriverKnown),
+                "gapA(FR-19): known-size path == fallback path size " + std::to_string(size));
         fs::remove(p, ec);
     }
     fs::remove_all(dir, ec);

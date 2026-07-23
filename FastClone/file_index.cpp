@@ -410,28 +410,39 @@ Hash256 ComputeHashFromSource(const std::function<size_t(uint8_t*, size_t)>& sou
     return output;
 }
 
-Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& path) {
+Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& path,
+                                 std::optional<uint64_t> knownSize) {
     // Shared hash read path for FastCheck + server hash-miss:
     //  - <=256 KiB: one driver read request + ComputeBufferHash over real bytes
     //  - >256 KiB : existing SequentialReader streaming path
     const auto fnStart = std::chrono::steady_clock::now();
     g_hashCount.fetch_add(1, std::memory_order_relaxed);
 
-    const auto fsStart = std::chrono::steady_clock::now();
-    std::error_code ec;
-    const uint64_t fileSize = static_cast<uint64_t>(fs::file_size(path, ec));
-    const auto fsEnd = std::chrono::steady_clock::now();
-    g_hashFileSizeUs.fetch_add(static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(fsEnd - fsStart).count()),
-        std::memory_order_relaxed);
-    if (ec) {
-        throw std::runtime_error("ComputeFileHashViaDriver: file_size failed");
+    // FR-19: when the caller already probed the size upstream (FastCheck compare pipeline's
+    // ProbeLocal), skip the redundant fs::file_size stat here. nullopt = caller has no size -> fall
+    // back to the stat (server hash-miss path, tests). A genuine 0-byte file arrives as knownSize==0
+    // and is handled by the early-return below exactly as before.
+    uint64_t fileSize = 0;
+    if (knownSize.has_value()) {
+        fileSize = *knownSize;
+    } else {
+        const auto fsStart = std::chrono::steady_clock::now();
+        std::error_code ec;
+        fileSize = static_cast<uint64_t>(fs::file_size(path, ec));
+        const auto fsEnd = std::chrono::steady_clock::now();
+        g_hashFileSizeUs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(fsEnd - fsStart).count()),
+            std::memory_order_relaxed);
+        if (ec) {
+            throw std::runtime_error("ComputeFileHashViaDriver: file_size failed");
+        }
     }
 
     const auto openStart = std::chrono::steady_clock::now();
-    // Change 3a (fastcheck-redundant-syscall-elim, FR-19): reuse the file size we just read above as
-    // the read-open expectedSize so the backend skips the redundant Windows FileSizeOnDisk query.
-    // A 0-byte file passes fileSize==0 (unknown/legacy path), which is fine (early-returns below).
+    // Change 3a (fastcheck-redundant-syscall-elim, FR-19): pass fileSize as the read-open expectedSize
+    // so the backend skips the redundant Windows FileSizeOnDisk query. fileSize came either from the
+    // caller's knownSize (no stat) or from the fs::file_size stat just above. A 0-byte file passes
+    // fileSize==0 (unknown/legacy path), which is fine (early-returns below).
     const uint64_t fid =
         driver.openFile(fc::PathToUtf8(path), fc::io::OpKind::Read, /*unbuffered=*/true, fileSize);
     const auto openEnd = std::chrono::steady_clock::now();

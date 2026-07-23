@@ -272,6 +272,10 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     struct HashTask {
         std::string rel;
         fs::path abs;
+        // FR-19: size probed by the compare pipeline's ProbeLocal, threaded through so the hash
+        // worker skips the redundant fs::file_size stat in ComputeFileHashViaDriver. nullopt only
+        // if the compare probe somehow had no local entry (defensive; falls back to a stat).
+        std::optional<uint64_t> knownSize;
     };
     std::mutex hashTaskMu;
     std::condition_variable hashTaskCv;
@@ -372,7 +376,7 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
                     const auto h0 = std::chrono::steady_clock::now();
                     try {
                         hash = o.noDiskioDriver ? ComputeFileHash(task.abs)
-                                                : ComputeFileHashViaDriver(*clientDriver, task.abs);
+                                                : ComputeFileHashViaDriver(*clientDriver, task.abs, task.knownSize);
                     } catch (...) {
                         hashFailed = true;
                     }
@@ -505,7 +509,9 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         awaiting.emplace(rel, need);
         {
             std::lock_guard<std::mutex> lk(hashTaskMu);
-            hashTaskQueue.push_back(HashTask{rel, JoinLocal(targetRoot, rel)});
+            hashTaskQueue.push_back(HashTask{
+                rel, JoinLocal(targetRoot, rel),
+                need.local ? std::optional<uint64_t>{need.local->fileSize} : std::nullopt});
         }
         hashTaskCv.notify_one();
         sentAt[rel] = std::chrono::steady_clock::now();
