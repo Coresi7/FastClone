@@ -761,6 +761,18 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     auto drainCompare = [&]() {
         std::vector<fc::ComparedItem> items;
         comparePipeline.Drain(items);
+
+        // lever2-hash-feed-locality: cluster needHash entries by relativePath (ascending) so that
+        // hashQueue feeds pump in directory-locality order, improving filesystem metadata cache hit
+        // rate (open_us_avg). Stable-partition separates needHash from non-needHash (preserving the
+        // relative order of non-needHash entries), then stable_sort the needHash segment by relPath.
+        auto hashEnd = std::stable_partition(items.begin(), items.end(),
+            [](const fc::ComparedItem& it) { return it.outcome.needHash; });
+        std::stable_sort(items.begin(), hashEnd,
+            [](const fc::ComparedItem& a, const fc::ComparedItem& b) {
+                return a.remote.relativePath < b.remote.relativePath;
+            });
+
         for (fc::ComparedItem& item : items) {
             if (item.outcome.needHash) {
                 hashQueue.push_back(HashNeed{item.remote, item.local});
