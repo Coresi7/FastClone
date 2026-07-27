@@ -152,6 +152,19 @@ if(WIN32)
 endif()
 add_test(NAME FastCloneTests COMMAND FastCloneTests)
 
+# Data-integrity integration test (Windows only): end-to-end SHA256 byte-for-byte
+# verification of server-transferred files. Covers the C2 "传输字节逐字节不变" guarantee
+# that unit tests cannot reach (sync_engine_server.cpp is not in the FastCloneTests target).
+# Runs via ctest; requires FastClone.exe to be built first.
+if(WIN32)
+    add_test(NAME data_integrity_integration
+        COMMAND powershell -ExecutionPolicy Bypass -File
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data_integrity_integration.ps1
+                -ExePath $<TARGET_FILE:FastClone>
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+endif()
+
 install(TARGETS FastClone
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

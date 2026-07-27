@@ -245,4 +245,14 @@
     <Message Text="Running FastClone unit tests..." Importance="high" />
     <Exec Command='"$(TargetPath)"' IgnoreStandardErrorWarningFormat="true" />
   </Target>
+
+  <!-- Run data-integrity integration test (requires FastClone.exe built in the same
+       configuration; the script auto-resolves the exe path). Covers the C2 byte-for-byte
+       transfer guarantee that unit tests cannot reach (sync_engine_server.cpp is excluded
+       from this project). Windows-only: uses PowerShell + Get-FileHash. -->
+  <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Message Text="Running data-integrity integration test..." Importance="high" />
+    <Exec Command='powershell -ExecutionPolicy Bypass -File "$(ProjectDir)..\tests\data_integrity_integration.ps1"'
+          IgnoreStandardErrorWarningFormat="true" />
+  </Target>
 </Project>

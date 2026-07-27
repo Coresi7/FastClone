@@ -37,6 +37,7 @@ namespace {
 struct ServerStream {
     std::ifstream input;
     std::string relativePath;
+    std::vector<uint8_t> readBuffer;  // A1: reused read buffer, lazily sized to effectiveChunkSize
 };
 
 // Binary delta (FC7) server-side byte-range stream. Opened on DeltaRangeOpen through the unified
@@ -58,6 +59,7 @@ struct ServerBatchStream {
     bool headerSent = false;
     std::ifstream input;
     uint64_t remainingBytes = 0;
+    std::vector<uint8_t> readBuffer;  // A1: reused read buffer, lazily sized to effectiveChunkSize
 };
 
 // --- FC6 handshake: version negotiation + the client/server primitives live in
@@ -1371,8 +1373,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             }
                         }
                         const uint64_t toRead = std::min<uint64_t>(batch.remainingBytes, static_cast<uint64_t>(effectiveChunkSize));
-                        std::vector<uint8_t> chunk(static_cast<size_t>(toRead));
-                        batch.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                        // A1: reuse per-stream readBuffer instead of allocating a new vector each iteration.
+                        if (batch.readBuffer.size() < static_cast<size_t>(toRead)) {
+                            batch.readBuffer.resize(static_cast<size_t>(toRead));
+                        }
+                        batch.input.read(reinterpret_cast<char*>(batch.readBuffer.data()), static_cast<std::streamsize>(toRead));
                         const std::streamsize got = batch.input.gcount();
                         if (got <= 0) {
                             // I/O error mid-file: abort just this batch stream, not the session.
@@ -1380,11 +1385,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             batchAborted = true;
                             break;
                         }
-                        chunk.resize(static_cast<size_t>(got));
                         burstBytes += static_cast<size_t>(got);
                         batchBytesSentThisRound += static_cast<size_t>(got);
                         batch.remainingBytes -= static_cast<uint64_t>(got);
-                        sendFrames.push_back(Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
+                        sendFrames.push_back(Frame{MsgType::FileBatchChunk, it->first,
+                            std::vector<uint8_t>(batch.readBuffer.data(), batch.readBuffer.data() + got)});
                         didWork = true;
                         if (batch.remainingBytes == 0) {
                             batch.input.close();
@@ -1421,13 +1426,18 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     size_t burstBytes = 0;
                     bool streamClosed = false;
                     while (!streamClosed && burstBytes < perStreamBurstBytes) {
-                        std::vector<uint8_t> chunk(effectiveChunkSize);
-                        it->second.input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                        // A1: reuse per-stream readBuffer instead of allocating a new vector each iteration.
+                        if (it->second.readBuffer.size() < static_cast<size_t>(effectiveChunkSize)) {
+                            it->second.readBuffer.resize(static_cast<size_t>(effectiveChunkSize));
+                        }
+                        it->second.input.read(reinterpret_cast<char*>(it->second.readBuffer.data()),
+                                              static_cast<std::streamsize>(effectiveChunkSize));
                         const std::streamsize got = it->second.input.gcount();
                         if (got > 0) {
-                            chunk.resize(static_cast<size_t>(got));
                             burstBytes += static_cast<size_t>(got);
-                            sendFrames.push_back(Frame{MsgType::FileChunk, it->first, std::move(chunk)});
+                            sendFrames.push_back(Frame{MsgType::FileChunk, it->first,
+                                std::vector<uint8_t>(it->second.readBuffer.data(),
+                                                     it->second.readBuffer.data() + got)});
                             didWork = true;
                         }
                         if (!it->second.input || got == 0) {
