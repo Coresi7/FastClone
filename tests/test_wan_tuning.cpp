@@ -420,6 +420,48 @@ void TC_NextWriteActiveCap() {
         Require(st.activeCap == 6 && st.lastReason == fc::WriteCapAdjustReason::Grow,
                 "W-03/B9: continued healthy recovery grows by exactly +1");
     }
+
+    // --- Latency gate: absolute threshold blocks grow when the device is saturated ---
+    {
+        // Latency just below the threshold: grow still works.
+        fc::WriteCapControllerState st; st.activeCap = 8;
+        const double belowGate = static_cast<double>(fc::kMaxLatencyForGrowNs) - 1.0;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Hold (streak=1)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Grow
+        Require(st.activeCap == 9 && st.lastReason == fc::WriteCapAdjustReason::Grow,
+                "latency-gate: below-threshold latency allows grow");
+    }
+    {
+        // Latency above the threshold: grow blocked, cap Holds (prevents oscillation).
+        fc::WriteCapControllerState st; st.activeCap = 8;
+        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Hold (gate)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Still Hold
+        Require(st.activeCap == 8 && st.lastReason == fc::WriteCapAdjustReason::Hold,
+                "latency-gate: above-threshold latency blocks grow (Hold)");
+    }
+    {
+        // Latency above the threshold does NOT block halve: deterioration still halves.
+        fc::WriteCapControllerState st; st.activeCap = 8;
+        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
+        fc::WriteCapSample s = healthy(20, 100.0, aboveGate);
+        s.writeFailures = 1;
+        st = fc::NextWriteActiveCap(st, s, 32);
+        Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveFailure,
+                "latency-gate: halve still works above threshold");
+    }
+    {
+        // Recovery: after latency drops below the threshold, grow resumes.
+        fc::WriteCapControllerState st; st.activeCap = 4;
+        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
+        const double belowGate = static_cast<double>(fc::kMaxLatencyForGrowNs) - 1.0;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Hold (gate)
+        Require(st.activeCap == 4, "latency-gate: blocked grow holds at 4");
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Hold (streak=1)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Grow (streak=2)
+        Require(st.activeCap == 5 && st.lastReason == fc::WriteCapAdjustReason::Grow,
+                "latency-gate: grow resumes after latency drops below threshold");
+    }
 }
 
 // AC-10: pressure is a saturating byte sum, independent of the worker count.

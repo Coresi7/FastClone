@@ -144,7 +144,8 @@ WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
             writePressure <= s.recvSoftBudgetBytes &&
             (!prev.havePrev || s.completionRate >= prev.prevCompletionRate) &&
             (!prev.havePrev || prev.prevLatencyEwmaNs <= 0.0 ||
-             s.latencyEwmaNs <= prev.prevLatencyEwmaNs * kWriteCapLatencyGrowFactor);
+             s.latencyEwmaNs <= prev.prevLatencyEwmaNs * kWriteCapLatencyGrowFactor) &&
+            s.latencyEwmaNs < kMaxLatencyForGrowNs;  // absolute gate: don't grow when device is saturated
         if (healthy) {
             next.consecutiveHealthy = prev.consecutiveHealthy + 1;
             if (next.consecutiveHealthy >= kWriteCapHealthyWindowsToGrow &&

@@ -45,6 +45,11 @@ inline constexpr double kWriteCapLatencyHalveFactor = 1.50;
 inline constexpr uint32_t kWriteCapHealthyWindowsToGrow = 2;
 // EWMA smoothing factor for the write-completion latency signal (UpdateEwma alpha).
 inline constexpr double kWriteLatencyEwmaAlpha = 0.2;
+// Absolute latency gate for grow: when the EWMA exceeds this threshold the controller
+// refuses to grow the cap (only halve/Hold are allowed). Prevents oscillation on slow
+// disks where grow -> concurrent IOPS collapse -> halve -> recover -> grow loops forever.
+// 10s is conservative: healthy disks complete in <1s; above 10s the device is saturated.
+inline constexpr uint64_t kMaxLatencyForGrowNs = 10ULL * 1000ULL * 1000ULL * 1000ULL;
 
 // Physical write-worker pool size (max concurrency ceiling, D-04): clamp(max(1,hw), 8, 32). This is
 // the active cap's hard upper bound (poolMax); when hw < 32 the effective cap ceiling becomes poolMax
