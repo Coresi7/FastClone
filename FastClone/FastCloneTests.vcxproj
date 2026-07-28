@@ -241,7 +241,7 @@
        scanning the test's stdout/stderr for "error" lines: the tests deliberately emit
        "error : ..." diagnostics while exercising error paths, which would otherwise be
        misclassified as build errors (MSB3077) even when the suite returns 0. -->
-  <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+  <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false'">
     <Message Text="Running FastClone unit tests..." Importance="high" />
     <Exec Command='"$(TargetPath)"' IgnoreStandardErrorWarningFormat="true" />
   </Target>
@@ -250,7 +250,7 @@
        configuration; the script auto-resolves the exe path). Covers the C2 byte-for-byte
        transfer guarantee that unit tests cannot reach (sync_engine_server.cpp is excluded
        from this project). Windows-only: uses PowerShell + Get-FileHash. -->
-  <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true'">
+  <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false'">
     <Message Text="Running data-integrity integration test..." Importance="high" />
     <Exec Command='powershell -ExecutionPolicy Bypass -File "$(ProjectDir)..\tests\data_integrity_integration.ps1"'
           IgnoreStandardErrorWarningFormat="true" />
