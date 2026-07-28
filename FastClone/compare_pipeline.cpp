@@ -121,9 +121,13 @@ void ComparePipeline::WorkerLoop() {
                 break;
             }
             // Cap gate: if activeCap_ > 0 and we are at the limit, loop back to wait.
-            const uint32_t cap = activeCap_.load(std::memory_order_relaxed);
-            if (cap > 0 && activeWorkers_ >= cap) {
-                continue;
+            // In stop mode, bypass the cap gate: drain remaining tasks without concurrency
+            // limit to avoid a busy-loop when cap is low and another worker holds the slot.
+            if (!stop_.load(std::memory_order_relaxed)) {
+                const uint32_t cap = activeCap_.load(std::memory_order_relaxed);
+                if (cap > 0 && activeWorkers_ >= cap) {
+                    continue;
+                }
             }
             ++activeWorkers_;
             claimedSlot = true;
