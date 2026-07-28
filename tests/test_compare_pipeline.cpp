@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -18,6 +19,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace fc;
 
@@ -257,6 +262,219 @@ void TestCountersConsistency() {
     pipeline.Join();
 }
 
+// ---------------------------------------------------------------------------
+// SetActiveCap tests: the adaptive concurrency gate mirrors writeActiveCap.
+// ---------------------------------------------------------------------------
+
+// A probe that tracks how many workers are inside it simultaneously.
+// Uses shared_ptr<atomic> so the struct is copy-constructible (required by std::function).
+struct ConcurrencyTrackingProbe {
+    std::shared_ptr<std::atomic<int>> active{std::make_shared<std::atomic<int>>(0)};
+    std::shared_ptr<std::atomic<int>> peak{std::make_shared<std::atomic<int>>(0)};
+    std::optional<FileEntry> operator()(const std::string& rel) const {
+        const int cur = active->fetch_add(1, std::memory_order_acq_rel) + 1;
+        int prev = peak->load(std::memory_order_relaxed);
+        while (cur > prev &&
+               !peak->compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));  // hold the slot
+        active->fetch_sub(1, std::memory_order_acq_rel);
+        return MakeRemote(rel, 1, 1700000000000000000LL);
+    }
+};
+
+// Case 6: SetActiveCap(0) = unlimited (default). Multiple workers run concurrently.
+void TestActiveCapUnlimited() {
+    ConcurrencyTrackingProbe probe;
+    ComparePipelineConfig cfg;
+    cfg.mode = CompareMode::Fast;
+    cfg.workerCount = 4;
+    cfg.batchPop = 1;  // small batch so workers contend on probe
+    ComparePipeline pipeline(cfg, probe, nullptr);
+    pipeline.SetActiveCap(0);  // explicit unlimited
+
+    for (int i = 0; i < 100; ++i) {
+        pipeline.Enqueue(MakeRemote("u" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    const auto items = RunToCompletion(pipeline, 100);
+    Expect(items.size() == 100, "case6: all items drained with unlimited cap");
+    Expect(probe.peak->load() >= 2, "case6: unlimited cap allows concurrent probes");
+    pipeline.Stop();
+    pipeline.Join();
+}
+
+// Case 7: SetActiveCap(1) = serialized probes. Peak concurrency must be 1.
+void TestActiveCapOne() {
+    ConcurrencyTrackingProbe probe;
+    ComparePipelineConfig cfg;
+    cfg.mode = CompareMode::Fast;
+    cfg.workerCount = 4;
+    cfg.batchPop = 1;
+    ComparePipeline pipeline(cfg, probe, nullptr);
+    pipeline.SetActiveCap(1);
+
+    for (int i = 0; i < 100; ++i) {
+        pipeline.Enqueue(MakeRemote("c" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    const auto items = RunToCompletion(pipeline, 100);
+    Expect(items.size() == 100, "case7: all items drained with cap=1");
+    Expect(probe.peak->load() == 1, "case7: cap=1 limits concurrency to exactly 1");
+    pipeline.Stop();
+    pipeline.Join();
+}
+
+// Case 8: SetActiveCap(N) bounds concurrency to N.
+void TestActiveCapBounded() {
+    ConcurrencyTrackingProbe probe;
+    ComparePipelineConfig cfg;
+    cfg.mode = CompareMode::Fast;
+    cfg.workerCount = 8;
+    cfg.batchPop = 1;
+    ComparePipeline pipeline(cfg, probe, nullptr);
+    pipeline.SetActiveCap(3);
+
+    for (int i = 0; i < 200; ++i) {
+        pipeline.Enqueue(MakeRemote("b" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    const auto items = RunToCompletion(pipeline, 200);
+    Expect(items.size() == 200, "case8: all items drained with cap=3");
+    Expect(probe.peak->load() <= 3, "case8: cap=3 limits concurrency to <=3");
+    Expect(probe.peak->load() >= 2, "case8: cap=3 allows some concurrency");
+    pipeline.Stop();
+    pipeline.Join();
+}
+
+// Case 9: Dynamic cap adjustment (raise mid-run) does not hang or lose items.
+void TestActiveCapDynamicRaise() {
+    ConcurrencyTrackingProbe probe;
+    ComparePipelineConfig cfg;
+    cfg.mode = CompareMode::Fast;
+    cfg.workerCount = 4;
+    cfg.batchPop = 1;
+    ComparePipeline pipeline(cfg, probe, nullptr);
+
+    pipeline.SetActiveCap(1);
+    for (int i = 0; i < 50; ++i) {
+        pipeline.Enqueue(MakeRemote("d" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    pipeline.Flush();
+    // Raise cap while workers are processing.
+    pipeline.SetActiveCap(4);
+    for (int i = 50; i < 100; ++i) {
+        pipeline.Enqueue(MakeRemote("d" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    const auto items = RunToCompletion(pipeline, 100);
+    Expect(items.size() == 100, "case9: all items drained with dynamic cap raise");
+    pipeline.Stop();
+    pipeline.Join();
+}
+
+// Case 10: Dynamic cap adjustment (lower mid-run) does not hang or lose items.
+void TestActiveCapDynamicLower() {
+    ConcurrencyTrackingProbe probe;
+    ComparePipelineConfig cfg;
+    cfg.mode = CompareMode::Fast;
+    cfg.workerCount = 4;
+    cfg.batchPop = 1;
+    ComparePipeline pipeline(cfg, probe, nullptr);
+
+    pipeline.SetActiveCap(4);
+    for (int i = 0; i < 50; ++i) {
+        pipeline.Enqueue(MakeRemote("l" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    pipeline.Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Lower cap while workers may be processing.
+    pipeline.SetActiveCap(1);
+    for (int i = 50; i < 100; ++i) {
+        pipeline.Enqueue(MakeRemote("l" + std::to_string(i), 1, 1700000000000000000LL));
+    }
+    const auto items = RunToCompletion(pipeline, 100);
+    Expect(items.size() == 100, "case10: all items drained with dynamic cap lower");
+    pipeline.Stop();
+    pipeline.Join();
+}
+
+// ---------------------------------------------------------------------------
+// Lazy directory cache consistency test: verifies that FindFirstFile data
+// (size + mtime) matches GetFileAttributesExW for the same files. This is
+// the correctness guarantee that allows the cache to replace per-file stat.
+// ---------------------------------------------------------------------------
+
+// Case 11: FindFirstFile/FindNextFile returns identical size and mtime to
+// GetFileAttributesExW. This validates the lazy directory cache's data source.
+void TestLazyDirCacheConsistency() {
+#ifdef _WIN32
+    namespace fs = std::filesystem;
+    const fs::path tmpDir = fs::temp_directory_path() / "fc_lazy_cache_test";
+    fs::create_directories(tmpDir);
+
+    struct TestFile {
+        std::string name;
+        std::string content;
+    };
+    const TestFile testFiles[] = {
+        {"a.txt", "hello"},
+        {"b.bin", std::string(100, 'x')},
+        {"c.dat", ""},
+        {"d.log", std::string(4096, 'z')},
+    };
+    for (const auto& f : testFiles) {
+        std::ofstream(tmpDir / f.name, std::ios::binary) << f.content;
+    }
+
+    // Enumerate with FindFirstFile (lazy cache data source).
+    std::unordered_map<std::string, std::pair<uint64_t, int64_t>> findData;
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW((tmpDir.wstring() + L"\\*").c_str(), &fd);
+    Expect(hFind != INVALID_HANDLE_VALUE, "case11: FindFirstFile succeeded");
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        const uint64_t size =
+            (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+        ULARGE_INTEGER mt{};
+        mt.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        const std::string name = fs::path(fd.cFileName).string();
+        findData[name] = std::make_pair(size, static_cast<int64_t>(mt.QuadPart));
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    Expect(findData.size() == 4, "case11: FindFirstFile found all test files");
+
+    // Cross-check each file against GetFileAttributesExW (the original probe path).
+    for (const auto& f : testFiles) {
+        const fs::path abs = tmpDir / f.name;
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        Expect(GetFileAttributesExW(abs.wstring().c_str(), GetFileExInfoStandard, &data) != 0,
+               "case11: GetFileAttributesExW succeeded for " + f.name);
+        const uint64_t size =
+            (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+        ULARGE_INTEGER mt{};
+        mt.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        mt.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        const int64_t mtime = static_cast<int64_t>(mt.QuadPart);
+
+        auto it = findData.find(f.name);
+        Expect(it != findData.end(), "case11: FindFirstFile found " + f.name);
+        Expect(it->second.first == size, "case11: size matches for " + f.name);
+        Expect(it->second.second == mtime, "case11: mtime matches for " + f.name);
+    }
+
+    // Verify expected file sizes.
+    Expect(findData["a.txt"].first == 5, "case11: a.txt size 5");
+    Expect(findData["b.bin"].first == 100, "case11: b.bin size 100");
+    Expect(findData["c.dat"].first == 0, "case11: c.dat size 0");
+    Expect(findData["d.log"].first == 4096, "case11: d.log size 4096");
+
+    fs::remove_all(tmpDir);
+#else
+    // Non-Windows: FindFirstFile is not available; the cache uses
+    // fs::directory_iterator which already provides cached metadata.
+    // Skip on non-Windows.
+#endif
+}
+
 }  // namespace
 
 void RunComparePipelineTests() {
@@ -265,4 +483,10 @@ void RunComparePipelineTests() {
     TestProbeExceptionFallback();
     TestBoundedInFlight();
     TestCountersConsistency();
+    TestActiveCapUnlimited();
+    TestActiveCapOne();
+    TestActiveCapBounded();
+    TestActiveCapDynamicRaise();
+    TestActiveCapDynamicLower();
+    TestLazyDirCacheConsistency();
 }

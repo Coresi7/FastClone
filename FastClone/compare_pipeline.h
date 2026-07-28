@@ -74,6 +74,13 @@ public:
     std::size_t PendingResults() const noexcept;  // ready-but-undrained result count (diagnostics)
     bool HasResults() const noexcept;           // result queue non-empty (wait predicate, atomic)
 
+    // Adaptive active cap (mirrors writeActiveCap in the IO worker pool): limits how many
+    // workers may execute disk-touching probes simultaneously. 0 = unlimited (FastCheck
+    // default / backward compat). On slow disks the caller throttles this to avoid
+    // overwhelming the device with concurrent GetFileAttributesExW calls that compete
+    // with writes for IOPS.
+    void SetActiveCap(uint32_t cap) noexcept;
+
     void Stop() noexcept;  // set stop flag + wake all workers (idempotent)
     void Join();           // join all workers (must run before the caller destroys its DiskIoDriver)
 
@@ -102,6 +109,11 @@ private:
 
     std::atomic<bool> stop_{false};
     std::vector<std::thread> workers_;
+
+    // Adaptive active cap: 0 = unlimited. When > 0, at most `activeCap_` workers may hold
+    // a slot simultaneously (guarded by taskMu_). Mirrors the writeActiveCap pattern.
+    std::atomic<uint32_t> activeCap_{0};
+    uint32_t activeWorkers_{0};  // guarded by taskMu_
 
     void WorkerLoop();
 };

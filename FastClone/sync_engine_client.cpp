@@ -4,6 +4,8 @@
 #include "compare_pipeline.h"
 #include "write_path_accounting.h"
 
+#include <shared_mutex>
+
 namespace fs = std::filesystem;
 
 namespace fc {
@@ -1565,58 +1567,97 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    // Lazy directory cache: when a compare probe first touches a directory, enumerate
+    // it once with FindFirstFile/FindNextFile (getting all files' size+mtime in one
+    // sequential MFT read) and cache the results. Subsequent probes for files in the
+    // same directory hit memory. This avoids both the full-tree pre-scan (too slow on
+    // huge slow disks) and the per-file GetFileAttributesExW (random MFT access that
+    // collapses IOPS under concurrency).
+    std::shared_mutex dirCacheMu;
+    std::unordered_map<std::string, std::unordered_map<std::string, FileEntry>> dirCache;
+
     auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
-        const fs::path abs = JoinRel(options.rootDir, relPath);
+        // Split relPath into directory + filename (relPath uses forward slashes).
+        const auto slashPos = relPath.find_last_of('/');
+        const std::string dirPart = (slashPos == std::string::npos) ? "." : relPath.substr(0, slashPos);
+        const std::string filePart = (slashPos == std::string::npos) ? relPath : relPath.substr(slashPos + 1);
+
+        // Fast path: directory already cached (shared lock, concurrent reads).
+        {
+            std::shared_lock<std::shared_mutex> lock(dirCacheMu);
+            auto dirIt = dirCache.find(dirPart);
+            if (dirIt != dirCache.end()) {
+                auto fileIt = dirIt->second.find(filePart);
+                if (fileIt != dirIt->second.end()) {
+                    FileEntry entry = fileIt->second;
+                    entry.relativePath = relPath;
+                    return entry;
+                }
+                return std::nullopt;  // directory cached, file not found -> missing
+            }
+        }
+
+        // Slow path: enumerate the directory once (exclusive lock).
+        {
+            std::unique_lock<std::shared_mutex> lock(dirCacheMu);
+            // Double-check after acquiring exclusive lock.
+            auto dirIt = dirCache.find(dirPart);
+            if (dirIt != dirCache.end()) {
+                auto fileIt = dirIt->second.find(filePart);
+                if (fileIt != dirIt->second.end()) {
+                    FileEntry entry = fileIt->second;
+                    entry.relativePath = relPath;
+                    return entry;
+                }
+                return std::nullopt;
+            }
+
+            const fs::path absDir = (dirPart == ".") ? options.rootDir : JoinRel(options.rootDir, dirPart);
+            std::unordered_map<std::string, FileEntry> files;
 #ifdef _WIN32
-        // Compare hot path: collapse the previous 4 std::filesystem metadata calls
-        // (exists/is_regular_file/file_size/last_write_time) into ONE syscall.
-        // On huge trees the per-file metadata cost dominates compare; a single
-        // GetFileAttributesExW avoids redundant path parsing and handle churn.
-        WIN32_FILE_ATTRIBUTE_DATA data{};
-        if (GetFileAttributesExW(abs.wstring().c_str(), GetFileExInfoStandard, &data) == 0) {
-            return std::nullopt;  // missing/inaccessible -> treat as new (TransferNow)
-        }
-        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            return std::nullopt;  // not a regular file
-        }
-        FileEntry entry;
-        entry.relativePath = relPath;
-        entry.isDirectory = false;
-        entry.fileSize = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
-                         static_cast<uint64_t>(data.nFileSizeLow);
-        // Raw FILETIME ticks (100ns since 1601), identical unit to the manifest
-        // writer (FileTimeToTicks). DecideCompareAction() normalizes both sides via
-        // TryNormalizeMtimeToUnixNs before tolerance, so correctness is preserved.
-        ULARGE_INTEGER mt{};
-        mt.LowPart = data.ftLastWriteTime.dwLowDateTime;
-        mt.HighPart = data.ftLastWriteTime.dwHighDateTime;
-        entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
-        return entry;
+            WIN32_FIND_DATAW fd;
+            HANDLE hFind = FindFirstFileW((absDir.wstring() + L"\\*").c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+                    FileEntry entry;
+                    entry.isDirectory = false;
+                    entry.fileSize = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
+                                     static_cast<uint64_t>(fd.nFileSizeLow);
+                    ULARGE_INTEGER mt{};
+                    mt.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+                    mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+                    entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
+                    std::string fileName = fs::path(fd.cFileName).string();
+                    files.emplace(std::move(fileName), std::move(entry));
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
 #else
-        std::error_code ec;
-        if (!fs::exists(abs, ec) || ec) {
-            return std::nullopt;
-        }
-        if (!fs::is_regular_file(abs, ec) || ec) {
-            return std::nullopt;
-        }
-        FileEntry entry;
-        entry.relativePath = relPath;
-        entry.isDirectory = false;
-        entry.fileSize = static_cast<uint64_t>(fs::file_size(abs, ec));
-        if (ec) {
-            return std::nullopt;
-        }
-        // Compare hot path: use last_write_time directly to avoid per-file handle
-        // open/close overhead from ReadFileMtimeCanonical on huge unchanged sets.
-        // DecideCompareAction() already normalizes Unix-ns vs FILETIME ticks before
-        // applying tolerance, so cross-platform correctness is preserved.
-        entry.mtimeNs = ToUnixNs(fs::last_write_time(abs, ec));
-        if (ec) {
-            return std::nullopt;
-        }
-        return entry;
+            for (const auto& item : fs::directory_iterator(absDir, fs::directory_options::skip_permission_denied)) {
+                std::error_code ec;
+                if (!item.is_regular_file(ec) || ec) continue;
+                const auto lwt = item.last_write_time(ec);
+                if (ec) continue;
+                const auto sz = item.file_size(ec);
+                if (ec) continue;
+                FileEntry entry;
+                entry.isDirectory = false;
+                entry.fileSize = static_cast<uint64_t>(sz);
+                entry.mtimeNs = static_cast<int64_t>(lwt.time_since_epoch().count());
+                files.emplace(item.path().filename().string(), std::move(entry));
+            }
 #endif
+            auto [insertedIt, inserted] = dirCache.emplace(dirPart, std::move(files));
+            (void)inserted;
+            auto fileIt = insertedIt->second.find(filePart);
+            if (fileIt != insertedIt->second.end()) {
+                FileEntry entry = fileIt->second;
+                entry.relativePath = relPath;
+                return entry;
+            }
+            return std::nullopt;
+        }
     };
 
     // Compare workers follow logical CPU concurrency (hardware_concurrency),
@@ -1625,6 +1666,11 @@ int RunClient(const CliOptions& options) {
     // Keep a deep in-flight window so the compare workers do not run dry while the
     // single main thread is busy ingesting a burst of manifest frames between refills.
     const size_t maxInFlightCompareTasks = std::max<size_t>(8192, static_cast<size_t>(compareWorkerCount) * 256);
+    // Compare active cap: starts at full worker count (no throttle on fast disks).
+    // Follows the write-cap controller's deterioration/growth signals to throttle
+    // concurrent GetFileAttributesExW calls on slow disks where parallel metadata
+    // queries cause IOPS collapse (observed: 4636 single-thread -> ~486 at 2 threads).
+    uint32_t compareActiveCap = compareWorkerCount;
     // Shared compare pipeline (fastcheck-compare-pipeline §5): Fast mode, probe = probeLocalFile
     // injected verbatim (preserves the FILETIME-ticks mtime representation, D-04/AC-24), workers wake
     // the main loop via compareResultCv. Declared AFTER clientDriver (§6.4 lifetime): its destructor
@@ -1637,6 +1683,7 @@ int RunClient(const CliOptions& options) {
     comparePipelineCfg.batchPop = 32;
     fc::ComparePipeline comparePipeline(comparePipelineCfg, probeLocalFile,
                                         [&]() { compareResultCv.notify_one(); });
+    comparePipeline.SetActiveCap(compareActiveCap);  // initial = full (no throttle)
 
     // Directory-creation worker pool (see dirTasks declaration). Each worker pops a
     // batch and runs create_directories without holding any lock; concurrent creation
@@ -3763,6 +3810,31 @@ int RunClient(const CliOptions& options) {
                     ioTaskCv.notify_all();
                     lastCapSampleSnapshot = sample;
 
+                    // Sync compare active cap to the write controller's direction. Compare's
+                    // GetFileAttributesExW competes with writes for disk IOPS; when the write
+                    // controller detects deterioration, compare must throttle too.
+                    // Floor is 4: a single GetFileAttributesExW worker is too slow on any disk
+                    // (observed 38 files/s at cap=1 vs 1412 at cap=10 on a slow RAID SSD).
+                    constexpr uint32_t kCompareCapMin = 4;
+                    switch (writeCapState.lastReason) {
+                        case fc::WriteCapAdjustReason::HalveBackpressure:
+                        case fc::WriteCapAdjustReason::HalveBudget:
+                        case fc::WriteCapAdjustReason::HalveRateDrop:
+                        case fc::WriteCapAdjustReason::HalveLatency:
+                        case fc::WriteCapAdjustReason::HalveFailure:
+                            compareActiveCap = std::max<uint32_t>(kCompareCapMin, compareActiveCap / 2);
+                            comparePipeline.SetActiveCap(compareActiveCap);
+                            break;
+                        case fc::WriteCapAdjustReason::Grow:
+                            if (compareActiveCap < compareWorkerCount) {
+                                ++compareActiveCap;
+                                comparePipeline.SetActiveCap(compareActiveCap);
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+
                     if (debugEnabled) {
                         std::cerr << "[write-cap] cap=" << writeCapState.activeCap
                                   << " min=" << fc::kActiveCapMin
@@ -3773,7 +3845,8 @@ int RunClient(const CliOptions& options) {
                                   << " drv_out=" << sample.driverWriteOutstandingBytes
                                   << " rate=" << sample.completionRate
                                   << " lat_ewma_us=" << (sample.latencyEwmaNs / 1000.0)
-                                  << " bp=" << (sample.backpressureSleep ? 1 : 0) << std::endl;
+                                  << " bp=" << (sample.backpressureSleep ? 1 : 0)
+                                  << " compare_cap=" << compareActiveCap << std::endl;
                     }
 
                     lastCapSampleAt = nowCap;

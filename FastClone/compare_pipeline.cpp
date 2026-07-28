@@ -85,6 +85,11 @@ void ComparePipeline::Stop() noexcept {
     taskCv_.notify_all();
 }
 
+void ComparePipeline::SetActiveCap(uint32_t cap) noexcept {
+    activeCap_.store(cap, std::memory_order_relaxed);
+    taskCv_.notify_all();  // wake parked workers so a raised cap takes effect immediately
+}
+
 void ComparePipeline::Join() {
     for (std::thread& w : workers_) {
         if (w.joinable()) {
@@ -100,16 +105,28 @@ void ComparePipeline::WorkerLoop() {
     resultBatch.reserve(cfg_.batchPop);
     while (true) {
         taskBatch.clear();
+        bool claimedSlot = false;
         {
             std::unique_lock<std::mutex> lock(taskMu_);
             taskCv_.wait(lock, [this]() {
-                return stop_.load(std::memory_order_relaxed) || !tasks_.empty();
+                if (stop_.load(std::memory_order_relaxed)) return true;
+                if (tasks_.empty()) return false;
+                const uint32_t cap = activeCap_.load(std::memory_order_relaxed);
+                if (cap == 0) return true;  // unlimited
+                return activeWorkers_ < cap;
             });
             // Drain any queued tasks before exiting on stop (same semantics as the legacy compare
             // worker: stop_ && queue empty is the only exit). In-flight is bounded by the caller's gate.
             if (stop_.load(std::memory_order_relaxed) && tasks_.empty()) {
                 break;
             }
+            // Cap gate: if activeCap_ > 0 and we are at the limit, loop back to wait.
+            const uint32_t cap = activeCap_.load(std::memory_order_relaxed);
+            if (cap > 0 && activeWorkers_ >= cap) {
+                continue;
+            }
+            ++activeWorkers_;
+            claimedSlot = true;
             const std::size_t take = std::min<std::size_t>(cfg_.batchPop, tasks_.size());
             for (std::size_t j = 0; j < take; ++j) {
                 taskBatch.push_back(std::move(tasks_.front()));
@@ -140,6 +157,12 @@ void ComparePipeline::WorkerLoop() {
                 onResultsReady_();
             }
         }
+        // Release the active slot so another worker can proceed.
+        if (claimedSlot) {
+            std::lock_guard<std::mutex> lock(taskMu_);
+            --activeWorkers_;
+        }
+        taskCv_.notify_one();
     }
 }
 
