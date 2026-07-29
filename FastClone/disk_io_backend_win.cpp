@@ -135,10 +135,21 @@ public:
         // unbuffered-writes D-03: the write path may hold BOTH an unbuffered (hUnbuf) and a buffered
         // (hBuf) handle to the same file at once (aligned ops go unbuffered, unaligned middle/tail
         // fragments go buffered). The second open therefore needs FILE_SHARE_WRITE, otherwise it
-        // fails with a sharing violation and unaligned fragments would hit an invalid handle. Reads
-        // keep FILE_SHARE_READ only.
-        const DWORD share = (mode == OpKind::Write) ? (FILE_SHARE_READ | FILE_SHARE_WRITE)
-                                                    : FILE_SHARE_READ;
+        // fails with a sharing violation and unaligned fragments would hit an invalid handle.
+        //
+        // read-share-widen: reads now grant FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        // (the same permissive mode file_index.cpp already uses for metadata scanning) instead of
+        // FILE_SHARE_READ only. Windows sharing is checked against EVERY existing handle's access:
+        // if another process holds e.g. a GENERIC_READ|GENERIC_WRITE handle (Office, editors,
+        // loggers, a concurrent reader...), a read that grants only FILE_SHARE_READ is rejected with
+        // ERROR_SHARING_VIOLATION even though we only want to read. Widening the granted share lets
+        // us read files that are merely open (not exclusively locked) by another process. It has no
+        // effect on unoccupied files and zero runtime cost. The only new risk is that a concurrent
+        // writer/deleter can mutate the file mid-read, yielding a possibly inconsistent copy -- an
+        // accepted best-effort trade-off for a copy/backup tool.
+        const DWORD share = (mode == OpKind::Write)
+                                ? (FILE_SHARE_READ | FILE_SHARE_WRITE)
+                                : (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         const DWORD disp = (mode == OpKind::Write) ? OPEN_ALWAYS : OPEN_EXISTING;
 
         if (wantUnbuf) {
