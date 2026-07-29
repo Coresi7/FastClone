@@ -1058,8 +1058,25 @@ int RunClient(const CliOptions& options) {
                     hashTaskQueue.pop_front();
                 }
                 localHashInFlight.fetch_add(1, std::memory_order_relaxed);
+                const auto hashStart = std::chrono::steady_clock::now();
+                uint64_t hashFileSize = 0;
                 try {
-                    Hash256 hash = ComputeFileHash(task.absPath);
+                    hashFileSize = static_cast<uint64_t>(fs::file_size(task.absPath));
+                } catch (...) {}
+                try {
+                    const std::optional<uint64_t> knownSize =
+                        (hashFileSize > 0) ? std::optional<uint64_t>(hashFileSize) : std::nullopt;
+                    Hash256 hash = ComputeFileHashViaDriver(clientDriver, task.absPath, knownSize);
+                    const auto hashEnd = std::chrono::steady_clock::now();
+                    const double hashSec = std::chrono::duration<double>(hashEnd - hashStart).count();
+                    if (hashSec > 1.0) {
+                        std::cerr << "[warn][client] slow_hash path=" << task.relPath
+                                  << " size_mb=" << (hashFileSize / (1024ULL * 1024ULL))
+                                  << " elapsed_s=" << std::fixed << std::setprecision(2) << hashSec
+                                  << " mb_s=" << std::setprecision(1)
+                                  << (hashSec > 0 ? (hashFileSize / (1024.0 * 1024.0)) / hashSec : 0.0)
+                                  << std::endl;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(hashResultMu);
                         localHashes[task.relPath] = hash;
@@ -1937,6 +1954,7 @@ int RunClient(const CliOptions& options) {
                     const uint64_t bytes = static_cast<uint64_t>(t.data.size());
                     bool ok = false;
                     bool fastPath = false;
+                    const auto writeStart = std::chrono::steady_clock::now();
                     try {
                         const fs::path abs = JoinRel(options.rootDir, t.relPath);
                         EnsureParentDir(abs, dirCache);  // B6: parent dir for both paths
@@ -1954,6 +1972,17 @@ int RunClient(const CliOptions& options) {
                         }
                     } catch (...) {
                         ok = false;  // exception -> treated as a write failure, flows to retryOrFail
+                    }
+                    const auto writeEnd = std::chrono::steady_clock::now();
+                    const double writeSec = std::chrono::duration<double>(writeEnd - writeStart).count();
+                    if (writeSec > 1.0) {
+                        std::cerr << "[warn][client] slow_write path=" << t.relPath
+                                  << " size_mb=" << (bytes / (1024ULL * 1024ULL))
+                                  << " elapsed_s=" << std::fixed << std::setprecision(2) << writeSec
+                                  << " mb_s=" << std::setprecision(1)
+                                  << (writeSec > 0 ? (bytes / (1024.0 * 1024.0)) / writeSec : 0.0)
+                                  << " ok=" << (ok ? 1 : 0)
+                                  << std::endl;
                     }
                     ioInFlightBytes.fetch_sub(t.data.size(), std::memory_order_relaxed);
                     // W-03/FR-08: enqueue->complete latency for the controller (0 enqueue == unset).
@@ -2722,7 +2751,7 @@ int RunClient(const CliOptions& options) {
 
         bool readErr = false;
         fc::io::SequentialReader reader(clientDriver, oldFileId, oldLen,
-                                        clientDriver.config().chunkBytes, 4);
+                                        clientDriver.config().chunkBytes, 8);
         std::vector<uint8_t> chunkBuf;
         size_t chunkPos = 0;
         delta::ByteSource src = [&](uint8_t* dst, size_t maxLen) -> size_t {
@@ -3472,6 +3501,24 @@ int RunClient(const CliOptions& options) {
         if (!manifestDone || queuedIncomingManifestFrames > 0) {
             addStallTag("manifest_wait");
         }
+        // io_write_wait: a file write dispatched to the async I/O pool hasn't completed
+        // (slow SSD / large file). This is a completion-gate term NOT previously surfaced.
+        if (ioOutstanding > 0) {
+            addStallTag("io_write_wait");
+        }
+        // delta_wait: binary-delta state machine is not idle (BlockSig in flight, ranges
+        // pending, or BuildPlan offload running). Also a completion-gate term NOT previously surfaced.
+        const size_t deltaStatesSize = deltaStates.size();
+        const size_t pendingDeltaSigSize = pendingDeltaSigRequests.size();
+        const size_t pendingDeltaRangesSize = pendingDeltaRanges.size();
+        const size_t activeDeltaRangesSize = activeDeltaRanges.size();
+        const size_t deltaPlanInFlightNow = deltaPlanInFlight.load(std::memory_order_relaxed);
+        const bool deltaBusy = (deltaStatesSize > 0 || pendingDeltaSigSize > 0 ||
+                                pendingDeltaRangesSize > 0 || activeDeltaRangesSize > 0 ||
+                                deltaPlanInFlightNow > 0);
+        if (deltaBusy) {
+            addStallTag("delta_wait");
+        }
         const bool waitingForNetwork = (!manifestDone) || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
                                        (hashResponsesReceived < hashRequestsSent);
         const bool incomingEmpty = (queuedIncomingPriorityFrames == 0 && queuedIncomingManifestFrames == 0);
@@ -3503,6 +3550,16 @@ int RunClient(const CliOptions& options) {
                   << " queued_incoming_prio=" << queuedIncomingPriorityFrames
                   << " queued_incoming_manifest=" << queuedIncomingManifestFrames
                   << " queued_incoming_mb=" << (queuedIncomingBytes / (1024ULL * 1024ULL))
+                  << " io_outstanding=" << ioOutstanding
+                  << " delayed_compare=" << delayedCompareEntries.size()
+                  << " delta_states=" << deltaStatesSize
+                  << " pending_delta_sig=" << pendingDeltaSigSize
+                  << " pending_delta_ranges=" << pendingDeltaRangesSize
+                  << " active_delta_ranges=" << activeDeltaRangesSize
+                  << " delta_plan_inflight=" << deltaPlanInFlightNow
+                  << " write_active_cap=" << writeActiveCap.load(std::memory_order_relaxed)
+                  << " write_active_workers=" << writeActiveWorkers
+                  << " io_tasks_queued=" << [&]{ std::lock_guard<std::mutex> lk(ioTaskMu); return ioTasks.size(); }()
                   << std::endl;
         lastStallWarnAt = now;
     };
@@ -3667,7 +3724,19 @@ int RunClient(const CliOptions& options) {
                     task = std::move(deltaPlanTaskQueue.front());
                     deltaPlanTaskQueue.pop_front();
                 }
+                const auto planStart = std::chrono::steady_clock::now();
                 DeltaPlanResult res = buildDeltaPlanOffloaded(std::move(task), dirCache);
+                const auto planEnd = std::chrono::steady_clock::now();
+                const double planSec = std::chrono::duration<double>(
+                    planEnd - planStart).count();
+                if (planSec > 5.0) {
+                    std::cerr << "[warn][client] slow_delta_plan path=" << res.rel
+                              << " elapsed_s=" << std::fixed << std::setprecision(2) << planSec
+                              << " ok=" << (res.ok ? 1 : 0)
+                              << " download_mb=" << (res.downloadBytes / (1024ULL * 1024ULL))
+                              << " new_mb=" << (res.newFileBytes / (1024ULL * 1024ULL))
+                              << std::endl;
+                }
                 {
                     std::lock_guard<std::mutex> lock(deltaPlanResultMu);
                     deltaPlanResults.push_back(std::move(res));
