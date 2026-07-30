@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -67,9 +68,17 @@ void TestCheckAuthWireRoundTrip() {
     std::string serverErr;
     std::thread server([&]() {
         try {
-            fc::SocketHandle client = fc::AcceptClient(listener);
-            received = fc::RecvFrame(client);
-            fc::ShutdownBoth(client);
+            // Timed accept: if the client never manages to connect (e.g. loopback
+            // misconfiguration), the test fails with a clear error instead of
+            // blocking forever in accept() and hanging join() below.
+            std::optional<fc::SocketHandle> client = fc::AcceptClientTimeout(listener, 10000);
+            if (!client) {
+                serverThrew = true;
+                serverErr = "AcceptClientTimeout: no client connection within 10s";
+                return;
+            }
+            received = fc::RecvFrame(*client);
+            fc::ShutdownBoth(*client);
         } catch (const std::exception& ex) {
             serverThrew = true;
             serverErr = ex.what();
@@ -79,7 +88,15 @@ void TestCheckAuthWireRoundTrip() {
     bool clientThrew = false;
     std::string clientErr;
     try {
-        fc::SocketHandle conn = fc::ConnectTo("::1", port);
+        // CreateServer listens dual-stack; prefer IPv6 loopback but fall back to
+        // IPv4 when ::1 is unavailable (e.g. ipv6 disabled on lo).
+        fc::SocketHandle conn = [&]() {
+            try {
+                return fc::ConnectTo("::1", port);
+            } catch (const std::exception&) {
+                return fc::ConnectTo("127.0.0.1", port);
+            }
+        }();
         fc::CheckAuthInfo info;
         info.password = "loopback-pw";
         info.flags = 0;

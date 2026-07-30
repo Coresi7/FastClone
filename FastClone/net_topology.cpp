@@ -31,7 +31,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#if defined(__linux__)
+#if defined(__linux__) && __has_include(<sys/random.h>)
 #include <sys/random.h>
 #endif
 #include <fstream>
@@ -86,7 +86,7 @@ std::string GenerateSessionToken() {
     }
 #else
     bool ok = false;
-#if defined(__linux__)
+#if defined(__linux__) && __has_include(<sys/random.h>)
     ssize_t got = getrandom(buf, kTokenBytes, 0);
     ok = (got == static_cast<ssize_t>(kTokenBytes));
 #endif
