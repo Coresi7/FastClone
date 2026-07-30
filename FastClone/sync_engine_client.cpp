@@ -2010,9 +2010,6 @@ int RunClient(const CliOptions& options) {
                 {
                     std::lock_guard<std::mutex> lock(ioResultMu);
                     for (IoWriteResult& r : results) {
-                        std::cerr << "[DIAG-BATCH][client] write rel=" << r.relPath
-                                  << " ok=" << (r.ok ? 1 : 0)
-                                  << " bytes=" << r.bytes << std::endl;
                         ioResults.push_back(std::move(r));
                     }
                 }
@@ -3119,7 +3116,6 @@ int RunClient(const CliOptions& options) {
                 entry.mtimeNs = rec.mtimeNs;
                 entry.serverOk = rec.ok;
                 entry.shouldWrite = entry.serverOk;
-                std::string diagAction;
                 // W-04/FR-10/FR-12: the main thread no longer synchronously creates zero-byte files
                 // or sets their mtime. A server-unavailable entry is defined now on the failure path
                 // (no write); a server-ok zero-byte entry is dispatched to the async write pool
@@ -3127,18 +3123,9 @@ int RunClient(const CliOptions& options) {
                 // Non-zero entries wait for their FileBatchChunk payload.
                 if (!entry.serverOk) {
                     finalizeBatchEntry(entry);
-                    diagAction = "finalize(no_write)";
                 } else if (entry.fileSize == 0) {
                     completeBatchEntry(entry);
-                    diagAction = "complete(zero_byte)";
-                } else {
-                    diagAction = "wait_chunk";
                 }
-                std::cerr << "[DIAG-BATCH][client] open rel=" << entry.relPath
-                          << " serverOk=" << (entry.serverOk ? 1 : 0)
-                          << " size=" << entry.fileSize
-                          << " action=" << diagAction
-                          << " finalized=" << (entry.finalized ? 1 : 0) << std::endl;
                 batch.entries.push_back(std::move(entry));
             }
             while (batch.currentIndex < batch.entries.size() &&
@@ -3209,16 +3196,6 @@ int RunClient(const CliOptions& options) {
                     completeBatchEntry(entry);
                 }
             }
-            for (auto& entry : batch.entries) {
-                std::cerr << "[DIAG-BATCH][client] end rel=" << entry.relPath
-                          << " serverOk=" << (entry.serverOk ? 1 : 0)
-                          << " received=" << entry.received
-                          << " fileSize=" << entry.fileSize
-                          << " finalized=" << (entry.finalized ? 1 : 0)
-                          << " shouldWrite=" << (entry.shouldWrite ? 1 : 0)
-                          << " incomplete=" << ((!entry.finalized && entry.received < entry.fileSize) ? 1 : 0)
-                          << std::endl;
-            }
             activeBatchDownloads.erase(itBatch);
             streamToPath.erase(key);
             releaseSlot();
@@ -3246,16 +3223,6 @@ int RunClient(const CliOptions& options) {
             pumpDownloadWrites(d, /*flushTail=*/true);
             drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites, d.writeError);
             const bool writeOk = !d.writeError;
-            {
-                const fs::path absPre = JoinRel(options.rootDir, rel);
-                std::error_code ecPre;
-                const bool exPre = fs::exists(absPre, ecPre);
-                std::cerr << "[DIAG-STREAM][client] preclose rel=" << rel
-                          << " abs=" << fc::PathToUtf8(absPre)
-                          << " exists=" << (exPre ? 1 : 0)
-                          << " size=" << (exPre ? static_cast<uintmax_t>(fs::file_size(absPre, ecPre)) : 0)
-                          << std::endl;
-            }
             // W-01/FR-01/FR-03: stamp mtime on the still-open write handle (only when content wrote
             // cleanly), then close; closeFile's return folds the SetEndOfFile + SetFileTime + close
             // result into the success decision (FR-02/B7) so a finalize failure does not count.
@@ -3265,20 +3232,6 @@ int RunClient(const CliOptions& options) {
             }
             const bool closeOk = clientDriver.closeFile(d.fileId);
             const bool ok = writeOk && closeOk;
-            std::cerr << "[DIAG-STREAM][client] end rel=" << rel
-                      << " writeOk=" << (writeOk ? 1 : 0)
-                      << " closeOk=" << (closeOk ? 1 : 0)
-                      << " ok=" << (ok ? 1 : 0) << std::endl;
-            {
-                const fs::path absPost = JoinRel(options.rootDir, rel);
-                std::error_code ecPost;
-                const bool exPost = fs::exists(absPost, ecPost);
-                std::cerr << "[DIAG-STREAM][client] postclose rel=" << rel
-                          << " abs=" << fc::PathToUtf8(absPost)
-                          << " exists=" << (exPost ? 1 : 0)
-                          << " size=" << (exPost ? static_cast<uintmax_t>(fs::file_size(absPost, ecPost)) : 0)
-                          << " err=" << ecPost.message() << std::endl;
-            }
             d.fileId = 0;
             activeDownloads.erase(it);
             streamToPath.erase(key);
@@ -3329,7 +3282,6 @@ int RunClient(const CliOptions& options) {
                 streamToPath.erase(itPath);
             }
             if (hasRelPath && !relPath.empty()) {
-                std::cerr << "[DIAG-STREAM][client] fileError rel=" << relPath << " action=retryOrFail" << std::endl;
                 retryOrFail(relPath);
             } else {
                 ++compared;

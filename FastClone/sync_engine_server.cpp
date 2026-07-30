@@ -1000,11 +1000,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     st.relativePath = rel;
                     st.input.open(abs, std::ios::binary);
                     if (!st.input) {
-                        std::cerr << "[DIAG-STREAM][server] open rel=" << rel << " ok=0 reason=input_open_failed" << std::endl;
                         enqueueHigh(Frame{MsgType::FileError, frame.streamId, std::vector<uint8_t>(rel.begin(), rel.end())});
                         continue;
                     }
-                    std::cerr << "[DIAG-STREAM][server] open rel=" << rel << " ok=1" << std::endl;
                     {
                         std::lock_guard<std::mutex> lock(mu);
                         pendingNewStreams.emplace_back(frame.streamId, std::move(st));
@@ -1019,12 +1017,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                         record.relativePath = rel;
                         record.absPath = JoinRel(options.rootDir, rel);
                         std::error_code ec;
-                        std::string whyNotOk;
-                        if (!(fs::exists(record.absPath, ec) && !ec)) {
-                            whyNotOk = "exists_check_failed:" + ec.message();
-                        } else if (!(fs::is_regular_file(record.absPath, ec) && !ec)) {
-                            whyNotOk = "not_regular_file:" + ec.message();
-                        } else {
+                        if (fs::exists(record.absPath, ec) && !ec &&
+                            fs::is_regular_file(record.absPath, ec) && !ec) {
                             record.fileSize = static_cast<uint64_t>(fs::file_size(record.absPath, ec));
                             if (!ec) {
                                 // Validate the file can actually be OPENED for read here,
@@ -1039,17 +1033,9 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                                     // Same canonical mtime unit as the manifest path.
                                     record.mtimeNs = ReadFileMtimeCanonical(record.absPath);
                                     record.ok = true;
-                                } else {
-                                    whyNotOk = "open_for_read_failed";
                                 }
-                            } else {
-                                whyNotOk = "file_size_failed:" + ec.message();
                             }
                         }
-                        std::cerr << "[DIAG-BATCH][server] open rel=" << record.relativePath
-                                  << " ok=" << (record.ok ? 1 : 0)
-                                  << " size=" << record.fileSize
-                                  << " reason=" << (record.ok ? "-" : whyNotOk) << std::endl;
                         batch.files.push_back(std::move(record));
                     }
                     {
