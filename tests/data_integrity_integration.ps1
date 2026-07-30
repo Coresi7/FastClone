@@ -2,7 +2,7 @@
 #
 # Verifies that bytes transferred by the server are byte-for-byte identical to
 # the source (SHA256) after a full sync. This is the automated regression guard
-# for the C2 "传输字节逐字节不变" guarantee that A1 (a1-sendloop-buffer-reuse)
+# for the C2 "transferred bytes are byte-for-byte unchanged" guarantee that A1 (a1-sendloop-buffer-reuse)
 # relies on but previously had only a one-shot manual SHA256 check.
 #
 # Covers the gaps identified in the post-A1 static review:

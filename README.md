@@ -58,7 +58,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--server`: accepts `10.0.0.8:27842` or `10.0.0.8` (default port `27842` if omitted); accepts a comma-separated list and/or may be repeated to supply multiple multipath endpoints
 - `--target`: local target directory
 - `--password`: password (must match server)
-- `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`; on high-RTT links the auto value is lifted along an RTT ladder — `4` on LAN/同城, then `8`/`12`/`16` as RTT grows, capped by CPU concurrency — to fight RTT-bound throughput on massive small-file sets; explicit values above `8` print a reliability warning)
+- `--streams`: concurrent stream count; auto-tuned when omitted (defaults to `4`; on high-RTT links the auto value is lifted along an RTT ladder — `4` on LAN / same-metro, then `8`/`12`/`16` as RTT grows, capped by CPU concurrency — to fight RTT-bound throughput on massive small-file sets; explicit values above `8` print a reliability warning)
 - `--chunk-kb`: chunk size in KB; auto-tuned when omitted, valid range `1..65536`
 - `--queued-file-size`: soft receive-queue memory target for adaptive throttling (default: `5G`, range: `256M..64G`, supports suffixes `K/M/G`)
 - `--large-file-threshold`: pins files `>=` this size to the primary link; default `1G`, range `1M..1T`, suffixes `K/M/G` (independent of the small-file batch threshold and the receive-queue target)

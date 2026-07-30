@@ -21,9 +21,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
-    # /utf-8: 源码为 UTF-8 编码。置于此处（而非 -DCMAKE_CXX_FLAGS）是为了保留 MSVC 默认的
-    # /EHsc —— 用命令行覆盖 CMAKE_CXX_FLAGS 会丢掉 /EHsc，导致异常不栈展开（C4530），
-    # RAII 的锁/线程析构不执行，测试进程死锁。/EHsc 显式给出，确保任何情况下都开启标准异常展开。
+    # /utf-8: source files are UTF-8 encoded. Placed here (rather than in
+    # -DCMAKE_CXX_FLAGS) to preserve MSVC's default /EHsc. Overriding
+    # CMAKE_CXX_FLAGS on the command line would drop /EHsc, breaking exception
+    # unwinding (C4530): RAII locks/thread destructors would not run and test
+    # processes could deadlock. /EHsc is given explicitly so standard exception
+    # unwinding is always enabled.
     add_compile_options(/utf-8 /EHsc)
 endif()
 
@@ -160,7 +163,8 @@ endif()
 add_test(NAME FastCloneTests COMMAND FastCloneTests)
 
 # Data-integrity integration test (Windows only): end-to-end SHA256 byte-for-byte
-# verification of server-transferred files. Covers the C2 "传输字节逐字节不变" guarantee
+# verification of server-transferred files. Covers the C2 "transferred bytes are
+# byte-for-byte unchanged" guarantee
 # that unit tests cannot reach (sync_engine_server.cpp is not in the FastCloneTests target).
 # Runs via ctest; requires FastClone.exe to be built first.
 if(WIN32)
@@ -197,13 +201,17 @@ if(WIN32)
     target_link_libraries(FastCloneRouteProbe PRIVATE ws2_32 iphlpapi bcrypt)
 endif()
 
-# --- FastCheck: 只读目录比对独立工具（fastcheck；additive，不触碰 FastClone/FastCloneTests） ---
-# 依赖闭包：check 源 + 共享 compare_phase + file_index(ComputeFileHash/ComputeFileHashViaDriver,+xxhash) +
-# client_handshake/protocol/protocol_codec/win_socket。明确不链 sync_engine_client/server/shared、
-# delta、main、transfer_tuning、hash_memcache、net_topology、cli（FR-33/AC-42）。
-# FastCheck 复用 DiskIoDriver + SequentialReader 执行并行本地哈希（ComputeFileHashViaDriver），
-# 因此链接统一 disk_io 五件套（${FASTCLONE_DISK_IO_SOURCES}）；file_index.cpp 依赖 disk_io，凡链它的
-# target 必须链 disk_io（fastcheck-parallel-hash M4/FR-03/D-07）。
+# --- FastCheck: standalone read-only directory comparison tool (additive; does not
+#     touch FastClone/FastCloneTests) ---
+# Dependency closure: check sources + shared compare_phase + file_index
+# (ComputeFileHash/ComputeFileHashViaDriver, +xxhash) + client_handshake/protocol/
+# protocol_codec/win_socket. Explicitly does NOT link sync_engine_client/server/
+# shared, delta, main, transfer_tuning, hash_memcache, net_topology, cli
+# (FR-33/AC-42).
+# FastCheck reuses DiskIoDriver + SequentialReader for parallel local hashing
+# (ComputeFileHashViaDriver), so it links the unified disk_io set
+# (${FASTCLONE_DISK_IO_SOURCES}); file_index.cpp depends on disk_io, so any target
+# linking it must also link disk_io (fastcheck-parallel-hash M4/FR-03/D-07).
 set(FASTCHECK_SHARED_SOURCES
     FastCheck/check_cli.cpp
     FastCheck/check_engine.cpp
@@ -220,7 +228,8 @@ set(FASTCHECK_SHARED_SOURCES
     ${FASTCLONE_DISK_IO_SOURCES}
 )
 
-# xxhash / Win 链接与 FastClone 复用同一解析结果，封装成函数避免在两个 target 上重复。
+# xxhash / Win linking reuses the same resolution as FastClone; wrapped in a
+# function to avoid duplication across the two targets.
 function(fastcheck_configure_target tgt)
     target_include_directories(${tgt} PRIVATE FastClone FastCheck)
     target_link_libraries(${tgt} PRIVATE Threads::Threads)
@@ -235,7 +244,7 @@ function(fastcheck_configure_target tgt)
     endif()
     if(WIN32)
         target_compile_definitions(${tgt} PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
-        # win_socket 需 ws2_32；无 net_topology 故不需 iphlpapi/bcrypt。
+        # win_socket needs ws2_32; no net_topology, so iphlpapi/bcrypt are not needed.
         target_link_libraries(${tgt} PRIVATE ws2_32)
     endif()
 endfunction()
@@ -247,7 +256,8 @@ add_executable(FastCheck
 fastcheck_configure_target(FastCheck)
 install(TARGETS FastCheck RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# FastCheckTests：链接同 FastCheck（去 check_main.cpp，加测试入口），兼作 FastCheck link 闭包冒烟。
+# FastCheckTests: links like FastCheck (minus check_main.cpp, plus the test entry
+# point); also serves as a FastCheck link-closure smoke test.
 add_executable(FastCheckTests
     ${FASTCHECK_SHARED_SOURCES}
     FastCheck/tests/test_main.cpp
