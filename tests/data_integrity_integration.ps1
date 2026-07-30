@@ -98,22 +98,34 @@ function Invoke-FastCloneSync {
     return [int]$LASTEXITCODE
 }
 
+# Force the LONG (non-8.3) form of a path. Resolve-Path is NOT reliable for this
+# on the CI machine: it returns the 8.3 short form (C:\Users\ADMINI~1\...) for a
+# directory that was created via a short $env:TEMP, while Get-ChildItem returns the
+# LONG form (C:\Users\Administrator\...) for the files inside it. That asymmetry
+# makes a naive Substring-based rel-path computation produce wrong keys
+# (e.g. "6\src\large_5m.bin", where "6" is the trailing digit of the short random
+# dir name) and the comparison reports every file missing. GetLongPathName always
+# expands 8.3 components, so both the root and each file become long and consistent.
+$longPathSig = @'
+[DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)]
+public static extern int GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, int cchBuffer);
+'@
+$longPathUtil = Add-Type -MemberDefinition $longPathSig -Name 'LongPathUtil' -Namespace 'FcDiag' -PassThru
+function Get-LongPath {
+    param([string]$Path)
+    $sb = New-Object System.Text.StringBuilder 4096
+    $r = $longPathUtil::GetLongPathName($Path, $sb, $sb.Capacity)
+    if ($r -gt 0 -and $r -le $sb.Capacity) { return $sb.ToString() }
+    return $Path
+}
+
 # Build a SHA256 hashtable {relativePath -> hash} for all files under $Root.
-#
-# NOTE: $env:TEMP on the CI build machine is a DOS 8.3 short path
-# (e.g. C:\Users\ADMINI~1\...), but Get-ChildItem returns LONG paths. A naive
-# $_.FullName.Substring($Root.Length) therefore produces wrong relative keys
-# (e.g. "2\src\large_5m.bin") and the comparison reports every file missing.
-# We normalize BOTH the root and each file to their long form via Resolve-Path
-# before computing the relative path. This is PS 5.1 / .NET Framework 4.8 safe
-# (no System.IO.Path::GetRelativePath, which is .NET Core only).
 function Get-FileHashTree {
     param([string]$Root)
     $hashes = @{}
-    $normRoot = (Resolve-Path -LiteralPath $Root -ErrorAction Stop).Path.TrimEnd('\', '/')
+    $normRoot = Get-LongPath -Path $Root
     Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $full = $_.FullName
-        try { $full = (Resolve-Path -LiteralPath $full -ErrorAction Stop).Path } catch { }
+        $full = Get-LongPath -Path $_.FullName
         $rel = $full.Substring($normRoot.Length).TrimStart('\', '/')
         $hashes[$rel] = (Get-FileHash -Path $full -Algorithm SHA256).Hash
     }
@@ -241,6 +253,19 @@ function Invoke-DataIntegrityVariant {
         -OutLog "$LogDir\$Label-client.out" -ErrLog "$LogDir\$Label-client.err"
     if ($code -ne 0) { throw "${Label}: client sync expected exit 0, got $code" }
 
+    # TEMP DIAG: snapshot target large-file presence IMMEDIATELY after the client
+    # process exits (before the server wait / compare scan). The client's
+    # postclose already reported exists=1 size=5242880 for every large file, so all
+    # three should be present here. If a large file is present NOW but gone at
+    # COMPARE TIME (a few seconds later), it was removed by an EXTERNAL process
+    # (real-time AV quarantine) in the window between client close and the scan --
+    # NOT by FastClone (the client writes directly to the final path and never
+    # renames/deletes). This isolates the genuine issue from the harness rel-key bug.
+    $postClientLarge = Get-ChildItem -Path $tgt -Recurse -File -ErrorAction SilentlyContinue `
+        | Where-Object { $_.Name -like 'large_5m_*' } `
+        | ForEach-Object { $_.FullName }
+    Write-Host "[$Label] large_5m_* present POST-CLIENT: $($postClientLarge -join ', ')"
+
     $srvCode = Wait-ExitCode -Proc $srv -TimeoutSec 60
     if ($srvCode -ne 0) { throw "${Label}: server --once expected exit 0, got $srvCode" }
 
@@ -300,10 +325,9 @@ try {
     New-TestFixture -Src $src
 
     Write-Host "Source files:"
-    $normSrc = (Resolve-Path -LiteralPath $src -ErrorAction Stop).Path.TrimEnd('\', '/')
+    $normSrc = Get-LongPath -Path $src
     Get-ChildItem -Path $src -Recurse -File | ForEach-Object {
-        $full = $_.FullName
-        try { $full = (Resolve-Path -LiteralPath $full -ErrorAction Stop).Path } catch { }
+        $full = Get-LongPath -Path $_.FullName
         $rel = $full.Substring($normSrc.Length).TrimStart('\', '/')
         Write-Host ("  {0,-30} {1,10:N0} bytes" -f $rel, $_.Length)
     }
@@ -340,6 +364,26 @@ catch {
             }
         }
     }
+    # TEMP DIAG (AV hypothesis): if a large file is present POST-CLIENT but missing
+    # at compare time, an external process deleted it. Best-effort: ask Windows
+    # Defender for any current threat detections whose resources reference our temp
+    # target dir -- a direct confirmation of quarantine.
+    try {
+        $dt = Get-MpThreatDetection -ErrorAction SilentlyContinue
+        if ($dt) {
+            $dt | ForEach-Object {
+                Write-Host "[DIAG-AV] ThreatName=$($_.ThreatName) Resources=$($_.Resources -join ';')"
+            }
+        }
+    } catch { }
+    try {
+        $thr = Get-MpThreat -ErrorAction SilentlyContinue
+        if ($thr) {
+            $thr | ForEach-Object {
+                Write-Host "[DIAG-AV] Threat=$($_.ThreatName) State=$($_.ThreatStatus)"
+            }
+        }
+    } catch { }
     Stop-AllFastClone
     exit 1
 }
