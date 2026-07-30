@@ -2010,6 +2010,9 @@ int RunClient(const CliOptions& options) {
                 {
                     std::lock_guard<std::mutex> lock(ioResultMu);
                     for (IoWriteResult& r : results) {
+                        std::cerr << "[DIAG-BATCH][client] write rel=" << r.relPath
+                                  << " ok=" << (r.ok ? 1 : 0)
+                                  << " bytes=" << r.bytes << std::endl;
                         ioResults.push_back(std::move(r));
                     }
                 }
@@ -3116,6 +3119,7 @@ int RunClient(const CliOptions& options) {
                 entry.mtimeNs = rec.mtimeNs;
                 entry.serverOk = rec.ok;
                 entry.shouldWrite = entry.serverOk;
+                std::string diagAction;
                 // W-04/FR-10/FR-12: the main thread no longer synchronously creates zero-byte files
                 // or sets their mtime. A server-unavailable entry is defined now on the failure path
                 // (no write); a server-ok zero-byte entry is dispatched to the async write pool
@@ -3123,9 +3127,18 @@ int RunClient(const CliOptions& options) {
                 // Non-zero entries wait for their FileBatchChunk payload.
                 if (!entry.serverOk) {
                     finalizeBatchEntry(entry);
+                    diagAction = "finalize(no_write)";
                 } else if (entry.fileSize == 0) {
                     completeBatchEntry(entry);
+                    diagAction = "complete(zero_byte)";
+                } else {
+                    diagAction = "wait_chunk";
                 }
+                std::cerr << "[DIAG-BATCH][client] open rel=" << entry.relPath
+                          << " serverOk=" << (entry.serverOk ? 1 : 0)
+                          << " size=" << entry.fileSize
+                          << " action=" << diagAction
+                          << " finalized=" << (entry.finalized ? 1 : 0) << std::endl;
                 batch.entries.push_back(std::move(entry));
             }
             while (batch.currentIndex < batch.entries.size() &&
@@ -3195,6 +3208,16 @@ int RunClient(const CliOptions& options) {
                     // incomplete/failed ones through the synchronous fail path.
                     completeBatchEntry(entry);
                 }
+            }
+            for (auto& entry : batch.entries) {
+                std::cerr << "[DIAG-BATCH][client] end rel=" << entry.relPath
+                          << " serverOk=" << (entry.serverOk ? 1 : 0)
+                          << " received=" << entry.received
+                          << " fileSize=" << entry.fileSize
+                          << " finalized=" << (entry.finalized ? 1 : 0)
+                          << " shouldWrite=" << (entry.shouldWrite ? 1 : 0)
+                          << " incomplete=" << ((!entry.finalized && entry.received < entry.fileSize) ? 1 : 0)
+                          << std::endl;
             }
             activeBatchDownloads.erase(itBatch);
             streamToPath.erase(key);
