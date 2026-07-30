@@ -102,8 +102,9 @@ function Invoke-FastCloneSync {
 function Get-FileHashTree {
     param([string]$Root)
     $hashes = @{}
-    Get-ChildItem -Path $Root -Recurse -File | ForEach-Object {
-        $rel = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+    $normRoot = (Resolve-Path -Path $Root -ErrorAction Stop).Path.TrimEnd('\', '/')
+    Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $rel = [System.IO.Path]::GetRelativePath($normRoot, $_.FullName)
         $hashes[$rel] = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
     }
     return $hashes
@@ -270,6 +271,14 @@ $logDir = Join-Path $root "logs"
 $src = Join-Path $root "src"
 New-Item -ItemType Directory -Force -Path $logDir, $src | Out-Null
 
+# TEMP DIAG: dump the real path layout so we can see where the "N\src" prefix
+# in the source rel keys comes from on the CI machine.
+Write-Host "[DIAG-PATH] env:TEMP=$env:TEMP"
+Write-Host "[DIAG-PATH] root=$root"
+Write-Host "[DIAG-PATH] rootResolved=$(try { (Resolve-Path $root).Path } catch { '?' })"
+Write-Host "[DIAG-PATH] src=$src"
+Write-Host "[DIAG-PATH] srcResolved=$(try { (Resolve-Path $src).Path } catch { '?' })"
+
 $password = "fc-di-pw"
 $serverAddr = "127.0.0.1:$Port"
 
@@ -281,7 +290,7 @@ try {
 
     Write-Host "Source files:"
     Get-ChildItem -Path $src -Recurse -File | ForEach-Object {
-        $rel = $_.FullName.Substring($src.Length).TrimStart('\', '/')
+        $rel = [System.IO.Path]::GetRelativePath((Resolve-Path $src).Path.TrimEnd('\', '/'), $_.FullName)
         Write-Host ("  {0,-30} {1,10:N0} bytes" -f $rel, $_.Length)
     }
 
