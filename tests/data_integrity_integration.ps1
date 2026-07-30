@@ -253,41 +253,11 @@ function Invoke-DataIntegrityVariant {
         -OutLog "$LogDir\$Label-client.out" -ErrLog "$LogDir\$Label-client.err"
     if ($code -ne 0) { throw "${Label}: client sync expected exit 0, got $code" }
 
-    # TEMP DIAG: snapshot target large-file presence IMMEDIATELY after the client
-    # process exits (before the server wait / compare scan). The client's
-    # postclose already reported exists=1 size=5242880 for every large file, so all
-    # three should be present here. If a large file is present NOW but gone at
-    # COMPARE TIME (a few seconds later), it was removed by an EXTERNAL process
-    # (real-time AV quarantine) in the window between client close and the scan --
-    # NOT by FastClone (the client writes directly to the final path and never
-    # renames/deletes). This isolates the genuine issue from the harness rel-key bug.
-    $postClientLarge = Get-ChildItem -Path $tgt -Recurse -File -ErrorAction SilentlyContinue `
-        | Where-Object { $_.Name -like 'large_5m_*' } `
-        | ForEach-Object { $_.FullName }
-    Write-Host "[$Label] large_5m_* present POST-CLIENT: $($postClientLarge -join ', ')"
-
     $srvCode = Wait-ExitCode -Proc $srv -TimeoutSec 60
     if ($srvCode -ne 0) { throw "${Label}: server --once expected exit 0, got $srvCode" }
 
     # DI-1: compare source/target SHA256 trees byte-for-byte.
     $tgtHashes = Get-FileHashTree -Root $tgt
-    # TEMP DIAG: enumerate what the target actually contained AT COMPARE TIME, and
-    # explicitly probe each missing source key. This confirms whether any file is
-    # genuinely absent from the target (a real product issue) versus the previous
-    # harness-only rel-key mismatch (caused by a DOS 8.3 short $env:TEMP path on
-    # the CI machine producing wrong source relative keys).
-    $largeFiles = Get-ChildItem -Path $tgt -Recurse -File -ErrorAction SilentlyContinue `
-        | Where-Object { $_.Name -like 'large_5m_*' } `
-        | ForEach-Object { $_.FullName }
-    Write-Host "[$Label] target file count at compare: $($tgtHashes.Count) (expected $($srcHashes.Count))"
-    Write-Host "[$Label] large_5m_* present in target at compare: $($largeFiles -join ', ')"
-    foreach ($rel in $srcHashes.Keys) {
-        if (-not $tgtHashes.ContainsKey($rel)) {
-            $guess = Join-Path $tgt $rel
-            $tp = Test-Path $guess
-            Write-Host "[$Label] MISSING-PROBE rel=$rel Test-Path=$(if ($tp) { 1 } else { 0 }) abs=$guess"
-        }
-    }
     $diff = Compare-FileHashTrees -Src $srcHashes -Tgt $tgtHashes
     if ($null -ne $diff) {
         throw "${Label}: DATA INTEGRITY FAILURE: $diff"
@@ -306,14 +276,6 @@ $root = Join-Path $env:TEMP "fastclone-data-integrity-$(Get-Random)"
 $logDir = Join-Path $root "logs"
 $src = Join-Path $root "src"
 New-Item -ItemType Directory -Force -Path $logDir, $src | Out-Null
-
-# TEMP DIAG: dump the real path layout so we can see where the "N\src" prefix
-# in the source rel keys comes from on the CI machine.
-Write-Host "[DIAG-PATH] env:TEMP=$env:TEMP"
-Write-Host "[DIAG-PATH] root=$root"
-Write-Host "[DIAG-PATH] rootResolved=$(try { (Resolve-Path $root).Path } catch { '?' })"
-Write-Host "[DIAG-PATH] src=$src"
-Write-Host "[DIAG-PATH] srcResolved=$(try { (Resolve-Path $src).Path } catch { '?' })"
 
 $password = "fc-di-pw"
 $serverAddr = "127.0.0.1:$Port"
@@ -353,8 +315,8 @@ try {
 catch {
     Write-Host "FAILED: $_" -ForegroundColor Red
     Write-Host "Logs: $logDir"
-    # TEMP DIAG: dump [DIAG-BATCH]/[DIAG-STREAM] probe lines from the server/client .err logs
-    # into stdout so ctest --output-on-failure (and the transcript) captures them.
+    # On failure, surface the server/client [DIAG-BATCH]/[DIAG-STREAM] probe lines
+    # from the .err logs into stdout so ctest --output-on-failure captures them.
     if (Test-Path $logDir) {
         Get-ChildItem -Path $logDir -File | ForEach-Object {
             $lines = Get-Content -Path $_.FullName -ErrorAction SilentlyContinue | Select-String -Pattern 'DIAG-BATCH|DIAG-STREAM'
@@ -364,26 +326,6 @@ catch {
             }
         }
     }
-    # TEMP DIAG (AV hypothesis): if a large file is present POST-CLIENT but missing
-    # at compare time, an external process deleted it. Best-effort: ask Windows
-    # Defender for any current threat detections whose resources reference our temp
-    # target dir -- a direct confirmation of quarantine.
-    try {
-        $dt = Get-MpThreatDetection -ErrorAction SilentlyContinue
-        if ($dt) {
-            $dt | ForEach-Object {
-                Write-Host "[DIAG-AV] ThreatName=$($_.ThreatName) Resources=$($_.Resources -join ';')"
-            }
-        }
-    } catch { }
-    try {
-        $thr = Get-MpThreat -ErrorAction SilentlyContinue
-        if ($thr) {
-            $thr | ForEach-Object {
-                Write-Host "[DIAG-AV] Threat=$($_.ThreatName) State=$($_.ThreatStatus)"
-            }
-        }
-    } catch { }
     Stop-AllFastClone
     exit 1
 }
