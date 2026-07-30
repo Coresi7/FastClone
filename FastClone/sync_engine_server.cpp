@@ -1000,9 +1000,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     st.relativePath = rel;
                     st.input.open(abs, std::ios::binary);
                     if (!st.input) {
+                        std::cerr << "[DIAG-STREAM][server] open rel=" << rel << " ok=0 reason=input_open_failed" << std::endl;
                         enqueueHigh(Frame{MsgType::FileError, frame.streamId, std::vector<uint8_t>(rel.begin(), rel.end())});
                         continue;
                     }
+                    std::cerr << "[DIAG-STREAM][server] open rel=" << rel << " ok=1" << std::endl;
                     {
                         std::lock_guard<std::mutex> lock(mu);
                         pendingNewStreams.emplace_back(frame.streamId, std::move(st));

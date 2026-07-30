@@ -3255,6 +3255,10 @@ int RunClient(const CliOptions& options) {
             }
             const bool closeOk = clientDriver.closeFile(d.fileId);
             const bool ok = writeOk && closeOk;
+            std::cerr << "[DIAG-STREAM][client] end rel=" << rel
+                      << " writeOk=" << (writeOk ? 1 : 0)
+                      << " closeOk=" << (closeOk ? 1 : 0)
+                      << " ok=" << (ok ? 1 : 0) << std::endl;
             d.fileId = 0;
             activeDownloads.erase(it);
             streamToPath.erase(key);
@@ -3305,6 +3309,7 @@ int RunClient(const CliOptions& options) {
                 streamToPath.erase(itPath);
             }
             if (hasRelPath && !relPath.empty()) {
+                std::cerr << "[DIAG-STREAM][client] fileError rel=" << relPath << " action=retryOrFail" << std::endl;
                 retryOrFail(relPath);
             } else {
                 ++compared;

@@ -290,6 +290,17 @@ try {
 catch {
     Write-Host "FAILED: $_" -ForegroundColor Red
     Write-Host "Logs: $logDir"
+    # TEMP DIAG: dump [DIAG-BATCH]/[DIAG-STREAM] probe lines from the server/client .err logs
+    # into stdout so ctest --output-on-failure (and the transcript) captures them.
+    if (Test-Path $logDir) {
+        Get-ChildItem -Path $logDir -File | ForEach-Object {
+            $lines = Get-Content -Path $_.FullName -ErrorAction SilentlyContinue | Select-String -Pattern 'DIAG-BATCH|DIAG-STREAM'
+            if ($lines) {
+                Write-Host "----- $($_.Name) (DIAG) -----"
+                $lines | ForEach-Object { Write-Host $_.Line }
+            }
+        }
+    }
     Stop-AllFastClone
     exit 1
 }
