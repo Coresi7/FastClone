@@ -4417,8 +4417,10 @@ int RunClient(const CliOptions& options) {
         RemoveLocalExtras(options.rootDir, remoteDirs, remoteFiles, selfPath, existingLocalDirs);
     deleted = deleteResult.deletedFiles;
     failed += deleteResult.failedOps;
-    compared += deleteResult.failedOps;
-    compared += deleted;
+    // COMPARED FIX: deleted files are local extras absent from the server manifest; they
+    // were never "compared" against a server entry. Counting them in 'compared' inflated
+    // it by 'deleted' (observed: Compared - Enumrated == Deleted == 8740). Same for
+    // failedOps: already accounted in 'failed', must not double-count in 'compared'.
     std::cout << "Delete done, " << deleted << " files" << std::endl;
 
     // Create ONLY the empty-subtree remote directories that are actually MISSING locally.
