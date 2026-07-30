@@ -3246,6 +3246,16 @@ int RunClient(const CliOptions& options) {
             pumpDownloadWrites(d, /*flushTail=*/true);
             drainFileWritesToCompletion(d.fileId, d.submittedWrites, d.completedWrites, d.writeError);
             const bool writeOk = !d.writeError;
+            {
+                const fs::path absPre = JoinRel(options.rootDir, rel);
+                std::error_code ecPre;
+                const bool exPre = fs::exists(absPre, ecPre);
+                std::cerr << "[DIAG-STREAM][client] preclose rel=" << rel
+                          << " abs=" << fc::PathToUtf8(absPre)
+                          << " exists=" << (exPre ? 1 : 0)
+                          << " size=" << (exPre ? static_cast<uintmax_t>(fs::file_size(absPre, ecPre)) : 0)
+                          << std::endl;
+            }
             // W-01/FR-01/FR-03: stamp mtime on the still-open write handle (only when content wrote
             // cleanly), then close; closeFile's return folds the SetEndOfFile + SetFileTime + close
             // result into the success decision (FR-02/B7) so a finalize failure does not count.
@@ -3259,6 +3269,16 @@ int RunClient(const CliOptions& options) {
                       << " writeOk=" << (writeOk ? 1 : 0)
                       << " closeOk=" << (closeOk ? 1 : 0)
                       << " ok=" << (ok ? 1 : 0) << std::endl;
+            {
+                const fs::path absPost = JoinRel(options.rootDir, rel);
+                std::error_code ecPost;
+                const bool exPost = fs::exists(absPost, ecPost);
+                std::cerr << "[DIAG-STREAM][client] postclose rel=" << rel
+                          << " abs=" << fc::PathToUtf8(absPost)
+                          << " exists=" << (exPost ? 1 : 0)
+                          << " size=" << (exPost ? static_cast<uintmax_t>(fs::file_size(absPost, ecPost)) : 0)
+                          << " err=" << ecPost.message() << std::endl;
+            }
             d.fileId = 0;
             activeDownloads.erase(it);
             streamToPath.erase(key);
