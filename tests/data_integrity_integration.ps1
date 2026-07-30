@@ -99,13 +99,23 @@ function Invoke-FastCloneSync {
 }
 
 # Build a SHA256 hashtable {relativePath -> hash} for all files under $Root.
+#
+# NOTE: $env:TEMP on the CI build machine is a DOS 8.3 short path
+# (e.g. C:\Users\ADMINI~1\...), but Get-ChildItem returns LONG paths. A naive
+# $_.FullName.Substring($Root.Length) therefore produces wrong relative keys
+# (e.g. "2\src\large_5m.bin") and the comparison reports every file missing.
+# We normalize BOTH the root and each file to their long form via Resolve-Path
+# before computing the relative path. This is PS 5.1 / .NET Framework 4.8 safe
+# (no System.IO.Path::GetRelativePath, which is .NET Core only).
 function Get-FileHashTree {
     param([string]$Root)
     $hashes = @{}
-    $normRoot = (Resolve-Path -Path $Root -ErrorAction Stop).Path.TrimEnd('\', '/')
+    $normRoot = (Resolve-Path -LiteralPath $Root -ErrorAction Stop).Path.TrimEnd('\', '/')
     Get-ChildItem -Path $Root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $rel = [System.IO.Path]::GetRelativePath($normRoot, $_.FullName)
-        $hashes[$rel] = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+        $full = $_.FullName
+        try { $full = (Resolve-Path -LiteralPath $full -ErrorAction Stop).Path } catch { }
+        $rel = $full.Substring($normRoot.Length).TrimStart('\', '/')
+        $hashes[$rel] = (Get-FileHash -Path $full -Algorithm SHA256).Hash
     }
     return $hashes
 }
@@ -237,9 +247,10 @@ function Invoke-DataIntegrityVariant {
     # DI-1: compare source/target SHA256 trees byte-for-byte.
     $tgtHashes = Get-FileHashTree -Root $tgt
     # TEMP DIAG: enumerate what the target actually contained AT COMPARE TIME, and
-    # explicitly probe each missing source key. This distinguishes an EXTERNAL
-    # deletion (real-time AV quarantine removing the file after the client closed
-    # it, but before this scan) from a path/key mismatch inside the harness.
+    # explicitly probe each missing source key. This confirms whether any file is
+    # genuinely absent from the target (a real product issue) versus the previous
+    # harness-only rel-key mismatch (caused by a DOS 8.3 short $env:TEMP path on
+    # the CI machine producing wrong source relative keys).
     $largeFiles = Get-ChildItem -Path $tgt -Recurse -File -ErrorAction SilentlyContinue `
         | Where-Object { $_.Name -like 'large_5m_*' } `
         | ForEach-Object { $_.FullName }
@@ -289,8 +300,11 @@ try {
     New-TestFixture -Src $src
 
     Write-Host "Source files:"
+    $normSrc = (Resolve-Path -LiteralPath $src -ErrorAction Stop).Path.TrimEnd('\', '/')
     Get-ChildItem -Path $src -Recurse -File | ForEach-Object {
-        $rel = [System.IO.Path]::GetRelativePath((Resolve-Path $src).Path.TrimEnd('\', '/'), $_.FullName)
+        $full = $_.FullName
+        try { $full = (Resolve-Path -LiteralPath $full -ErrorAction Stop).Path } catch { }
+        $rel = $full.Substring($normSrc.Length).TrimStart('\', '/')
         Write-Host ("  {0,-30} {1,10:N0} bytes" -f $rel, $_.Length)
     }
 
