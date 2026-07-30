@@ -20,6 +20,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+    # /utf-8: 源码为 UTF-8 编码。置于此处（而非 -DCMAKE_CXX_FLAGS）是为了保留 MSVC 默认的
+    # /EHsc —— 用命令行覆盖 CMAKE_CXX_FLAGS 会丢掉 /EHsc，导致异常不栈展开（C4530），
+    # RAII 的锁/线程析构不执行，测试进程死锁。/EHsc 显式给出，确保任何情况下都开启标准异常展开。
+    add_compile_options(/utf-8 /EHsc)
+endif()
+
 # Unified disk IO driver sources (unified-disk-io-driver). The platform backend .cpp files are
 # each guarded by their platform macro so exactly one compiles to real code per OS; the others
 # compile to an empty translation unit (design D-04, strong isolation).
