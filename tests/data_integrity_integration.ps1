@@ -247,7 +247,8 @@ function Invoke-DataIntegrityVariant {
     foreach ($rel in $srcHashes.Keys) {
         if (-not $tgtHashes.ContainsKey($rel)) {
             $guess = Join-Path $tgt $rel
-            Write-Host "[$Label] MISSING-PROBE rel=$rel Test-Path=$((Test-Path $guess) ? 1 : 0) abs=$guess"
+            $tp = Test-Path $guess
+            Write-Host "[$Label] MISSING-PROBE rel=$rel Test-Path=$(if ($tp) { 1 } else { 0 }) abs=$guess"
         }
     }
     $diff = Compare-FileHashTrees -Src $srcHashes -Tgt $tgtHashes
