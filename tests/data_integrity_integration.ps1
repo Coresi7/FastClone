@@ -235,6 +235,21 @@ function Invoke-DataIntegrityVariant {
 
     # DI-1: compare source/target SHA256 trees byte-for-byte.
     $tgtHashes = Get-FileHashTree -Root $tgt
+    # TEMP DIAG: enumerate what the target actually contained AT COMPARE TIME, and
+    # explicitly probe each missing source key. This distinguishes an EXTERNAL
+    # deletion (real-time AV quarantine removing the file after the client closed
+    # it, but before this scan) from a path/key mismatch inside the harness.
+    $largeFiles = Get-ChildItem -Path $tgt -Recurse -File -ErrorAction SilentlyContinue `
+        | Where-Object { $_.Name -like 'large_5m_*' } `
+        | ForEach-Object { $_.FullName }
+    Write-Host "[$Label] target file count at compare: $($tgtHashes.Count) (expected $($srcHashes.Count))"
+    Write-Host "[$Label] large_5m_* present in target at compare: $($largeFiles -join ', ')"
+    foreach ($rel in $srcHashes.Keys) {
+        if (-not $tgtHashes.ContainsKey($rel)) {
+            $guess = Join-Path $tgt $rel
+            Write-Host "[$Label] MISSING-PROBE rel=$rel Test-Path=$((Test-Path $guess) ? 1 : 0) abs=$guess"
+        }
+    }
     $diff = Compare-FileHashTrees -Src $srcHashes -Tgt $tgtHashes
     if ($null -ne $diff) {
         throw "${Label}: DATA INTEGRITY FAILURE: $diff"
