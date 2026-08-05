@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +33,10 @@ thread_local std::array<RecvHistoryEntry, kRecvHistorySize> tlRecvHistory{};
 thread_local size_t tlRecvHistoryPos = 0;
 thread_local uint64_t tlRecvFrameIndex = 0;   // frames fully received so far on this thread
 thread_local uint64_t tlRecvByteOffset = 0;   // wire bytes consumed so far on this thread
+
+// Process-wide cumulative wire bytes (relaxed atomics, ~nanosecond cost per frame).
+std::atomic<uint64_t> g_netBytesSent{0};
+std::atomic<uint64_t> g_netBytesRecv{0};
 
 void RecordRecvHistory(uint8_t type, uint32_t streamId, uint32_t payloadLen) {
     tlRecvHistory[tlRecvHistoryPos % kRecvHistorySize] = RecvHistoryEntry{type, streamId, payloadLen, true};
@@ -72,6 +77,9 @@ std::array<uint8_t, kHeaderSize> EncodeHeader(const Frame& frame) {
 
 }  // namespace
 
+uint64_t NetBytesSent() { return g_netBytesSent.load(std::memory_order_relaxed); }
+uint64_t NetBytesRecv() { return g_netBytesRecv.load(std::memory_order_relaxed); }
+
 void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame) {
     const uint32_t payloadLen = static_cast<uint32_t>(frame.payload.size());
     out.reserve(out.size() + kHeaderSize + frame.payload.size());
@@ -91,6 +99,8 @@ void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame) {
 
 void SendFrame(const SocketHandle& socket, const Frame& frame) {
     std::array<uint8_t, kHeaderSize> header = EncodeHeader(frame);
+    g_netBytesSent.fetch_add(static_cast<uint64_t>(kHeaderSize) + frame.payload.size(),
+                             std::memory_order_relaxed);
     if (frame.payload.empty()) {
         SendAll(socket, header.data(), header.size());
         return;
@@ -107,6 +117,7 @@ void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames
     if (frames.empty()) {
         return;
     }
+    uint64_t totalBytes = 0;
     constexpr size_t kFrameChunk = 256;
     for (size_t offset = 0; offset < frames.size(); offset += kFrameChunk) {
         const size_t count = std::min<size_t>(kFrameChunk, frames.size() - offset);
@@ -121,9 +132,11 @@ void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames
             if (!frame.payload.empty()) {
                 buffers.push_back(SocketBuffer{frame.payload.data(), frame.payload.size()});
             }
+            totalBytes += static_cast<uint64_t>(kHeaderSize) + frame.payload.size();
         }
         SendBuffersAll(socket, buffers.data(), buffers.size());
     }
+    g_netBytesSent.fetch_add(totalBytes, std::memory_order_relaxed);
 }
 
 const char* MsgTypeName(uint8_t typeByte) {
@@ -253,6 +266,8 @@ Frame RecvFrame(const SocketHandle& socket) {
     RecordRecvHistory(header[0], streamId, payloadLen);
     ++tlRecvFrameIndex;
     tlRecvByteOffset += static_cast<uint64_t>(kHeaderSize) + payloadLen;
+    g_netBytesRecv.fetch_add(static_cast<uint64_t>(kHeaderSize) + payloadLen,
+                             std::memory_order_relaxed);
     return frame;
 }
 

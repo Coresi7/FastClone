@@ -40,6 +40,8 @@ struct IoCounters {
     uint64_t ioUringFallback = 0;
     uint64_t smallFileFallback = 0;
     uint64_t tailZeroFallback = 0;
+    uint64_t bytesRead = 0;      // cumulative bytes transferred by completed Read ops
+    uint64_t bytesWritten = 0;   // cumulative bytes transferred by completed Write ops
 };
 
 class DiskIoDriver {

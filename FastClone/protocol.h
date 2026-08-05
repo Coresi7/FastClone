@@ -55,6 +55,11 @@ void SendFrameBatch(const SocketHandle& socket, const std::vector<Frame>& frames
 void AppendEncodedFrame(std::vector<uint8_t>& out, const Frame& frame);
 Frame RecvFrame(const SocketHandle& socket);
 
+// Cumulative wire bytes sent/received across all sockets in this process (relaxed atomics,
+// ~nanosecond cost). For release-level real-time rate diagnostics in progress lines.
+uint64_t NetBytesSent();
+uint64_t NetBytesRecv();
+
 // Diagnostics for framing desync investigation.
 // Human-readable name for a wire type byte (or "?(<n>)" for out-of-enum values).
 const char* MsgTypeName(uint8_t typeByte);

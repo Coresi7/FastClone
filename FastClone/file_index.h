@@ -51,6 +51,7 @@ struct HashPhaseTimings {
     uint64_t readUs = 0;      // submit+wait+drain (fast path) or SequentialReader loop (slow path)
     uint64_t xxhUs = 0;       // ComputeBufferHash / ComputeHashFromSource
     uint64_t closeUs = 0;     // driver.closeFile
+    uint64_t bytes = 0;       // cumulative file bytes hashed (sum of fileSize per call)
 };
 HashPhaseTimings GetHashPhaseTimings();
 // Same XXH3-128 digest + raw byte layout as ComputeFileHash, but over an in-memory buffer.

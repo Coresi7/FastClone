@@ -102,7 +102,11 @@ public:
         wf.wpath = Widen(path);
         wf.mode = mode;
         wf.expectedSize = expectedSize;
-        wf.align = QueryAlign(path);
+        // S6: wf.align is resolved lazily below (only when wantUnbuf). Small files take the
+        // buffered handle where alignment is irrelevant (useUnbuf = wf.unbuffered && ... = false),
+        // so skipping QueryAlign here avoids a per-file GetVolumePathNameW syscall + global
+        // g_alignCacheMu lock on the small-file hot path. Default AlignInfo{ioGranularity=0}
+        // makes IsAligned() return false, but useUnbuf is already false for buffered files.
 
         // Change 3 (fastcheck-redundant-syscall-elim, FR-15/FR-16): on the read path, a positive
         // expectedSize is the caller's already-known read size/bound, so use it directly and skip
@@ -129,6 +133,16 @@ public:
                                (sizeForPolicy >= kSmallFileBufferedMax);
         if (unbuffered && !wantUnbuf && sizeKnown) {
             counters_.smallFileFallback.fetch_add(1);
+        }
+        // S6: resolve alignment only on the unbuffered (large-file direct-IO) path. Small files
+        // never consult wf.align for the useUnbuf decision (useUnbuf=false), but submit() still
+        // passes wf.align.ioGranularity to AlignedAlloc/IsAligned, which require a non-zero
+        // value (default AlignInfo has 0, making AlignedAlloc(0,n) fail). Set a harmless 1-byte
+        // granularity for the buffered path so those helpers get a valid value.
+        if (wantUnbuf) {
+            wf.align = QueryAlign(path);
+        } else {
+            wf.align.ioGranularity = 1;  // buffered path: alignment is irrelevant, 1 is a no-op
         }
 
         const DWORD access = (mode == OpKind::Write) ? GENERIC_WRITE : GENERIC_READ;

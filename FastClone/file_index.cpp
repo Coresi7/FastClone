@@ -103,6 +103,7 @@ std::atomic<uint64_t> g_hashOpenUs{0};
 std::atomic<uint64_t> g_hashReadUs{0};
 std::atomic<uint64_t> g_hashXxhUs{0};
 std::atomic<uint64_t> g_hashCloseUs{0};
+std::atomic<uint64_t> g_hashBytes{0};
 constexpr uint64_t kSmallFileDirectThreshold = 256u * 1024u;
 
 fs::file_time_type::duration FileToSystemEpochDelta() {
@@ -437,6 +438,7 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
             throw std::runtime_error("ComputeFileHashViaDriver: file_size failed");
         }
     }
+    g_hashBytes.fetch_add(fileSize, std::memory_order_relaxed);
 
     const auto openStart = std::chrono::steady_clock::now();
     // Change 3a (fastcheck-redundant-syscall-elim, FR-19): pass fileSize as the read-open expectedSize
@@ -598,6 +600,7 @@ HashPhaseTimings GetHashPhaseTimings() {
     t.readUs = g_hashReadUs.load(std::memory_order_relaxed);
     t.xxhUs = g_hashXxhUs.load(std::memory_order_relaxed);
     t.closeUs = g_hashCloseUs.load(std::memory_order_relaxed);
+    t.bytes = g_hashBytes.load(std::memory_order_relaxed);
     return t;
 }
 

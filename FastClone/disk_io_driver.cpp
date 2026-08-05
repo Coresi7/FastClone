@@ -197,6 +197,7 @@ void DiskIoDriver::SchedulerLoop() {
         const size_t got = backend_->reap(comps, 128, timeout);
         if (got > 0) {
             uint64_t completed = 0, failed = 0, cancelled = 0;
+            uint64_t bytesRead = 0, bytesWritten = 0;
             for (auto& c : comps) {
                 if (c.status == IoStatus::Error) {
                     ++failed;
@@ -204,6 +205,11 @@ void DiskIoDriver::SchedulerLoop() {
                     ++cancelled;
                 } else {
                     ++completed;
+                    if (c.kind == OpKind::Read) {
+                        bytesRead += c.transferred;
+                    } else {
+                        bytesWritten += c.transferred;
+                    }
                 }
                 EnqueueCompletion(std::move(c));
             }
@@ -216,6 +222,8 @@ void DiskIoDriver::SchedulerLoop() {
                 counters_.completed += completed;
                 counters_.failed += failed;
                 counters_.cancelled += cancelled;
+                counters_.bytesRead += bytesRead;
+                counters_.bytesWritten += bytesWritten;
             }
             qcv_.notify_all();
         }

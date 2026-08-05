@@ -1,5 +1,7 @@
 #include "sync_engine_internal.h"
 
+#include <iomanip>
+
 #include "read_gate.h"
 
 namespace fs = std::filesystem;
@@ -918,11 +920,25 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             // shared ComputeFileHashViaDriver (fastcheck-parallel-hash FR-02); any
                             // failure throws and is caught here -> hash.fill(0xFF), byte-for-byte
                             // equivalent to the previous inline block.
-                            try {
-                                hash = ComputeFileHashViaDriver(GetServerDiskIoDriver(), abs);
-                            } catch (...) {
-                                hashOk = false;
-                            }
+                        const auto hashStart = std::chrono::steady_clock::now();
+                        try {
+                            hash = ComputeFileHashViaDriver(GetServerDiskIoDriver(), abs);
+                        } catch (...) {
+                            hashOk = false;
+                        }
+                        const double hashSec = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - hashStart).count();
+                        if (hashOk && hashSec > 1.0) {
+                            std::error_code sizeEc;
+                            const uintmax_t sz = fs::file_size(abs, sizeEc);
+                            const uint64_t slowSize = sizeEc ? 0 : static_cast<uint64_t>(sz);
+                            std::cerr << "[warn][server] slow_hash path=" << rel
+                                      << " size_mb=" << (slowSize / (1024ULL * 1024ULL))
+                                      << " elapsed_s=" << std::fixed << std::setprecision(2) << hashSec
+                                      << " mb_s=" << std::setprecision(1)
+                                      << (hashSec > 0 ? (slowSize / (1024.0 * 1024.0)) / hashSec : 0.0)
+                                      << std::endl;
+                        }
                             if (!hashOk) {
                                 hash.fill(0xFF);
                             }
@@ -1266,6 +1282,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
         uint64_t lastEnumFlushes = 0;
         uint64_t lastEnumListingUsSum = 0;
         uint64_t lastEnumFlushBlockUsSum = 0;
+        // Per-interval hash phase + driver IO counters (delta vs last debug print).
+        // HashPhaseTimings accumulates in file_index.cpp global atomics on every
+        // ComputeFileHashViaDriver call (incl. server HashRequest path); IoCounters
+        // comes from the process-wide server driver. Both are read-only here.
+        fc::HashPhaseTimings lastHashPhases{};
+        fc::io::IoCounters lastIoCounters{};
         const size_t perStreamBurstBytes = (streamLimit <= 8)
                                                ? std::max<size_t>(2 * 1024 * 1024, static_cast<size_t>(effectiveChunkSize) * 2)
                                                : static_cast<size_t>(effectiveChunkSize);
@@ -1570,6 +1592,26 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     lastEnumFlushes = enumFlushes;
                     lastEnumListingUsSum = enumListingUsSum;
                     lastEnumFlushBlockUsSum = enumFlushBlockUsSum;
+                    const fc::HashPhaseTimings hashPhases = fc::GetHashPhaseTimings();
+                    const fc::io::IoCounters ioCnt = GetServerDiskIoDriver().counters();
+                    const uint64_t dHashCount = hashPhases.count - lastHashPhases.count;
+                    const uint64_t dHashTotalUs = hashPhases.totalUs - lastHashPhases.totalUs;
+                    const uint64_t dHashFilesizeUs = hashPhases.fileSizeUs - lastHashPhases.fileSizeUs;
+                    const uint64_t dHashOpenUs = hashPhases.openUs - lastHashPhases.openUs;
+                    const uint64_t dHashReadUs = hashPhases.readUs - lastHashPhases.readUs;
+                    const uint64_t dHashXxhUs = hashPhases.xxhUs - lastHashPhases.xxhUs;
+                    const uint64_t dHashCloseUs = hashPhases.closeUs - lastHashPhases.closeUs;
+                    const uint64_t dIoReadSubmitted = ioCnt.readSubmitted - lastIoCounters.readSubmitted;
+                    const uint64_t dIoCompleted = ioCnt.completed - lastIoCounters.completed;
+                    const uint64_t dIoSmallFallback = ioCnt.smallFileFallback - lastIoCounters.smallFileFallback;
+                    const uint64_t dIoDirect = ioCnt.directIo - lastIoCounters.directIo;
+                    const uint64_t dHashBytes = hashPhases.bytes - lastHashPhases.bytes;
+                    const uint64_t dIoBytesRead = ioCnt.bytesRead - lastIoCounters.bytesRead;
+                    const double avgReadKb = (dIoReadSubmitted > 0)
+                        ? static_cast<double>(dIoBytesRead) / 1024.0 / static_cast<double>(dIoReadSubmitted)
+                        : 0.0;
+                    lastHashPhases = hashPhases;
+                    lastIoCounters = ioCnt;
                     std::cerr << "[debug][server][sid=" << sessionId << "] queued_high=" << highQueued
                               << " queued_manifest=" << manifestQueued
                               << " pending_adopt=" << pendingAdopt
@@ -1604,10 +1646,57 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                               << " enum_listing_us_max=" << enumStats.listingUsMax.load(std::memory_order_relaxed)
                               << " enum_flush_block_us_avg=" << enumFlushBlockUsAvg
                               << " enum_flush_block_us_max=" << enumStats.flushBlockUsMax.load(std::memory_order_relaxed)
+                              << " hash_files_s=" << dHashCount
+                              << " hash_total_us=" << dHashTotalUs
+                              << " hash_filesize_us=" << dHashFilesizeUs
+                              << " hash_open_us=" << dHashOpenUs
+                              << " hash_read_us=" << dHashReadUs
+                              << " hash_xxh_us=" << dHashXxhUs
+                              << " hash_close_us=" << dHashCloseUs
+                              << " io_read_submitted=" << dIoReadSubmitted
+                              << " io_ops_completed=" << dIoCompleted
+                              << " io_read_pending=" << ioCnt.readPending
+                              << " io_direct=" << dIoDirect
+                              << " io_small_fallback=" << dIoSmallFallback
+                              << " hash_bytes=" << dHashBytes
+                              << " io_bytes_read=" << dIoBytesRead
+                              << " avg_read_kb=" << std::fixed << std::setprecision(1) << avgReadKb
                               << std::endl;
                     muWaitUs.clear();
                     muHoldUs.clear();
                     lastDebugPrint = now;
+                }
+            }
+            // Release-level progress line (not gated by FASTCLONE_DEBUG): one compact line per
+            // second with real-time rates, so operators see throughput without enabling debug.
+            // Uses function-level statics (cross-session sharing is acceptable for diagnostics;
+            // the dominant session drives the visible rate).
+            {
+                static auto lastReleasePrint = std::chrono::steady_clock::now();
+                static uint64_t lastRelHashCount = 0;
+                static uint64_t lastRelIoBytesRead = 0;
+                static uint64_t lastRelNetSent = 0;
+                const auto nowRel = std::chrono::steady_clock::now();
+                if ((nowRel - lastReleasePrint) >= std::chrono::seconds(1)) {
+                    const double relIntervalSec =
+                        std::chrono::duration<double>(nowRel - lastReleasePrint).count();
+                    const uint64_t relHashCount = fc::GetHashPhaseTimings().count;
+                    const uint64_t relIoBytesRead = GetServerDiskIoDriver().counters().bytesRead;
+                    const uint64_t relNetSent = fc::NetBytesSent();
+                    const uint64_t dRelHash = relHashCount - lastRelHashCount;
+                    const uint64_t dRelIo = relIoBytesRead - lastRelIoBytesRead;
+                    const uint64_t dRelNet = relNetSent - lastRelNetSent;
+                    std::cerr << "[server] hash_files_s=" << dRelHash
+                              << " io_read_mb_s=" << std::fixed << std::setprecision(1)
+                              << (relIntervalSec > 0 ? (dRelIo / (1024.0 * 1024.0)) / relIntervalSec : 0.0)
+                              << " net_send_mb_s="
+                              << (relIntervalSec > 0 ? (dRelNet / (1024.0 * 1024.0)) / relIntervalSec : 0.0)
+                              << " interval_ms=" << std::setprecision(0) << (relIntervalSec * 1000.0)
+                              << std::endl;
+                    lastRelHashCount = relHashCount;
+                    lastRelIoBytesRead = relIoBytesRead;
+                    lastRelNetSent = relNetSent;
+                    lastReleasePrint = nowRel;
                 }
             }
             if (!didWork) {

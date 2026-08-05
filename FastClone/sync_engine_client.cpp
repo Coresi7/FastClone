@@ -541,6 +541,11 @@ struct BatchDownloadState {
     size_t currentIndex = 0;
 };
 
+// Diagnostic pointer to the client driver (set in RunClient). Used by PrintClientCounters to
+// report DiskWrite rate without changing the function signature / 12 call sites. Valid only
+// during RunClient (all PrintClientCounters calls are inside RunClient).
+fc::io::DiskIoDriver* g_clientDriverForDiag = nullptr;
+
 void PrintClientCounters(size_t enumerated,
                          size_t compared,
                          size_t unchanged,
@@ -557,6 +562,10 @@ void PrintClientCounters(size_t enumerated,
                          bool force = false) {
     using clock = std::chrono::steady_clock;
     static clock::time_point lastPrint = clock::now();
+    static uint64_t lastHashBytes = 0;
+    static uint64_t lastNetSent = 0;
+    static uint64_t lastNetRecv = 0;
+    static uint64_t lastWriteBytes = 0;
     const auto now = clock::now();
     const bool tickReached = (now - lastPrint) >= std::chrono::seconds(1);
     const bool changedEnough = (enumerated != lastEnumerated) ||
@@ -568,6 +577,7 @@ void PrintClientCounters(size_t enumerated,
     if (!force && (!tickReached || !changedEnough)) {
         return;
     }
+    const double intervalSec = std::chrono::duration<double>(now - lastPrint).count();
     lastPrint = now;
     lastEnumerated = enumerated;
     lastCompared = compared;
@@ -575,6 +585,23 @@ void PrintClientCounters(size_t enumerated,
     lastFailed = failed;
     lastTransferred = transferred;
     lastDeleted = deleted;
+    // DiskRead now covers ALL driver reads (hash + verify + delta), symmetric with DiskWrite.
+    const uint64_t hashBytes = g_clientDriverForDiag ? g_clientDriverForDiag->counters().bytesRead : 0;
+    const uint64_t netSent = fc::NetBytesSent();
+    const uint64_t netRecv = fc::NetBytesRecv();
+    const uint64_t writeBytes = g_clientDriverForDiag ? g_clientDriverForDiag->counters().bytesWritten : 0;
+    const uint64_t dHashBytes = hashBytes - lastHashBytes;
+    const uint64_t dNetSent = netSent - lastNetSent;
+    const uint64_t dNetRecv = netRecv - lastNetRecv;
+    const uint64_t dWriteBytes = writeBytes - lastWriteBytes;
+    const double diskReadMbS = (intervalSec > 0) ? (dHashBytes / (1024.0 * 1024.0)) / intervalSec : 0.0;
+    const double netSendMbS = (intervalSec > 0) ? (dNetSent / (1024.0 * 1024.0)) / intervalSec : 0.0;
+    const double netRecvMbS = (intervalSec > 0) ? (dNetRecv / (1024.0 * 1024.0)) / intervalSec : 0.0;
+    const double diskWriteMbS = (intervalSec > 0) ? (dWriteBytes / (1024.0 * 1024.0)) / intervalSec : 0.0;
+    lastHashBytes = hashBytes;
+    lastNetSent = netSent;
+    lastNetRecv = netRecv;
+    lastWriteBytes = writeBytes;
     // CONSTRAINT-C1: each progress update occupies its own line (no '\r' overwrite),
     // so output stays consistent across Windows/Linux/macOS terminals and log files.
     std::cout << "Enumrated: " << enumerated
@@ -583,6 +610,11 @@ void PrintClientCounters(size_t enumerated,
               << "  Failed: " << failed
               << "  Transfered: " << transferred
               << "  Connections: " << connections
+              << "  DiskRead: " << std::fixed << std::setprecision(1) << diskReadMbS << "MB/s"
+              << "  DiskWrite: " << diskWriteMbS << "MB/s"
+              << "  NetSend: " << netSendMbS << "MB/s"
+              << "  NetRecv: " << netRecvMbS << "MB/s"
+              << "  Interval: " << std::setprecision(0) << (intervalSec * 1000.0) << "ms"
               << std::endl;
 }
 
@@ -1012,6 +1044,7 @@ int RunClient(const CliOptions& options) {
     // so fairness + backpressure apply across the whole client (design section 3.2/section 5.4).
     fc::io::IoDriverConfig clientIoCfg;
     fc::io::DiskIoDriver clientDriver(clientIoCfg);
+    g_clientDriverForDiag = &clientDriver;
     std::cout << "[disk-io] backend=" << clientDriver.backendName() << std::endl;
 
     // Directory creation is offloaded to a small worker pool. With deep trees the
