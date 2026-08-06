@@ -37,13 +37,20 @@ TunedTransferOptions ResolveTransferOptions(const CliOptions& options) {
 }
 
 uint32_t EffectiveChunkSizeForStreams(uint32_t configuredChunkSize, uint32_t streamLimit) {
+    uint32_t base;
     if (streamLimit <= 16) {
-        return std::max<uint32_t>(configuredChunkSize, 1024 * 1024);
+        base = std::max<uint32_t>(configuredChunkSize, 1024 * 1024);
+    } else if (streamLimit <= 32) {
+        base = std::max<uint32_t>(configuredChunkSize, 512 * 1024);
+    } else {
+        base = configuredChunkSize;
     }
-    if (streamLimit <= 32) {
-        return std::max<uint32_t>(configuredChunkSize, 512 * 1024);
-    }
-    return configuredChunkSize;
+    // Align down to 4 KiB (the common sector/page granularity) so that nextReadOffset
+    // stays sector-aligned across sequential chunk reads in the unbuffered transfer path
+    // (transfer-unbuffered). 1 MiB and 512 KiB are already aligned; this only affects an
+    // oddly-configured chunkSize, preventing silent fallback to buffered IO when the
+    // offset drifts off-sector after the first chunk.
+    return std::max<uint32_t>(base & ~static_cast<uint32_t>(4095), 4096u);
 }
 
 size_t DownloadFlushThresholdForStreams(uint32_t streamLimit, uint32_t effectiveChunkSize) {

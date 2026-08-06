@@ -36,10 +36,18 @@ bool ReadWholeFile(const fs::path& abs, std::vector<uint8_t>& out) {
 
 namespace {
 
+// Transfer-path unified-disk-io (transfer-unbuffered): regular file streams now read through
+// the process-global DiskIoDriver with FILE_FLAG_NO_BUFFERING, eliminating the std::ifstream
+// buffered-IO path whose reliance on the Windows file-system cache caused "disk 100% activity
+// time but only ~50 MB/s effective throughput" on cold-cache/large-working-set runs (the cache
+// prefetched far ahead of the single-threaded send-loop consumption rate, wasting disk bandwidth
+// on re-reads after eviction). driver read does not auto-EOF like ifstream, so fileRemaining
+// tracks bytes left and nextReadOffset tracks position explicitly.
 struct ServerStream {
-    std::ifstream input;
     std::string relativePath;
-    std::vector<uint8_t> readBuffer;  // A1: reused read buffer, lazily sized to effectiveChunkSize
+    uint64_t fileId = 0;         // driver handle (0 = none/closed)
+    uint64_t fileRemaining = 0;  // bytes left to read
+    uint64_t nextReadOffset = 0; // next file offset to read
 };
 
 // Binary delta (FC7) server-side byte-range stream. Opened on DeltaRangeOpen through the unified
@@ -59,9 +67,9 @@ struct ServerBatchStream {
     std::vector<BatchFileRecord> files;
     size_t index = 0;
     bool headerSent = false;
-    std::ifstream input;
-    uint64_t remainingBytes = 0;
-    std::vector<uint8_t> readBuffer;  // A1: reused read buffer, lazily sized to effectiveChunkSize
+    uint64_t fileId = 0;          // driver handle for current file (0 = none)
+    uint64_t nextReadOffset = 0;   // next offset in current file
+    uint64_t remainingBytes = 0;   // remaining bytes in current file
 };
 
 // --- FC6 handshake: version negotiation + the client/server primitives live in
@@ -1014,10 +1022,21 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     const fs::path abs = JoinRel(options.rootDir, rel);
                     ServerStream st;
                     st.relativePath = rel;
-                    st.input.open(abs, std::ios::binary);
-                    if (!st.input) {
+                    std::error_code szEc;
+                    const uint64_t fileSize = static_cast<uint64_t>(fs::file_size(abs, szEc));
+                    if (szEc) {
                         enqueueHigh(Frame{MsgType::FileError, frame.streamId, std::vector<uint8_t>(rel.begin(), rel.end())});
                         continue;
+                    }
+                    st.fileRemaining = fileSize;
+                    if (fileSize > 0) {
+                        st.fileId = GetServerDiskIoDriver().openFile(fc::PathToUtf8(abs),
+                                                                     fc::io::OpKind::Read,
+                                                                     /*unbuffered=*/true, fileSize);
+                        if (st.fileId == 0) {
+                            enqueueHigh(Frame{MsgType::FileError, frame.streamId, std::vector<uint8_t>(rel.begin(), rel.end())});
+                            continue;
+                        }
                     }
                     {
                         std::lock_guard<std::mutex> lock(mu);
@@ -1376,9 +1395,17 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             break;
                         }
                         BatchFileRecord& file = batch.files[batch.index];
-                        if (!batch.input.is_open()) {
-                            batch.input.open(file.absPath, std::ios::binary);
-                            if (!batch.input) {
+                        if (batch.fileId == 0) {
+                            batch.nextReadOffset = 0;
+                            batch.remainingBytes = file.fileSize;
+                            if (batch.remainingBytes == 0) {
+                                ++batch.index;
+                                continue;
+                            }
+                            batch.fileId = GetServerDiskIoDriver().openFile(
+                                fc::PathToUtf8(file.absPath), fc::io::OpKind::Read,
+                                /*unbuffered=*/true, batch.remainingBytes);
+                            if (batch.fileId == 0) {
                                 // Rare TOCTOU: the file was openable when the batch header
                                 // was built but is now unreadable. Abort only THIS batch
                                 // stream (the client fails its remaining entries) instead
@@ -1387,41 +1414,35 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                                 batchAborted = true;
                                 break;
                             }
-                            batch.remainingBytes = file.fileSize;
-                            if (batch.remainingBytes == 0) {
-                                batch.input.close();
-                                ++batch.index;
-                                continue;
-                            }
                         }
                         const uint64_t toRead = std::min<uint64_t>(batch.remainingBytes, static_cast<uint64_t>(effectiveChunkSize));
-                        // A1: reuse per-stream readBuffer instead of allocating a new vector each iteration.
-                        if (batch.readBuffer.size() < static_cast<size_t>(toRead)) {
-                            batch.readBuffer.resize(static_cast<size_t>(toRead));
-                        }
-                        batch.input.read(reinterpret_cast<char*>(batch.readBuffer.data()), static_cast<std::streamsize>(toRead));
-                        const std::streamsize got = batch.input.gcount();
-                        if (got <= 0) {
+                        bool readErr = false;
+                        std::vector<uint8_t> chunk;
+                        const uint32_t got = DriverReadRangeChunk(batch.fileId, batch.nextReadOffset,
+                                                                   static_cast<uint32_t>(toRead), chunk, readErr);
+                        if (readErr || got == 0) {
                             // I/O error mid-file: abort just this batch stream, not the session.
                             sendFrames.push_back(Frame{MsgType::FileError, it->first, {}});
                             batchAborted = true;
                             break;
                         }
+                        batch.nextReadOffset += got;
                         burstBytes += static_cast<size_t>(got);
                         batchBytesSentThisRound += static_cast<size_t>(got);
                         batch.remainingBytes -= static_cast<uint64_t>(got);
-                        sendFrames.push_back(Frame{MsgType::FileBatchChunk, it->first,
-                            std::vector<uint8_t>(batch.readBuffer.data(), batch.readBuffer.data() + got)});
+                        sendFrames.push_back(Frame{MsgType::FileBatchChunk, it->first, std::move(chunk)});
                         didWork = true;
                         if (batch.remainingBytes == 0) {
-                            batch.input.close();
+                            GetServerDiskIoDriver().closeFile(batch.fileId);
+                            batch.fileId = 0;
                             ++batch.index;
                         }
                     }
 
                     if (batchAborted) {
-                        if (batch.input.is_open()) {
-                            batch.input.close();
+                        if (batch.fileId != 0) {
+                            GetServerDiskIoDriver().closeFile(batch.fileId);
+                            batch.fileId = 0;
                         }
                         it = activeBatchStreams.erase(it);
                         didWork = true;
@@ -1435,7 +1456,7 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                             break;
                         }
                     }
-                    if (batchDone && !batch.input.is_open()) {
+                    if (batchDone && batch.fileId == 0) {
                         sendFrames.push_back(Frame{MsgType::FileBatchEnd, it->first, {}});
                         it = activeBatchStreams.erase(it);
                         didWork = true;
@@ -1448,26 +1469,47 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     size_t burstBytes = 0;
                     bool streamClosed = false;
                     while (!streamClosed && burstBytes < perStreamBurstBytes) {
-                        // A1: reuse per-stream readBuffer instead of allocating a new vector each iteration.
-                        if (it->second.readBuffer.size() < static_cast<size_t>(effectiveChunkSize)) {
-                            it->second.readBuffer.resize(static_cast<size_t>(effectiveChunkSize));
-                        }
-                        it->second.input.read(reinterpret_cast<char*>(it->second.readBuffer.data()),
-                                              static_cast<std::streamsize>(effectiveChunkSize));
-                        const std::streamsize got = it->second.input.gcount();
-                        if (got > 0) {
-                            burstBytes += static_cast<size_t>(got);
-                            sendFrames.push_back(Frame{MsgType::FileChunk, it->first,
-                                std::vector<uint8_t>(it->second.readBuffer.data(),
-                                                     it->second.readBuffer.data() + got)});
-                            didWork = true;
-                        }
-                        if (!it->second.input || got == 0) {
+                        ServerStream& ss = it->second;
+                        if (ss.fileRemaining == 0) {
+                            // EOF (includes empty files where fileId stays 0).
                             sendFrames.push_back(Frame{MsgType::FileEnd, it->first, {}});
+                            if (ss.fileId != 0) {
+                                GetServerDiskIoDriver().closeFile(ss.fileId);
+                                ss.fileId = 0;
+                            }
                             it = activeStreams.erase(it);
                             streamClosed = true;
                             didWork = true;
+                            break;
                         }
+                        const uint64_t toRead = std::min<uint64_t>(ss.fileRemaining,
+                                                                    static_cast<uint64_t>(effectiveChunkSize));
+                        bool readErr = false;
+                        std::vector<uint8_t> chunk;
+                        const uint32_t got = DriverReadRangeChunk(ss.fileId, ss.nextReadOffset,
+                                                                   static_cast<uint32_t>(toRead), chunk, readErr);
+                        if (readErr || got == 0) {
+                            // readErr = driver hard error; got==0 with fileRemaining>0 means the
+                            // file was truncated/shrunk between open and read (torn write). Both are
+                            // genuine failures -- emit FileError (not FileEnd) so the client can
+                            // retry/report rather than silently treating a partial file as complete.
+                            // This is intentionally stricter than the old ifstream path where
+                            // gcount()==0 was ambiguous between EOF and error.
+                            sendFrames.push_back(Frame{MsgType::FileError, it->first, {}});
+                            if (ss.fileId != 0) {
+                                GetServerDiskIoDriver().closeFile(ss.fileId);
+                                ss.fileId = 0;
+                            }
+                            it = activeStreams.erase(it);
+                            streamClosed = true;
+                            didWork = true;
+                            break;
+                        }
+                        ss.nextReadOffset += got;
+                        ss.fileRemaining -= got;
+                        burstBytes += got;
+                        sendFrames.push_back(Frame{MsgType::FileChunk, it->first, std::move(chunk)});
+                        didWork = true;
                     }
                     if (!streamClosed) {
                         ++it;
@@ -1715,9 +1757,21 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
         errorText = ex.what();
     }
 
-    // C10: release any driver file handles still held by in-flight range streams. The send loop
-    // closes each on completion/error, but a session that tore down mid-range leaves some open;
+    // C10: release any driver file handles still held by in-flight streams. The send loop
+    // closes each on completion/error, but a session that tore down mid-stream leaves some open;
     // the process-global driver would otherwise leak these handles across sessions.
+    for (auto& kv : activeStreams) {
+        if (kv.second.fileId != 0) {
+            GetServerDiskIoDriver().closeFile(kv.second.fileId);
+            kv.second.fileId = 0;
+        }
+    }
+    for (auto& kv : activeBatchStreams) {
+        if (kv.second.fileId != 0) {
+            GetServerDiskIoDriver().closeFile(kv.second.fileId);
+            kv.second.fileId = 0;
+        }
+    }
     for (auto& kv : activeRangeStreams) {
         if (kv.second.fileId != 0) {
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
