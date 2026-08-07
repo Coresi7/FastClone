@@ -34,13 +34,11 @@ inline constexpr uint32_t kActiveCapMax     = 32;  // FR-07 upper bound
 // Controller sampling interval (FR-08): the main loop samples the write signals once per window.
 inline constexpr long kWriteCapSampleIntervalMs = 500;
 
-// Adaptive thresholds (all constexpr-tunable, FR-08). A completion-rate drop below
-// kWriteCapRateDropFactor of the previous window (i.e. >25% drop) halves the cap; a latency EWMA
-// rise above kWriteCapLatencyHalveFactor (>50%) halves it; the healthy branch additionally requires
-// the latency EWMA to stay at or below kWriteCapLatencyGrowFactor (<=+25%) of the previous window.
-inline constexpr double kWriteCapRateDropFactor    = 0.75;
+// Adaptive thresholds (all constexpr-tunable, FR-08). The halve path uses ABSOLUTE thresholds
+// (kWriteLatencyHalveAbsNs / kWriteRateDropAbsMinFilesPerSec, see below); the healthy/grow branch
+// additionally requires the latency EWMA to stay at or below kWriteCapLatencyGrowFactor (<=+25%)
+// of the previous window.
 inline constexpr double kWriteCapLatencyGrowFactor = 1.25;
-inline constexpr double kWriteCapLatencyHalveFactor = 1.50;
 // FR-08 / D-12: the cap only grows after this many CONSECUTIVE healthy windows, then +1 per window.
 inline constexpr uint32_t kWriteCapHealthyWindowsToGrow = 2;
 // EWMA smoothing factor for the write-completion latency signal (UpdateEwma alpha).
@@ -48,8 +46,36 @@ inline constexpr double kWriteLatencyEwmaAlpha = 0.2;
 // Absolute latency gate for grow: when the EWMA exceeds this threshold the controller
 // refuses to grow the cap (only halve/Hold are allowed). Prevents oscillation on slow
 // disks where grow -> concurrent IOPS collapse -> halve -> recover -> grow loops forever.
-// 10s is conservative: healthy disks complete in <1s; above 10s the device is saturated.
-inline constexpr uint64_t kMaxLatencyForGrowNs = 10ULL * 1000ULL * 1000ULL * 1000ULL;
+// 30s: calibrated from real-lib post data — fast NVMe max=12.3s (can grow), slow SSD p50=65.9s (blocked).
+inline constexpr uint64_t kMaxLatencyForGrowNs = 30ULL * 1000ULL * 1000ULL * 1000ULL;
+
+// --- D-1a/D-3a/D-5: small-file cap desensitization (root-cause §7) ---
+// The OLD relative thresholds (1.5x latency / 25% rate drop) over-reacted to the natural jitter
+// of small-file write latency (NTFS MFT lock contention) and cap-switch rate oscillation, collapsing
+// cap 8->1 and never recovering (root-cause.md §3). They have been REMOVED and replaced by ABSOLUTE
+// thresholds below. The absolute thresholds are calibrated from real-lib 230M-file measurements:
+// fast NVMe latency p99=11.4s/max=12.3s; slow SSD p50=65.9s/max=273.5s. Real IOPS storms
+// (rate≈0, latency≫15s) are still caught.
+
+// D-1a: absolute latency halve threshold when desensitization gate is open.
+// Calibrated from real-lib 230M-file post data (root-cause §2.5):
+//   fast NVMe p99=11.4s, max=12.3s; slow SSD p50=65.9s, max=273.5s.
+// 15s sits above fast-disk burst peaks (no false halve) but far below slow-disk saturation (halve fires).
+inline constexpr uint64_t kWriteLatencyHalveAbsNs = 15ULL * 1000ULL * 1000ULL * 1000ULL;
+
+// D-3a: absolute rate halve threshold when desensitization gate is open (files/sec).
+// Real paralysis persists at rate 0.0 for multiple windows; cap-switch transients briefly
+// dip low but are absorbed by the D-5 protection window.
+// Known limitation: for large-file-only workloads (e.g. 8MB files at 110MB/s → ~14 files/s),
+// this threshold will pin cap at 1. That is acceptable — sequential large-file writes are
+// I/O-bound, not concurrency-bound, and cap=1 avoids seek thrashing. If future large-file
+// scenarios need concurrent growth, lower this threshold (e.g. to 2 files/s).
+inline constexpr double kWriteRateDropAbsMinFilesPerSec = 20.0;
+
+// D-5: protection windows after a cap change (halve or grow). During this window, the RATE
+// absolute threshold is suppressed (cap just moved, rate is transient). The LATENCY absolute
+// threshold is NOT suppressed — real device saturation must halve immediately.
+inline constexpr uint32_t kWriteCapProtectAfterChangeWindows = 1;
 
 // Physical write-worker pool size (max concurrency ceiling, D-04): clamp(max(1,hw), 8, 32). This is
 // the active cap's hard upper bound (poolMax); when hw < 32 the effective cap ceiling becomes poolMax
@@ -102,6 +128,7 @@ struct WriteCapControllerState {
     double   prevLatencyEwmaNs = 0.0;
     bool     havePrev = false;
     WriteCapAdjustReason lastReason = WriteCapAdjustReason::Init;
+    uint32_t windowsSinceLastChange = 0;  // D-5: windows since last halve/grow (protection window)
 };
 
 // Advance the active-cap controller by exactly one sampling window (FR-08 / NFR-08 / AC-07 / AC-08 /

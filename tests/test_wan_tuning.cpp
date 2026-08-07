@@ -265,22 +265,45 @@ void TC_NextWriteActiveCap() {
                     "W-03/S-01/AC-22: empty backlog + write failure halves with failure reason");
         }
         {
-            // rate drop >25% with backlog > 0 (unmet demand) halves with the rate reason. Gated on
-            // backlog > 0 since the trickle-rate-drop fix: an empty-backlog rate drop is demand
-            // oscillation, not deterioration (see the trickle guard below).
+            // bp=1 triggers HalveBackpressure (priority 1), regardless of rate/latency.
+            // (B-01 fix: relative-threshold path removed — bp==1 always hits HalveBackpressure first.)
             fc::WriteCapControllerState st; st.activeCap = 8;
-            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed prevRate=100
-            st = fc::NextWriteActiveCap(st, healthy(20, 70.0, 1000.0), 32);   // backlog>0, rate 70<75
-            Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveRateDrop,
-                    "W-03/S-01/AC-22: backlog>0 + rate drop halves with rate reason");
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed
+            fc::WriteCapSample bp = healthy(20, 70.0, 1000.0); bp.backpressureSleep = true;
+            st = fc::NextWriteActiveCap(st, bp, 32);
+            Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveBackpressure,
+                    "W-03/S-01/AC-22: bp=1 triggers HalveBackpressure (priority over rate)");
         }
         {
-            // latency rise >50% with backlog > 0 halves with the latency reason (same backlog gate).
+            // D-3a: rate=70 (> 20 abs threshold) does NOT halve.
             fc::WriteCapControllerState st; st.activeCap = 8;
-            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed prevLat=1000
-            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1600.0), 32);  // backlog>0, lat 1600>1500
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed, Hold
+            st = fc::NextWriteActiveCap(st, healthy(20, 70.0, 1000.0), 32);   // 70 > 20, no halve
+            Require(st.activeCap == 8, "D-3a: rate 70 > abs threshold 20 -> no halve");
+        }
+        {
+            // D-3a: rate=15 (< 20 abs threshold) DOES halve (real paralysis).
+            fc::WriteCapControllerState st; st.activeCap = 8;
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed, Hold
+            st = fc::NextWriteActiveCap(st, healthy(20, 15.0, 1000.0), 32);   // 15 < 20, halve
+            Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveRateDrop,
+                    "D-3a: rate 15 < abs threshold 20 -> halve (real paralysis)");
+        }
+        {
+            // D-1a: lat=1600ns (<< 15s abs threshold) does NOT halve.
+            fc::WriteCapControllerState st; st.activeCap = 8;
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed, Hold
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1600.0), 32);   // 1600ns << 15s, no halve
+            Require(st.activeCap == 8, "D-1a: lat 1600ns << 15s abs threshold -> no halve");
+        }
+        {
+            // D-1a: lat > 15s absolute threshold DOES halve (real saturation).
+            fc::WriteCapControllerState st; st.activeCap = 8;
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // seed, Hold
+            const double absHalve = static_cast<double>(fc::kWriteLatencyHalveAbsNs) + 1.0;
+            st = fc::NextWriteActiveCap(st, healthy(20, 100.0, absHalve), 32);
             Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveLatency,
-                    "W-03/S-01/AC-22: backlog>0 + latency rise halves with latency reason");
+                    "D-1a: lat > 15s abs threshold -> halve (real saturation)");
         }
         {
             // Trickle-rate-drop guard (regression for the real 1.22M-file run): empty backlog + rate
@@ -326,19 +349,20 @@ void TC_NextWriteActiveCap() {
     }
     {
         // Rate drop >25% (needs a prev baseline): window1 seeds prevRate=100, window2 rate=70.
+        // D-3a: backlog>0 + bp=0 => desensitized => absolute threshold. rate 70 > 20 => no halve.
+        // This test now verifies the desensitized path does NOT false-halve on relative drops.
         fc::WriteCapControllerState st; st.activeCap = 8;
         st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // Hold, prevRate=100
-        st = fc::NextWriteActiveCap(st, healthy(20, 70.0, 1000.0), 32);
-        Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveRateDrop,
-                "W-03/AC-08: completion rate drop >25% halves 8->4");
+        st = fc::NextWriteActiveCap(st, healthy(20, 70.0, 1000.0), 32);   // 70 > 20 abs => no halve
+        Require(st.activeCap == 8, "D-3a: relative rate drop 100->70 does NOT halve (desensitized, 70 > 20 abs)");
     }
     {
         // Latency rise >50% (needs a prev baseline): window1 prevLat=1000, window2 lat=1600.
+        // D-1a: backlog>0 + bp=0 => desensitized => absolute threshold. 1600ns << 15s => no halve.
         fc::WriteCapControllerState st; st.activeCap = 8;
         st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // Hold, prevLat=1000
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1600.0), 32);
-        Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveLatency,
-                "W-03/AC-08: latency EWMA rise >50% halves 8->4");
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1600.0), 32);   // 1600ns << 15s => no halve
+        Require(st.activeCap == 8, "D-1a: relative latency rise 1000->1600 does NOT halve (desensitized, 1600ns << 15s abs)");
     }
     {
         // Startup window: a previous sample may have no latency EWMA yet (0.0). The first real
@@ -347,18 +371,22 @@ void TC_NextWriteActiveCap() {
         st = fc::NextWriteActiveCap(st, healthy(20, 0.0, 0.0), 32);
         Require(st.activeCap == 8 && st.lastReason == fc::WriteCapAdjustReason::Hold,
                 "W-03/B9: zero-latency startup window holds at initial cap");
-        st = fc::NextWriteActiveCap(st, healthy(20, 1.0, 1000.0), 32);
+        // D-3a note: rate must be >= 20 (abs threshold) when desensitized (backlog>0, bp=0)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);
         Require(st.activeCap == 9 && st.lastReason == fc::WriteCapAdjustReason::Grow,
                 "W-03/B9: first real latency sample after zero baseline does not halve");
     }
     {
         // Startup rate baseline: prevRate==0 is a valid unseeded / no-completion state. A later
         // zero-completion window with healthy backlog must not be classified as a rate drop.
+        // D-3a note: with desensitized gate open (backlog>0, bp=0) and abs threshold 20,
+        // rate=0 (< 20) WILL halve on the 2nd window. So this test now uses rate=0 first
+        // (havePrev=false, so no halve), then a healthy rate to confirm grow works.
         fc::WriteCapControllerState st; st.activeCap = 8;
-        st = fc::NextWriteActiveCap(st, healthy(20, 0.0, 0.0), 32);
-        st = fc::NextWriteActiveCap(st, healthy(20, 0.0, 0.0), 32);
+        st = fc::NextWriteActiveCap(st, healthy(20, 0.0, 0.0), 32);  // havePrev=false, Hold
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // healthy, grow
         Require(st.activeCap == 9 && st.lastReason == fc::WriteCapAdjustReason::Grow,
-                "W-03/B9: zero-rate baseline does not falsely halve on rate drop");
+                "W-03/B9: zero-rate baseline does not falsely halve; healthy rate grows");
     }
 
     // --- Floor: halving at cap=1 stays at 1 (never 0) ---
@@ -421,46 +449,90 @@ void TC_NextWriteActiveCap() {
                 "W-03/B9: continued healthy recovery grows by exactly +1");
     }
 
-    // --- Latency gate: absolute threshold blocks grow when the device is saturated ---
+    // --- Latency gate: absolute thresholds (D-1a halve=15s, grow-gate=30s) ---
     {
-        // Latency just below the threshold: grow still works.
+        // Latency well below the D-1a halve absolute threshold (15s): grow still works.
         fc::WriteCapControllerState st; st.activeCap = 8;
-        const double belowGate = static_cast<double>(fc::kMaxLatencyForGrowNs) - 1.0;
+        const double belowGate = 100.0 * 1000.0 * 1000.0;  // 100ms << 15s
         st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Hold (streak=1)
         st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Grow
         Require(st.activeCap == 9 && st.lastReason == fc::WriteCapAdjustReason::Grow,
                 "latency-gate: below-threshold latency allows grow");
     }
     {
-        // Latency above the threshold: grow blocked, cap Holds (prevents oscillation).
+        // Latency above D-1a halve absolute threshold (15s) with desensitized gate:
+        // HalveLatency fires (abs path), cap drops. This replaces the old "Hold" expectation.
+        // Need 2 windows: first seeds havePrev, second triggers abs halve.
         fc::WriteCapControllerState st; st.activeCap = 8;
-        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Hold (gate)
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Still Hold
-        Require(st.activeCap == 8 && st.lastReason == fc::WriteCapAdjustReason::Hold,
-                "latency-gate: above-threshold latency blocks grow (Hold)");
+        const double aboveGate = static_cast<double>(fc::kWriteLatencyHalveAbsNs) + 1.0;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Hold (havePrev=false, seed)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // halve (abs, havePrev=true)
+        Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveLatency,
+                "latency-gate: above D-1a abs threshold (15s) halves (desensitized abs path)");
     }
     {
         // Latency above the threshold does NOT block halve: deterioration still halves.
+        // Use a latency below the D-1a abs threshold so HalveLatency doesn't fire first,
+        // isolating the HalveFailure path.
         fc::WriteCapControllerState st; st.activeCap = 8;
-        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
-        fc::WriteCapSample s = healthy(20, 100.0, aboveGate);
+        const double lowLat = 100.0 * 1000.0 * 1000.0;  // 100ms << 15s
+        fc::WriteCapSample s = healthy(20, 100.0, lowLat);
         s.writeFailures = 1;
         st = fc::NextWriteActiveCap(st, s, 32);
         Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::HalveFailure,
                 "latency-gate: halve still works above threshold");
     }
     {
-        // Recovery: after latency drops below the threshold, grow resumes.
+        // Recovery: after latency drops below the D-1a abs threshold, grow resumes.
         fc::WriteCapControllerState st; st.activeCap = 4;
-        const double aboveGate = static_cast<double>(fc::kMaxLatencyForGrowNs) + 1.0;
-        const double belowGate = static_cast<double>(fc::kMaxLatencyForGrowNs) - 1.0;
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveGate), 32);  // Hold (gate)
-        Require(st.activeCap == 4, "latency-gate: blocked grow holds at 4");
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Hold (streak=1)
-        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowGate), 32);  // Grow (streak=2)
-        Require(st.activeCap == 5 && st.lastReason == fc::WriteCapAdjustReason::Grow,
+        const double aboveAbs = static_cast<double>(fc::kWriteLatencyHalveAbsNs) + 1.0;  // > 15s
+        const double belowAbs = 100.0 * 1000.0 * 1000.0;  // 100ms << 15s
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveAbs), 32);  // Hold (havePrev=false, seed)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, aboveAbs), 32);  // halve 4->2 (abs)
+        Require(st.activeCap == 2, "latency-gate: above abs threshold halves during seed");
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowAbs), 32);  // Hold (streak=1, healthy)
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, belowAbs), 32);  // Grow (streak=2)
+        Require(st.activeCap == 3 && st.lastReason == fc::WriteCapAdjustReason::Grow,
                 "latency-gate: grow resumes after latency drops below threshold");
+    }
+
+    // --- D-5: protection window after cap change (root-cause §3.2 grow->immediate halve fix) ---
+    {
+        // D-5a: protection window suppresses RATE absolute threshold during cap-switch transient.
+        // Scenario: halve 8->4 via failure, then rate=0.7 (real slow-disk transient from
+        // real-slow-client.err:8) with backlog>0 && bp=0.
+        //   Window 0: failure -> halve 8->4 (capChanged, windowsSinceLastChange=0, protection ON)
+        //   Window 1: rate=0.7 < 20 BUT in protection window -> NOT halved (Hold)
+        //   Window 2: rate=0.7 < 20, protection window expired -> halved 4->2
+        // This pair is the V-01 critical assertion: if kWriteCapProtectAfterChangeWindows=0,
+        // window 1 would halve (4->2) and the first assertion FAILS.
+        fc::WriteCapControllerState st; st.activeCap = 8;
+        fc::WriteCapSample fail = healthy(20, 100.0, 1000.0); fail.writeFailures = 1;
+        st = fc::NextWriteActiveCap(st, fail, 32);  // halve 8->4, protection window starts
+        Require(st.activeCap == 4, "D-5a: failure halves 8->4");
+        Require(st.windowsSinceLastChange == 0, "D-5a: windowsSinceLastChange reset to 0 after halve");
+        // Window 1: in protection window, rate=0.7 < 20 -> NOT halved
+        st = fc::NextWriteActiveCap(st, healthy(20, 0.7, 1000.0), 32);
+        Require(st.activeCap == 4 && st.lastReason == fc::WriteCapAdjustReason::Hold,
+                "D-5a: rate 0.7 < 20 held during protection window (cap-switch transient)");
+        Require(st.windowsSinceLastChange == 1, "D-5a: protection window counting up");
+        // Window 2: protection window expired, rate=0.7 < 20 -> halved 4->2
+        st = fc::NextWriteActiveCap(st, healthy(20, 0.7, 1000.0), 32);
+        Require(st.activeCap == 2 && st.lastReason == fc::WriteCapAdjustReason::HalveRateDrop,
+                "D-5a: rate 0.7 < 20 halves after protection window expires (real paralysis)");
+    }
+    {
+        // D-5: LATENCY absolute threshold is NOT suppressed by protection window.
+        // After grow, if latency exceeds 15s absolute, halve still fires immediately.
+        fc::WriteCapControllerState st; st.activeCap = 1;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, 1000.0), 32);  // Grow 1->2
+        Require(st.activeCap == 2 && st.lastReason == fc::WriteCapAdjustReason::Grow,
+                "D-5: grow 1->2 (protection window starts)");
+        const double absHalve = static_cast<double>(fc::kWriteLatencyHalveAbsNs) + 1.0;
+        st = fc::NextWriteActiveCap(st, healthy(20, 100.0, absHalve), 32);  // lat > 15s => halve
+        Require(st.activeCap == 1 && st.lastReason == fc::WriteCapAdjustReason::HalveLatency,
+                "D-5: absolute latency threshold fires even in protection window (slow-disk safety net)");
     }
 }
 

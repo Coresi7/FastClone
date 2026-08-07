@@ -3948,6 +3948,8 @@ int RunClient(const CliOptions& options) {
                                   << " rate=" << sample.completionRate
                                   << " lat_ewma_us=" << (sample.latencyEwmaNs / 1000.0)
                                   << " bp=" << (sample.backpressureSleep ? 1 : 0)
+                                  << " pw=" << (writeCapState.windowsSinceLastChange < fc::kWriteCapProtectAfterChangeWindows ? 1 : 0)
+                                  << " wslc=" << writeCapState.windowsSinceLastChange
                                   << " compare_cap=" << compareActiveCap << std::endl;
                     }
 

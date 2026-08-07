@@ -108,6 +108,16 @@ WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
 
     WriteCapControllerState next = prev;
 
+    // D-5: protection window — cap just changed (halve/grow) last window, metrics are transient.
+    // The protection window suppresses the RATE absolute threshold (cap-switch transients can
+    // briefly dip rate to ~0.7 on slow disks; design §4 D-3 "cross-window paralysis" check).
+    // The LATENCY absolute threshold is NOT suppressed — it is the slow-disk safety net and
+    // must fire even during the protection window (design §3.2 "absolute judgments不受保护窗口限制").
+    // Note (B-01 fix): the relative-threshold path (1.5x / 25% drop) was removed because it was
+    // dead code — HalveBackpressure (priority 1) intercepts all bp==true samples before reaching
+    // here, so `desensitized` would always be true, making `!desensitized` unreachable.
+    const bool inProtectionWindow = prev.windowsSinceLastChange < kWriteCapProtectAfterChangeWindows;
+
     // 1) Deterioration (any true -> halve). Priority order maps 1:1 to the FR-08 halve list.
     WriteCapAdjustReason reason = WriteCapAdjustReason::Hold;
     bool deteriorated = true;
@@ -115,18 +125,17 @@ WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
         reason = WriteCapAdjustReason::HalveBackpressure;
     } else if (writePressure > s.recvSoftBudgetBytes) {
         reason = WriteCapAdjustReason::HalveBudget;
-    } else if (prev.havePrev && s.backlog > 0 &&
-               s.completionRate < prev.prevCompletionRate * kWriteCapRateDropFactor) {
-        // Gated on backlog > 0 (unmet demand): a rate drop only means the write side is failing to
-        // keep up when there is queued work. With backlog == 0 a zero-rate window is just demand
-        // oscillation in a trickle workload (few files/sec), NOT deterioration. Without this gate the
-        // cap self-collapses to kActiveCapMin=1 via repeated halve_rate_drop on natural 0<->rate
-        // oscillation and can never recover (backlog==0 is not healthy) -- a throughput cliff on the
-        // next burst. Observed in a real 1.22M-file run: cap 8->1 pinned, reason=halve_rate_drop.
+    } else if (prev.havePrev && s.backlog > 0 && !inProtectionWindow &&
+               s.completionRate < kWriteRateDropAbsMinFilesPerSec) {
+        // D-3a rate halve (absolute): rate < 20 files/s with backlog>0 (unmet demand).
+        // D-5: suppressed during protection window (cap-switch transient can briefly dip rate).
+        // S-01: backlog==0 is demand oscillation, not deterioration (gate preserved by s.backlog > 0).
         reason = WriteCapAdjustReason::HalveRateDrop;
     } else if (prev.havePrev && s.backlog > 0 && prev.prevLatencyEwmaNs > 0.0 &&
-               s.latencyEwmaNs > prev.prevLatencyEwmaNs * kWriteCapLatencyHalveFactor) {
-        // Same backlog>0 gate: a single high-latency completion with no queued work is meaningless.
+               s.latencyEwmaNs > static_cast<double>(kWriteLatencyHalveAbsNs)) {
+        // D-1a latency halve (absolute): EWMA > 15s with backlog>0.
+        // NOT suppressed by protection window — real device saturation must halve immediately
+        // (slow-disk safety net, design §3.2).
         reason = WriteCapAdjustReason::HalveLatency;
     } else if (s.writeFailures > 0) {
         reason = WriteCapAdjustReason::HalveFailure;
@@ -175,6 +184,8 @@ WriteCapControllerState NextWriteActiveCap(const WriteCapControllerState& prev,
     next.prevCompletionRate = s.completionRate;
     next.prevLatencyEwmaNs = s.latencyEwmaNs;
     next.havePrev = true;
+    // D-5: track windows since last cap change (halve or grow). Use clamp-post value (S-03 fix).
+    next.windowsSinceLastChange = (next.activeCap != prev.activeCap) ? 0 : prev.windowsSinceLastChange + 1;
     return next;
 }
 
