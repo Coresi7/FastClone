@@ -344,11 +344,12 @@ try {
     if (-not $downLine -or [int]$downLine.Matches[0].Groups[1].Value -lt 1) {
         throw "FR-D: expected requeued_files>=1 (in-flight blocks rerouted)"
     }
-    # Block-level re-send proof: 2 + 24 blocks planned; more allocs than planned blocks means
-    # killed in-flight blocks were re-issued on the surviving lane (not a whole-file restart).
+    # Block-level re-send proof: 2 + 25 blocks planned (large_tail is 24 full blocks + a
+    # 123-byte tail block); more allocs than planned means killed in-flight blocks were
+    # re-issued on the surviving lane (not a whole-file restart).
     $allocCount = (Select-String -Path "$logDir\D-client.out" -Pattern 'kind=file_range').Count
-    if ($allocCount -le 26) {
-        throw "FR-D: expected >26 file_range allocs (26 planned + re-sent blocks), got $allocCount"
+    if ($allocCount -le 27) {
+        throw "FR-D: expected >27 file_range allocs (27 planned + re-sent blocks), got $allocCount"
     }
     if (-not (Select-String -Path "$logDir\D-client.out" -Pattern '\[file_range\] done' -Quiet)) {
         throw "FR-D: missing '[file_range] done' after reroute"
