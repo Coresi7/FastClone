@@ -17,6 +17,11 @@ inline constexpr const char* kProtocolVersion = "FC7";
 // server has binary delta capability. The client sends delta-specific messages only when "its own
 // --delta-min-size>0 and the server advertises bit0" (AC-17).
 inline constexpr uint8_t kCapDelta = 0x01;
+// bit1 (FC7 additive, T-largefile-block-multinic): the peer can serve byte-range reads via
+// the FileRangeOpen/FileRangeData/FileRangeEnd frame family. The client enables large-file
+// block mode only when "its own --large-file-block-kb was given AND the server advertises
+// bit1"; otherwise it stays on the legacy FileOpen/FileChunk path (AC-08).
+inline constexpr uint8_t kCapFileRange = 0x02;
 
 // Send a simple frame carrying only a text payload (streamId=0).
 void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {});

@@ -51,7 +51,11 @@ void NegotiateHelloAsClient(const SocketHandle& socket) {
 // identity + server-advertised endpoint list (design section 3.2 / FR-003/005/017).
 AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password) {
     NegotiateHelloAsClient(socket);
-    SendSimple(socket, MsgType::Auth, password);
+    // The Auth claim carries the client capability byte + extension string after the bare
+    // password (T-largefile-block-multinic, D-02): the server parses the trailing fields
+    // tolerantly, so this stays wire-compatible with the capability-unaware parse.
+    SendFrame(socket, Frame{MsgType::Auth, 0,
+                            EncodeAuthClaim(password, kCapFileRange, std::string())});
     Frame authResult = RecvFrame(socket);
     if (authResult.type != MsgType::AuthOk) {
         const std::string payload(reinterpret_cast<const char*>(authResult.payload.data()), authResult.payload.size());
@@ -101,6 +105,9 @@ void HandshakeClientJoin(const SocketHandle& socket, const std::string& password
     SessionJoinInfo join;
     join.sessionId = sessionId;
     join.password = password;
+    // Advertise the same client capability set on every joined lane (aux links negotiate
+    // independently, T-largefile-block-multinic).
+    join.capabilities |= kCapFileRange;
     SendFrame(socket, Frame{MsgType::SessionJoin, 0, EncodeSessionJoin(join)});
     Frame authResult = RecvFrame(socket);
     if (authResult.type != MsgType::AuthOk) {

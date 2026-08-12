@@ -685,6 +685,9 @@ int RunClient(const CliOptions& options) {
     //   binary-delta state (deltaStates/deltaAbandoned/pendingDeltaSigRequests/
     //   deltaSigRequested/pendingDeltaRanges/activeDeltaRanges) -- all declared INSIDE the
     //   while below so each session re-evaluates delta from scratch (FR-25 per-session),
+    //   large-file block state (fileRangeStates/pendingFileRanges/activeFileRanges/
+    //   pendingFileRangePlans/fileRangePendingHash/fileRangeAbandoned) -- same per-session
+    //   reset discipline (T-largefile-block-multinic §6: no cross-session block resume),
     //   manifestDone, recvError/recvClosed -- each session is a fresh FC5 handshake +
     //   ManifestRequest. Already-synced local files persist on DISK only; the next session
     //   re-enumerates and skips them via size+mtime compare (no in-memory carry-over).
@@ -700,6 +703,11 @@ int RunClient(const CliOptions& options) {
     // (--delta-min-size > 0) AND the server advertised the delta capability bit in AuthOk
     // (binary-delta section 8.1 / AC-17). Set right after the primary handshake below.
     bool deltaEnabled = false;
+    // Large-file block mode (T-largefile-block-multinic, design §4.1.3): true when the server
+    // advertised kCapFileRange in AuthOk. Combined with --large-file-block-kb + isLarge +
+    // >=2 healthy lanes at the admission gate (§3.2); false keeps every file on the legacy
+    // FileOpen/FileChunk path (AC-08).
+    bool serverCapFileRange = false;
     // Measured session RTT (design section 3.1, FR-01). Primary source: the primary lane's TCP
     // connect timing (one round trip). Secondary: the probe matrix minimum (when multipath
     // probing runs). 0 == unknown -> treated as LAN so a missing RTT never enables WAN
@@ -729,6 +737,7 @@ int RunClient(const CliOptions& options) {
         sessionId = authInfo.sessionId;
         deltaEnabled = (options.deltaMinSizeBytes > 0) &&
                        ((authInfo.capabilities & kCapDelta) != 0);
+        serverCapFileRange = ((authInfo.capabilities & kCapFileRange) != 0);
 
         auto primaryConn = std::make_unique<ClientConnection>();
         primaryConn->connId = 0;
@@ -920,6 +929,45 @@ int RunClient(const CliOptions& options) {
     };
     std::unordered_map<uint64_t, ActiveDeltaRange> activeDeltaRanges;  // (connId,streamId) -> range
     uint64_t deltaReconstructed = 0;  // diagnostics: files completed via delta this session
+
+    // --- Large-file block (file-range) per-session state (T-largefile-block-multinic, §3.3) ---
+    // Independent containers mirroring the delta state machine but NEVER sharing it (AC-09
+    // isolation). Each block carries a fixed [offset,length) and lands at destOffset via the
+    // driver; FileRangeFileState.pendingRanges is the completion barrier (FileRangeEnd
+    // decrements); verifyHash is the whole-file XXH3-128 fetched via H1 (HashRequest) BEFORE
+    // any block fan-out (§3.8). length/received are u64 (wire width): the 4 GiB CLI block
+    // maximum would overflow u32.
+    struct FileRangeTask {
+        std::string rel;
+        uint64_t offset = 0;
+        uint64_t length = 0;
+    };
+    struct ActiveFileRange {
+        std::string rel;
+        uint64_t destOffset = 0;
+        uint64_t length = 0;
+        uint64_t received = 0;
+    };
+    struct FileRangeFileState {
+        uint64_t tempFileId = 0;        // driver write handle (delta temp semantics)
+        std::filesystem::path tempPath;
+        uint32_t pendingRanges = 0;     // completion barrier (FileRangeEnd decrements)
+        uint32_t submittedWrites = 0;
+        uint32_t completedWrites = 0;
+        bool writeError = false;
+        uint64_t fileSize = 0;
+        Hash256 verifyHash{};           // whole-file XXH3-128 reference (H1), finalize check
+    };
+    std::deque<FileRangeTask> pendingFileRanges;                     // blocks awaiting a lane
+    std::unordered_map<uint64_t, ActiveFileRange> activeFileRanges;  // (connId,streamId) -> block
+    std::unordered_map<std::string, FileRangeFileState> fileRangeStates;
+    std::deque<std::string> pendingFileRangePlans;        // hash-ready rels awaiting block plan
+    std::unordered_set<std::string> fileRangePendingHash; // admitted, H1 hash in flight (§3.8)
+    std::unordered_set<std::string> fileRangeAbandoned;   // never retry block mode this session
+    // Admission gate (§3.2). Declared here and ASSIGNED after healthyConnCount comes into
+    // scope; both call sites (handleCompareResult / resolveFallbackIfReady) only run from the
+    // main loop, long after the assignment.
+    std::function<bool(const std::string&)> tryEnterFileRange;
 
     // --- BuildPlan offload (design section 3.4, FR-07/FR-10) ---
     // The heavy delta reconstruct (old-file read + delta::BuildPlan + temp pre-write) used to
@@ -1349,6 +1397,9 @@ int RunClient(const CliOptions& options) {
                         case MsgType::DeltaRangeChunk:
                         case MsgType::DeltaRangeEnd:
                         case MsgType::DeltaError:
+                        case MsgType::FileRangeData:
+                        case MsgType::FileRangeEnd:
+                        case MsgType::FileRangeError:
                             break;  // legitimately server -> client
                         default: {
                             std::ostringstream os;
@@ -2054,7 +2105,9 @@ int RunClient(const CliOptions& options) {
         if (action == CompareAction::TransferNow) {
             // Size-different changed file (e.g. append/insert). delta gate G4 admits it only
             // when a readable local old version exists; brand-new files fall through to full.
-            if (!tryEnterDelta(relPath)) {
+            // Large-file block gate (T-largefile-block-multinic §3.2) is tried next: admitted
+            // files never enter regularQueue (they fan out as blocks after the H1 hash).
+            if (!tryEnterDelta(relPath) && !tryEnterFileRange(relPath)) {
                 scheduleTransfer(relPath);
             }
         } else if (action == CompareAction::Skip) {
@@ -2130,11 +2183,17 @@ int RunClient(const CliOptions& options) {
             }
             ++hashRequestsSent;
             outboundFrames.push_back(Frame{MsgType::HashRequest, 0, EncodeHashRequest(rel)});
-            {
+            if (!fileRangePendingHash.contains(rel)) {
+                // A fallback-hash request also needs the LOCAL hash for comparison. A block-mode
+                // H1 prefetch (T-largefile-block-multinic §3.8) needs only the REMOTE hash (the
+                // file is downloaded wholesale), so it must NOT enqueue a local hash task: the
+                // worker's completion would push rel into fallbackReadyQueue and the fallback
+                // machinery would double-schedule a file already managed by fileRangeStates
+                // (R-07 isolation).
                 std::lock_guard<std::mutex> lock(hashTaskMu);
                 hashTaskQueue.push_back(ClientHashTask{rel, JoinRel(options.rootDir, rel)});
+                hashTaskCv.notify_one();
             }
-            hashTaskCv.notify_one();
             if (outboundFrames.size() >= 256) {
                 if (!flushOutbound()) {
                     return;
@@ -2189,6 +2248,63 @@ int RunClient(const CliOptions& options) {
             }
         }
         return n;
+    };
+
+    // Large-file block mode admission gate (T-largefile-block-multinic §3.2,
+    // AC-01/04/05/07/08). Mirrors the tryEnterDelta layering: admitted files never enter
+    // regularQueue; they wait for the H1 verify hash, then fan out as blocks via
+    // tryStartFileRanges. All conditions required:
+    //   --large-file-block-kb explicitly given (opt-in, AC-07)  AND
+    //   server advertised kCapFileRange (AC-08)                 AND
+    //   remote fileSize >= largeFileThresholdBytes (AC-01/04)   AND
+    //   >= 2 healthy lanes (AC-01/05)                           AND
+    //   not already abandoned/managed this session (anti-loop).
+    tryEnterFileRange = [&](const std::string& rel) -> bool {
+        if (!options.largeFileBlockFlagged || !serverCapFileRange) {
+            return false;
+        }
+        if (fileRangeAbandoned.contains(rel) || fileRangeStates.contains(rel) ||
+            fileRangePendingHash.contains(rel)) {
+            return false;
+        }
+        const auto it = remoteFiles.find(rel);
+        if (it == remoteFiles.end() || it->second.fileSize < options.largeFileThresholdBytes) {
+            return false;  // not large -> legacy path (AC-04)
+        }
+        if (healthyConnCount() < 2) {
+            return false;  // single lane -> legacy single-stream path (AC-05)
+        }
+        FileRangeFileState st;
+        st.fileSize = it->second.fileSize;
+        auto [itState, inserted] = fileRangeStates.emplace(rel, std::move(st));
+        (void)inserted;
+        // H1 (§3.8): the whole-file verify hash must be on hand BEFORE any block fan-out.
+        bool hashReady = false;
+        {
+            std::lock_guard<std::mutex> lock(hashResultMu);
+            const auto hit = remoteHashes.find(rel);
+            if (hit != remoteHashes.end()) {
+                itState->second.verifyHash = hit->second;
+                hashReady = true;
+            }
+        }
+        if (hashReady) {
+            pendingFileRangePlans.push_back(rel);  // block plan on the next main-loop pass
+        } else {
+            // Prefetch via the existing HashRequest pipeline. Isolation (§3.8/R-07): the
+            // fileRangePendingHash ledger keeps this OUT of the fallback accounting
+            // (hashRequested/fallbackCount); the HashResponse branch routes the answer away
+            // from fallbackReadyQueue and dispatchHashRequests skips the local-hash task.
+            fileRangePendingHash.insert(rel);
+            pendingHashRequests.push_back(rel);
+            pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());
+        }
+        if (debugEnabled) {
+            std::cout << "[file_range] admit rel=" << rel << " sessionId=" << sessionId
+                      << " bytes=" << itState->second.fileSize
+                      << " hash_ready=" << (hashReady ? 1 : 0) << std::endl;
+        }
+        return true;
     };
 
     // Change 2 (fastcheck-perf-tune, FR-13): directory cache for the two EnsureParentDir call sites
@@ -2488,8 +2604,10 @@ int RunClient(const CliOptions& options) {
             // already gated out (!localHashReady && !localFailed), so localHashReady must be true; for readability this is
             // equivalent to !localFailed. Semantics match the old (localFailed || !localHashReady || !HashEquals(...)).
             if (ClassifyByHash(!localFailed, localHash, remoteHash) == CompareCategory::Diff) {
-                // Same size, content differs: try block-level delta before full download.
-                if (!tryEnterDelta(rel)) {
+                // Same size, content differs: try block-level delta, then large-file block
+                // mode (remote hash already on hand from this fallback resolution, so the H1
+                // prefetch is free), before a full single-stream download.
+                if (!tryEnterDelta(rel) && !tryEnterFileRange(rel)) {
                     scheduleTransfer(rel);
                 }
             } else {
@@ -2561,6 +2679,40 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    // Block-mode H1 hash backstop (T-largefile-block-multinic §3.8, R-08): when every
+    // dispatched HashRequest has been answered (fully quiescent control plane) yet a rel is
+    // still hash-pending, its request/response was LOST (e.g. a send-side frame drop), so it
+    // will never resolve. Never wait forever: abandon block mode and fall back to the
+    // single-stream path. A merely SLOW server-side hash keeps the request in flight
+    // (sent != received) and does NOT trip this sweep; a lane-down mid-wait is covered by
+    // the failoverScan re-request hook (mirrors the delta-sig requeue).
+    auto sweepFileRangePendingHashIfQuiescent = [&]() {
+        if (fileRangePendingHash.empty()) {
+            return;
+        }
+        if (!pendingHashRequests.empty()) {
+            return;
+        }
+        if (hashRequestsSent != hashResponsesReceived) {
+            return;
+        }
+        const std::vector<std::string> lost(fileRangePendingHash.begin(),
+                                            fileRangePendingHash.end());
+        for (const std::string& rel : lost) {
+            fileRangePendingHash.erase(rel);
+            auto itS = fileRangeStates.find(rel);
+            if (itS != fileRangeStates.end()) {
+                // No temp was opened and no block was fanned out yet (the plan runs only
+                // after the hash lands), so there is nothing to clean up.
+                fileRangeStates.erase(itS);
+            }
+            fileRangeAbandoned.insert(rel);
+            std::cerr << "[warn][client] file_range_hash_lost path=" << rel
+                      << " -> single-stream fallback" << std::endl;
+            scheduleTransfer(rel);
+        }
+    };
+
     // Compare-task hand-off is now the pipeline's Enqueue (single-producer buffer, no lock) + Flush
     // (one lock + notify_all for the whole drained batch). enqueueCompareTask/flushCompareDispatch are
     // thin wrappers so the existing call sites stay readable (fastcheck-compare-pipeline §8 extraction).
@@ -2581,49 +2733,43 @@ int RunClient(const CliOptions& options) {
         return p;
     };
 
-    // Reconstruction complete: verify the temp file against the manifest XXH3-128 (FR-23) and
-    // either atomic-rename it into place (NFR-05) or discard + abandon delta + full fallback.
-    auto finalizeDelta = [&](const std::string& rel) {
-        auto it = deltaStates.find(rel);
-        if (it == deltaStates.end()) {
-            return;
-        }
-        DeltaFileState& st = it->second;
+    // Shared temp-file finalize tail (T-largefile-block-multinic §3.4 FinalizeTempFile):
+    // gate every submitted write to completion, close + size-finalize the temp handle,
+    // fsync, run the whole-file XXH3-128 verify read against verifyHash, atomic-rename into
+    // place and stamp the manifest mtime. Extracted VERBATIM from finalizeDelta so the delta
+    // and large-file block paths share the one verify/rename implementation (§7 regression
+    // minimisation). On any failure the temp is removed here and the caller runs its own
+    // fallback bookkeeping (reason split: IoFailure vs VerifyFailure).
+    enum class TempFinalizeResult { Ok, IoFailure, VerifyFailure };
+    auto finalizeTempVerifyRename = [&](const std::string& rel, uint64_t& tempFileId,
+                                        const fs::path& tempPath, uint32_t submittedWrites,
+                                        uint32_t& completedWrites, bool& writeError,
+                                        const Hash256& verifyHash) -> TempFinalizeResult {
         // unbuffered-writes FR-08/D-06: gate on every copy + range write completing before the
         // verify read / rename, so the verify never races a still-in-flight write. Then close the
-        // temp handle (SetEndOfFile/ftruncate -> exact size, trimming any tail beyond newFileBytes).
-        drainFileWritesToCompletion(st.tempFileId, st.submittedWrites, st.completedWrites,
-                                    st.writeError);
+        // temp handle (SetEndOfFile/ftruncate -> exact size, trimming any tail beyond the file).
+        drainFileWritesToCompletion(tempFileId, submittedWrites, completedWrites, writeError);
         // W-01: closeFile now returns whether the finalize (ftruncate/SetEndOfFile) + close
         // succeeded; fold it into the temp-write success so a finalize failure falls back to a full
-        // download instead of proceeding to verify a truncated/short temp (FR-02/B7). The delta temp
+        // download instead of proceeding to verify a truncated/short temp (FR-02/B7). The temp
         // has no recorded mtime (mtime is stamped on the renamed target below), so close does size
         // finalize + handle close only.
         bool closeOk = true;
-        if (st.tempFileId != 0) {
-            closeOk = clientDriver.closeFile(st.tempFileId);
-            st.tempFileId = 0;
+        if (tempFileId != 0) {
+            closeOk = clientDriver.closeFile(tempFileId);
+            tempFileId = 0;
         }
-        const bool tempWriteOk = !st.writeError && closeOk;
+        const bool tempWriteOk = !writeError && closeOk;
         if (!tempWriteOk) {
-            // A copy/range write failed: discard + fall back to a full download (FR-16), same as
-            // the former ofstream/reconstruct_io failure path.
+            // A copy/range write failed: discard (the caller falls back to a full download).
             std::error_code rec;
-            fs::remove(st.tempPath, rec);
-            deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
-            deltaAbandoned.insert(rel);
-            deltaStates.erase(it);
-            scheduleTransfer(rel);
-            return;
+            fs::remove(tempPath, rec);
+            return TempFinalizeResult::IoFailure;
         }
-        if (!st.tempPath.empty() && !SyncFileToDisk(st.tempPath)) {
+        if (!tempPath.empty() && !SyncFileToDisk(tempPath)) {
             std::error_code rec;
-            fs::remove(st.tempPath, rec);
-            deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
-            deltaAbandoned.insert(rel);
-            deltaStates.erase(it);
-            scheduleTransfer(rel);
-            return;
+            fs::remove(tempPath, rec);
+            return TempFinalizeResult::IoFailure;
         }
         const fs::path target = JoinRel(options.rootDir, rel);
         bool verifyOk = false;
@@ -2633,7 +2779,7 @@ int RunClient(const CliOptions& options) {
         try {
             std::error_code szEc;
             const uint64_t verifySize =
-                static_cast<uint64_t>(fs::file_size(st.tempPath, szEc));
+                static_cast<uint64_t>(fs::file_size(tempPath, szEc));
             if (szEc) {
                 verifyOk = false;
             } else {
@@ -2641,7 +2787,7 @@ int RunClient(const CliOptions& options) {
                 // read above as the read-open expectedSize so the backend skips the redundant
                 // Windows FileSizeOnDisk query. The verify read bytes/decision are unchanged.
                 const uint64_t fid = clientDriver.openFile(
-                    fc::PathToUtf8(st.tempPath), fc::io::OpKind::Read, /*unbuffered=*/true, verifySize);
+                    fc::PathToUtf8(tempPath), fc::io::OpKind::Read, /*unbuffered=*/true, verifySize);
                 if (fid == 0) {
                     verifyOk = false;
                 } else {
@@ -2677,34 +2823,48 @@ int RunClient(const CliOptions& options) {
                     };
                     const Hash256 got = ComputeHashFromSource(src);
                     clientDriver.closeFile(fid);
-                    verifyOk = !rerr && HashEquals(got, st.verifyHash);
+                    verifyOk = !rerr && HashEquals(got, verifyHash);
                 }
             }
         } catch (...) {
             verifyOk = false;
         }
         std::error_code rec;
-        if (verifyOk) {
-            bool renamed = false;
+        if (!verifyOk) {
+            fs::remove(tempPath, rec);
+            return TempFinalizeResult::VerifyFailure;
+        }
+        bool renamed = false;
 #ifdef _WIN32
-            renamed = (MoveFileExW(st.tempPath.wstring().c_str(), target.wstring().c_str(),
-                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0);
+        renamed = (MoveFileExW(tempPath.wstring().c_str(), target.wstring().c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0);
 #else
-            fs::rename(st.tempPath, target, rec);
-            renamed = !rec;
+        fs::rename(tempPath, target, rec);
+        renamed = !rec;
 #endif
-            if (!renamed) {
-                fs::remove(st.tempPath, rec);
-                deltaFallback(rel, "reconstruct_io", st.newFileBytes, st.newFileBytes);
-                deltaAbandoned.insert(rel);
-                deltaStates.erase(it);
-                scheduleTransfer(rel);
-                return;
-            }
-            const auto metaIt = remoteFiles.find(rel);
-            if (metaIt != remoteFiles.end()) {
-                SetFileModifyTime(target, metaIt->second.mtimeNs);
-            }
+        if (!renamed) {
+            fs::remove(tempPath, rec);
+            return TempFinalizeResult::IoFailure;
+        }
+        const auto metaIt = remoteFiles.find(rel);
+        if (metaIt != remoteFiles.end()) {
+            SetFileModifyTime(target, metaIt->second.mtimeNs);
+        }
+        return TempFinalizeResult::Ok;
+    };
+
+    // Reconstruction complete: verify the temp file against the manifest XXH3-128 (FR-23) and
+    // either atomic-rename it into place (NFR-05) or discard + abandon delta + full fallback.
+    auto finalizeDelta = [&](const std::string& rel) {
+        auto it = deltaStates.find(rel);
+        if (it == deltaStates.end()) {
+            return;
+        }
+        DeltaFileState& st = it->second;
+        const TempFinalizeResult fin =
+            finalizeTempVerifyRename(rel, st.tempFileId, st.tempPath, st.submittedWrites,
+                                     st.completedWrites, st.writeError, st.verifyHash);
+        if (fin == TempFinalizeResult::Ok) {
             ++compared;
             ++transferred;
             ++deltaReconstructed;
@@ -2719,10 +2879,51 @@ int RunClient(const CliOptions& options) {
                           << " bytes=" << reconstructedBytes << std::endl;
             }
         } else {
-            fs::remove(st.tempPath, rec);
-            deltaFallback(rel, "verify_fail", st.newFileBytes, st.newFileBytes);  // FR-24 / AC-08
+            // Write/close/fsync/rename failure -> "reconstruct_io" (FR-16); whole-file hash
+            // mismatch -> "verify_fail" (FR-24 / AC-08). Both discard + abandon + full fallback.
+            deltaFallback(rel,
+                          fin == TempFinalizeResult::VerifyFailure ? "verify_fail" : "reconstruct_io",
+                          st.newFileBytes, st.newFileBytes);
             deltaAbandoned.insert(rel);
             deltaStates.erase(it);
+            scheduleTransfer(rel);
+        }
+        PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
+                            lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
+    };
+
+    // Large-file block finalize (T-largefile-block-multinic §3.4): all blocks landed (the
+    // pendingRanges barrier reached 0) -> drain writes, verify the whole temp against the H1
+    // verifyHash, atomic-rename + mtime stamp. Any failure abandons block mode for this file
+    // this session and falls back to the legacy single-stream whole-file download (the
+    // single-stream path's own integrity story guarantees bit-exactness; no per-block retry).
+    auto finalizeFileRange = [&](const std::string& rel) {
+        auto it = fileRangeStates.find(rel);
+        if (it == fileRangeStates.end()) {
+            return;
+        }
+        FileRangeFileState& st = it->second;
+        const TempFinalizeResult fin =
+            finalizeTempVerifyRename(rel, st.tempFileId, st.tempPath, st.submittedWrites,
+                                     st.completedWrites, st.writeError, st.verifyHash);
+        if (fin == TempFinalizeResult::Ok) {
+            ++compared;
+            ++transferred;
+            ++driverPathFiles;  // the block temp was written via the driver path
+            transferRetryCounts.erase(rel);
+            const uint64_t doneBytes = st.fileSize;
+            fileRangeStates.erase(it);
+            if (debugEnabled) {
+                std::cout << "[file_range] done rel=" << rel << " sessionId=" << sessionId
+                          << " bytes=" << doneBytes << std::endl;
+            }
+        } else {
+            std::cerr << "[warn][client] file_range_finalize_failed rel=" << rel
+                      << " reason="
+                      << (fin == TempFinalizeResult::VerifyFailure ? "verify_fail" : "io")
+                      << " -> single-stream fallback" << std::endl;
+            fileRangeAbandoned.insert(rel);
+            fileRangeStates.erase(it);
             scheduleTransfer(rel);
         }
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
@@ -3044,6 +3245,114 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    // --- Large-file block (file-range) fan-out (T-largefile-block-multinic §3.3) ---
+
+    // H1 hash ready -> open the temp and slice the block plan. The tail block is clamped to
+    // fileSize (AC-10); a 0-byte file gets an empty plan and finalizes immediately (AC-11,
+    // defensive: the isLarge gate already excludes empty files). closeFile's expectedSize
+    // truncates any tail overhang, so a non-multiple tail block never writes out of bounds.
+    auto beginFileRangePlan = [&](const std::string& rel) {
+        auto itS = fileRangeStates.find(rel);
+        if (itS == fileRangeStates.end()) {
+            return;  // abandoned/errored while queued
+        }
+        FileRangeFileState& st = itS->second;
+        if (st.tempFileId != 0) {
+            return;  // plan already built (duplicate queue entry)
+        }
+        const fs::path abs = JoinRel(options.rootDir, rel);
+        EnsureParentDir(abs, mainThreadDirCache);
+        const fs::path tmp = makeDeltaTempPath(abs);  // reuse the delta temp naming convention
+        const uint64_t tempFileId = clientDriver.openFile(
+            fc::PathToUtf8(tmp), fc::io::OpKind::Write, unbufferedWrites, st.fileSize);
+        if (tempFileId == 0) {
+            // Temp open failed: abandon block mode, fall back to the single-stream path.
+            fileRangeAbandoned.insert(rel);
+            fileRangeStates.erase(itS);
+            scheduleTransfer(rel);
+            return;
+        }
+        st.tempFileId = tempFileId;
+        st.tempPath = tmp;
+        const uint64_t blockSize = std::min<uint64_t>(options.largeFileBlockBytes, st.fileSize);
+        uint32_t blockCount = 0;
+        uint64_t off = 0;
+        while (off < st.fileSize) {
+            const uint64_t len = std::min<uint64_t>(blockSize, st.fileSize - off);
+            pendingFileRanges.push_back(FileRangeTask{rel, off, len});
+            off += len;
+            ++blockCount;
+        }
+        st.pendingRanges = blockCount;
+        if (debugEnabled) {
+            std::cout << "[file_range] plan rel=" << rel << " sessionId=" << sessionId
+                      << " bytes=" << st.fileSize << " block=" << blockSize
+                      << " blocks=" << blockCount << std::endl;
+        }
+        if (blockCount == 0) {
+            finalizeFileRange(rel);  // empty file: nothing to fetch (AC-11)
+        }
+    };
+
+    auto pumpFileRangePlans = [&]() {
+        while (!pendingFileRangePlans.empty()) {
+            const std::string rel = pendingFileRangePlans.front();
+            pendingFileRangePlans.pop_front();
+            if (!fileRangeStates.contains(rel)) {
+                continue;  // abandoned/errored meanwhile
+            }
+            if (fileRangePendingHash.contains(rel)) {
+                continue;  // defensive: plan only after the H1 hash lands (§3.8)
+            }
+            beginFileRangePlan(rel);
+        }
+    };
+
+    // Assign queued blocks to healthy lanes (mirrors tryStartDeltaRanges; reuses
+    // pickConnection(false) weighted least-load so the blocks spread across ALL healthy
+    // lanes -- the multi-NIC aggregation point, AC-01). Runs only once the H1 verify hash
+    // is on hand (the plan itself is gated on it, so the pendingHash check is defensive).
+    auto tryStartFileRanges = [&]() {
+        while (!pendingFileRanges.empty()) {
+            const FileRangeTask& peek = pendingFileRanges.front();
+            if (!fileRangeStates.contains(peek.rel)) {
+                pendingFileRanges.pop_front();  // file abandoned by a sibling block
+                continue;
+            }
+            if (fileRangePendingHash.contains(peek.rel)) {
+                break;  // H1 hash not ready yet; retry next pass (§3.8)
+            }
+            ClientConnection* conn = pickConnection(false);
+            if (conn == nullptr) {
+                break;  // all lanes saturated; retry next pass
+            }
+            FileRangeTask task = pendingFileRanges.front();
+            pendingFileRanges.pop_front();
+            const uint32_t sid = conn->nextStreamId++;
+            const uint64_t k = streamKey(conn->connId, sid);
+            FileRangeOpenReq req;
+            req.relPath = task.rel;
+            req.offset = task.offset;
+            req.length = task.length;
+            try {
+                SendFrame(conn->socket, Frame{MsgType::FileRangeOpen, sid, EncodeFileRangeOpen(req)});
+            } catch (const std::exception& ex) {
+                markConnDown(conn, ex.what());
+                pendingFileRanges.push_front(task);  // re-route to a healthy lane (AC-03)
+                break;
+            }
+            activeFileRanges.emplace(k, ActiveFileRange{task.rel, task.offset, task.length, 0});
+            ++conn->inFlight;
+            if (debugEnabled) {
+                std::cout << "[mp] alloc kind=file_range connId=" << conn->connId
+                          << " sessionId=" << sessionId << " stream=" << sid
+                          << " path=" << task.rel << " offset=" << task.offset
+                          << " bytes=" << task.length
+                          << " primary=" << (conn->isPrimary ? 1 : 0) << std::endl;
+            }
+        }
+    };
+
     auto processIncomingFrame = [&](uint32_t connId, Frame& frame) {
         // Resolve the originating lane (connId == pool index; pool never reorders). Used
         // for per-connection (connId,streamId) demux and in-flight accounting.
@@ -3125,7 +3434,21 @@ int RunClient(const CliOptions& options) {
                 std::lock_guard<std::mutex> lock(hashResultMu);
                 remoteHashes[value.first] = value.second;
             }
-            {
+            if (fileRangePendingHash.erase(value.first) > 0) {
+                // Block-mode H1 prefetch resolved (§3.8): adopt the hash and queue the block
+                // plan; deliberately NOT pushed into fallbackReadyQueue (R-07 isolation).
+                auto itS = fileRangeStates.find(value.first);
+                if (itS != fileRangeStates.end()) {
+                    itS->second.verifyHash = value.second;
+                    pendingFileRangePlans.push_back(value.first);
+                }
+            } else if (fileRangeStates.contains(value.first) &&
+                       !hashRequested.contains(value.first)) {
+                // Late/duplicate H1 response for a pure block-mode file (e.g. the failoverScan
+                // re-request after a lane drop): already resolved, keep it out of the fallback
+                // machinery (R-07). A file that went through fallback-hash admission has
+                // hashRequested set and falls through to the normal fallback queue below.
+            } else {
                 std::lock_guard<std::mutex> lock(fallbackReadyMu);
                 fallbackReadyQueue.push_back(value.first);
             }
@@ -3445,6 +3768,85 @@ int RunClient(const CliOptions& options) {
                 deltaFallback(rel, "sig_error", 0, 0);
                 scheduleTransfer(rel);
             }
+        } else if (frame.type == MsgType::FileRangeData) {
+            // Large-file block data (T-largefile-block-multinic §3.4): land the bytes at
+            // destOffset+received in the temp via the driver (blocking submit so none are
+            // dropped), then reap to keep the budget tight. Mirrors DeltaRangeChunk.
+            auto itR = activeFileRanges.find(key);
+            if (itR == activeFileRanges.end()) {
+                if (staleFromDeadLane()) { return; }
+                throw std::runtime_error("Received file range data for unknown stream");
+            }
+            ActiveFileRange& r = itR->second;
+            auto itS = fileRangeStates.find(r.rel);
+            if (itS != fileRangeStates.end() && itS->second.tempFileId != 0 && !frame.payload.empty()) {
+                FileRangeFileState& fst = itS->second;
+                submitDriverWrite(fst.tempFileId, r.destOffset + r.received, frame.payload.data(),
+                                  static_cast<uint32_t>(frame.payload.size()), /*blocking=*/true,
+                                  fst.submittedWrites, fst.completedWrites, fst.writeError);
+                reapDriverWrites(fst.tempFileId, fst.completedWrites, fst.writeError);
+            }
+            r.received += static_cast<uint64_t>(frame.payload.size());
+        } else if (frame.type == MsgType::FileRangeEnd) {
+            auto itR = activeFileRanges.find(key);
+            if (itR == activeFileRanges.end()) {
+                if (staleFromDeadLane()) { return; }
+                throw std::runtime_error("Received file range end for unknown stream");
+            }
+            const std::string rel = itR->second.rel;
+            activeFileRanges.erase(itR);
+            releaseSlot();
+            auto itS = fileRangeStates.find(rel);
+            if (itS != fileRangeStates.end()) {
+                // Completion barrier (§3.4): decremented ONLY here (never on Data), so a
+                // lane-down block re-send never corrupts the count (AC-03 idempotency).
+                if (itS->second.pendingRanges > 0) {
+                    --itS->second.pendingRanges;
+                }
+                if (itS->second.pendingRanges == 0) {
+                    finalizeFileRange(rel);
+                }
+            }
+        } else if (frame.type == MsgType::FileRangeError) {
+            // Range open/read failed server-side -> abandon block mode for this file this
+            // session and fall back to the single-stream whole-file path (§3.2/§3.4). The
+            // frame may be range-tagged (streamId) or open-level; resolve rel from either.
+            std::string rel = DecodeFileRangeError(frame.payload);
+            auto itR = activeFileRanges.find(key);
+            if (itR != activeFileRanges.end()) {
+                rel = itR->second.rel;
+                activeFileRanges.erase(itR);
+                releaseSlot();
+            }
+            noteCtrlEvent();
+            fileRangePendingHash.erase(rel);  // defensive: no block-mode hash stays pending
+            auto itS = fileRangeStates.find(rel);
+            if (itS != fileRangeStates.end()) {
+                FileRangeFileState& fst = itS->second;
+                // Reap any in-flight temp writes to balance the budget, then close + remove.
+                drainFileWritesToCompletion(fst.tempFileId, fst.submittedWrites,
+                                            fst.completedWrites, fst.writeError);
+                if (fst.tempFileId != 0) {
+                    clientDriver.closeFile(fst.tempFileId);
+                    fst.tempFileId = 0;
+                }
+                std::error_code rec;
+                if (!fst.tempPath.empty()) {
+                    fs::remove(fst.tempPath, rec);
+                }
+                fileRangeStates.erase(itS);
+            }
+            // Sibling blocks of the same file still in flight land on dead state and are
+            // dropped by the guards above; queued siblings are skipped by tryStartFileRanges'
+            // fileRangeStates check. fileRangeAbandoned blocks a block-mode re-entry loop.
+            if (!fileRangeAbandoned.contains(rel)) {
+                fileRangeAbandoned.insert(rel);
+                if (debugEnabled || diagnostics) {
+                    std::cerr << "[file_range] error rel=" << rel
+                              << " -> single-stream fallback" << std::endl;
+                }
+                scheduleTransfer(rel);
+            }
         } else {
             {
                 std::ostringstream os;
@@ -3551,6 +3953,15 @@ int RunClient(const CliOptions& options) {
                                 deltaPlanInFlightNow > 0);
         if (deltaBusy) {
             addStallTag("delta_wait");
+        }
+        // file_range_wait: large-file block state machine is not idle (T-largefile-block-multinic
+        // §3.6): hash pending, plan queued, blocks queued/in flight, or finalize outstanding.
+        const bool fileRangeBusy =
+            !fileRangeStates.empty() || !pendingFileRanges.empty() ||
+            !activeFileRanges.empty() || !fileRangePendingHash.empty() ||
+            !pendingFileRangePlans.empty();
+        if (fileRangeBusy) {
+            addStallTag("file_range_wait");
         }
         const bool waitingForNetwork = (!manifestDone) || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
                                        (hashResponsesReceived < hashRequestsSent);
@@ -3693,6 +4104,28 @@ int RunClient(const CliOptions& options) {
                     activeDeltaRanges.erase(it);
                 }
             }
+            // Large-file block (T-largefile-block-multinic §3.5): requeue this lane's in-flight
+            // blocks. Each block carries its own [offset,length) and writes at a fixed
+            // destOffset, so re-fetching the WHOLE block on a healthy lane is idempotent;
+            // pendingRanges is only decremented on FileRangeEnd, so the barrier count stays
+            // correct across the re-route. Worst case one full block is re-sent (AC-03).
+            std::vector<uint64_t> fileRangeKeys;
+            for (auto& kv : activeFileRanges) {
+                if (static_cast<uint32_t>(kv.first >> 32) == connId) {
+                    fileRangeKeys.push_back(kv.first);
+                }
+            }
+            for (uint64_t k : fileRangeKeys) {
+                auto it = activeFileRanges.find(k);
+                if (it != activeFileRanges.end()) {
+                    if (fileRangeStates.contains(it->second.rel)) {
+                        pendingFileRanges.push_back(
+                            FileRangeTask{it->second.rel, it->second.destOffset, it->second.length});
+                        ++requeued;
+                    }
+                    activeFileRanges.erase(it);
+                }
+            }
             c->inFlight = 0;
             c->drained = true;
             ShutdownBoth(c->socket);
@@ -3718,6 +4151,15 @@ int RunClient(const CliOptions& options) {
                         --deltaSigInFlight;
                     }
                 }
+            }
+            // Block-mode H1 prefetch re-request (T-largefile-block-multinic §3.8, mirrors the
+            // delta-sig requeue above): a HashResponse lost with the dead lane would otherwise
+            // leave fileRangePendingHash stuck. Re-requesting is idempotent -- the first
+            // response resolves the pending entry, late duplicates are ignored by the
+            // HashResponse branch's fileRange guard.
+            for (const std::string& rel : fileRangePendingHash) {
+                pendingHashRequests.push_back(rel);
+                pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());
             }
         }
         if (healthyConnCount() == 0 && !recvClosed.load()) {
@@ -3811,6 +4253,10 @@ int RunClient(const CliOptions& options) {
                 }
             }
             tryStartDeltaRanges();
+            // Large-file block (T-largefile-block-multinic): build block plans for hash-ready
+            // files, then fan blocks out across all healthy lanes.
+            pumpFileRangePlans();
+            tryStartFileRanges();
             {
                 // Drain compare results from the shared pipeline and map each outcome to the client's
                 // CompareAction via the single outcome->action truth table (CompareActionFromOutcome),
@@ -3985,9 +4431,13 @@ int RunClient(const CliOptions& options) {
                     !deltaStates.empty() || !pendingDeltaSigRequests.empty() ||
                     !pendingDeltaRanges.empty() || !activeDeltaRanges.empty() ||
                     deltaPlanInFlight.load(std::memory_order_relaxed) != 0;
+                const bool fileRangeBusy =
+                    !fileRangeStates.empty() || !pendingFileRanges.empty() ||
+                    !activeFileRanges.empty() || !fileRangePendingHash.empty() ||
+                    !pendingFileRangePlans.empty();
                 const bool ctrlWorkOutstanding =
                     !manifestDone || (hashRequestsSent != hashResponsesReceived) ||
-                    !pendingHashRequests.empty() || deltaBusy;
+                    !pendingHashRequests.empty() || deltaBusy || fileRangeBusy;
                 if (ctrlWorkOutstanding) {
                     const double gap = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - lastCtrlEventAt).count();
@@ -4128,16 +4578,24 @@ int RunClient(const CliOptions& options) {
             const bool deltaIdle = deltaStates.empty() && pendingDeltaSigRequests.empty() &&
                                    pendingDeltaRanges.empty() && activeDeltaRanges.empty() &&
                                    deltaPlanInFlight.load(std::memory_order_relaxed) == 0;
+            // T-largefile-block-multinic §3.6: the main loop must not exit (or stop waiting
+            // on the network) while any block-mode file is mid-flight, else the transfer
+            // would be cut off before finalize.
+            const bool fileRangeIdle = fileRangeStates.empty() && pendingFileRanges.empty() &&
+                                       activeFileRanges.empty() && fileRangePendingHash.empty() &&
+                                       pendingFileRangePlans.empty();
             if (manifestDone && allCompareDone &&
                 pendingTransfers.empty() && pendingBatchTransfers.empty() &&
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone &&
-                ioOutstanding == 0 && deltaIdle) {
+                ioOutstanding == 0 && deltaIdle && fileRangeIdle) {
                 break;
             }
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
-                                          (hashResponsesReceived < hashRequestsSent) || !deltaIdle;
+                                          (hashResponsesReceived < hashRequestsSent) || !deltaIdle ||
+                                          !fileRangeIdle;
             sweepUnresolvedFallbackIfQuiescent();
+            sweepFileRangePendingHashIfQuiescent();
             // recvClosed means EVERY lane is down (failoverScan). When a send-side failure
             // requeued the last lane's work, there may be no in-flight network state left, so
             // needNetworkFrame is false even though the session is gone. Don't spin here: fall

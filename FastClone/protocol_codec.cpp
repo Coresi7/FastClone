@@ -20,6 +20,8 @@ std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info) {
     }
     // FC7 connection-level capability bits, appended last (binary-delta section 8.1).
     payload.push_back(info.capabilities);
+    // Extension string appended after the capability byte (T-largefile-block-multinic).
+    AppendString(payload, info.extensionString);
     return payload;
 }
 
@@ -47,13 +49,56 @@ AuthOkInfo DecodeAuthOk(const std::vector<uint8_t>& payload) {
     if (cursor < payload.size()) {
         info.capabilities = payload[cursor++];
     }
+    // Extension string trails the capability byte; absent => "" (same tolerant style).
+    if (cursor < payload.size()) {
+        info.extensionString = ReadString(payload, cursor);
+    }
     return info;
+}
+
+std::vector<uint8_t> EncodeAuthClaim(const std::string& password, uint8_t capabilities,
+                                     const std::string& extensionString) {
+    // Bare password bytes first (legacy shape), then the trailing capability byte and
+    // extension string (T-largefile-block-multinic).
+    std::vector<uint8_t> payload(password.begin(), password.end());
+    payload.push_back(capabilities);
+    AppendString(payload, extensionString);
+    return payload;
+}
+
+bool DecodeAuthClaim(const std::vector<uint8_t>& payload, const std::string& expectedPassword,
+                     AuthClaimInfo& out) {
+    out = AuthClaimInfo{};
+    if (payload.size() < expectedPassword.size() ||
+        !std::equal(expectedPassword.begin(), expectedPassword.end(),
+                    reinterpret_cast<const char*>(payload.data()),
+                    reinterpret_cast<const char*>(payload.data()) + expectedPassword.size())) {
+        return false;  // password prefix mismatch -> authentication failure
+    }
+    size_t cursor = expectedPassword.size();
+    // Trailing fields are read only while bytes remain (tolerant): a legacy bare-password
+    // payload decodes with capabilities=0 / extensionString="".
+    if (cursor < payload.size()) {
+        out.capabilities = payload[cursor++];
+    }
+    if (cursor + 2 <= payload.size()) {
+        const uint16_t extLen = static_cast<uint16_t>(payload[cursor]) |
+                                static_cast<uint16_t>(static_cast<uint16_t>(payload[cursor + 1]) << 8);
+        if (cursor + 2 + extLen <= payload.size()) {
+            out.extensionString.assign(reinterpret_cast<const char*>(payload.data() + cursor + 2),
+                                       extLen);
+        }
+    }
+    return true;
 }
 
 std::vector<uint8_t> EncodeSessionJoin(const SessionJoinInfo& info) {
     std::vector<uint8_t> payload;
     AppendString(payload, info.sessionId);
     AppendString(payload, info.password);
+    // Client capability byte + extension string trail the password (T-largefile-block-multinic).
+    payload.push_back(info.capabilities);
+    AppendString(payload, info.extensionString);
     return payload;
 }
 
@@ -62,6 +107,14 @@ SessionJoinInfo DecodeSessionJoin(const std::vector<uint8_t>& payload) {
     SessionJoinInfo info;
     info.sessionId = ReadString(payload, cursor);
     info.password = ReadString(payload, cursor);
+    // Trailing capability byte / extension string: read only while bytes remain, so a
+    // legacy payload (sessionId + password only) decodes with defaults.
+    if (cursor < payload.size()) {
+        info.capabilities = payload[cursor++];
+    }
+    if (cursor < payload.size()) {
+        info.extensionString = ReadString(payload, cursor);
+    }
     return info;
 }
 
@@ -300,6 +353,34 @@ DeltaRangeRequest DecodeDeltaRangeOpen(const std::vector<uint8_t>& payload) {
     req.offset = ReadU64(payload, cursor);
     req.length = ReadU64(payload, cursor);
     return req;
+}
+
+std::vector<uint8_t> EncodeFileRangeOpen(const FileRangeOpenReq& req) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, req.relPath);
+    AppendU64(payload, req.offset);
+    AppendU64(payload, req.length);
+    return payload;
+}
+
+FileRangeOpenReq DecodeFileRangeOpen(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    FileRangeOpenReq req;
+    req.relPath = ReadString(payload, cursor);
+    req.offset = ReadU64(payload, cursor);
+    req.length = ReadU64(payload, cursor);
+    return req;
+}
+
+std::vector<uint8_t> EncodeFileRangeError(const std::string& relPath) {
+    std::vector<uint8_t> payload;
+    AppendString(payload, relPath);
+    return payload;
+}
+
+std::string DecodeFileRangeError(const std::vector<uint8_t>& payload) {
+    size_t cursor = 0;
+    return ReadString(payload, cursor);
 }
 
 }  // namespace fc

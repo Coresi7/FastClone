@@ -166,7 +166,11 @@ const char* MsgTypeName(uint8_t typeByte) {
         case MsgType::FileBatchOpen: return "FileBatchOpen";
         case MsgType::FileBatchChunk: return "FileBatchChunk";
         case MsgType::FileBatchEnd: return "FileBatchEnd";
+        case MsgType::FileRangeOpen: return "FileRangeOpen";
+        case MsgType::FileRangeData: return "FileRangeData";
+        case MsgType::FileRangeEnd: return "FileRangeEnd";
         case MsgType::SyncDone: return "SyncDone";
+        case MsgType::FileRangeError: return "FileRangeError";
         case MsgType::Error: return "Error";
     }
     return "?";
@@ -199,7 +203,11 @@ bool IsKnownMsgType(uint8_t typeByte) {
         case MsgType::FileBatchOpen:
         case MsgType::FileBatchChunk:
         case MsgType::FileBatchEnd:
+        case MsgType::FileRangeOpen:
+        case MsgType::FileRangeData:
+        case MsgType::FileRangeEnd:
         case MsgType::SyncDone:
+        case MsgType::FileRangeError:
         case MsgType::Error:
             return true;
     }

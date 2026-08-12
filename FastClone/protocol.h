@@ -40,7 +40,15 @@ enum class MsgType : uint8_t {
     FileBatchOpen = 34,
     FileBatchChunk = 35,
     FileBatchEnd = 36,
+    // Large-file block (file-range) transfer (FC7 additive, T-largefile-block-multinic).
+    // Independent message types (not reusing DeltaRange*) so the large-file block state
+    // machine stays isolated from the delta state machine. Sent only after both ends
+    // negotiated the kCapFileRange capability bit (client_handshake.h).
+    FileRangeOpen = 37,   // C->S: relPath + offset + length (stream id in frame header)
+    FileRangeData = 38,   // S->C: raw range bytes (appended in send order to the stream)
+    FileRangeEnd = 39,    // S->C: empty (range complete)
     SyncDone = 40,
+    FileRangeError = 41,  // S->C: relPath (range open/read failure -> client single-stream fallback)
     Error = 255
 };
 

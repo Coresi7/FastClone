@@ -320,6 +320,20 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             } else {
                 throw std::runtime_error("Invalid --large-file-lane (expected primary|aux|auto)");
             }
+        } else if (arg == "--large-file-block-kb") {
+            // Large-file block mode opt-in (T-largefile-block-multinic, AC-13). The value is a
+            // block size in KiB; giving the flag at all enables the mode (largeFileBlockFlagged).
+            // Strict validation: power-of-two KiB in [1024, 4194304] (= [1 MiB, 4 GiB]); anything
+            // else throws instead of silently adopting a dangerous default.
+            const long blockKb = ParseLongStrict(ArgAt(args, ++i), "--large-file-block-kb");
+            constexpr long kMinKb = 1024;             // 1 MiB lower bound
+            constexpr long kMaxKb = 4 * 1024 * 1024;  // 4 GiB upper bound
+            if (blockKb < kMinKb || blockKb > kMaxKb || (blockKb & (blockKb - 1)) != 0) {
+                throw std::runtime_error(
+                    "Invalid --large-file-block-kb (range: 1024..4194304, power of two)");
+            }
+            options.largeFileBlockBytes = static_cast<uint64_t>(blockKb) * 1024ULL;
+            options.largeFileBlockFlagged = true;
         } else if (arg == "--link") {
             options.linkPins.push_back(ParseLinkPin(ArgAt(args, ++i), options.port));
         } else if (arg == "--password") {
@@ -449,6 +463,7 @@ std::string BuildUsageText() {
         "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
+        "      [--large-file-block-kb <n>]\n"
         "      [--delta-min-size <size>] [--unbuffered-writes]\n"
         "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -460,6 +475,14 @@ std::string BuildUsageText() {
         "      values pull proportionally more transfers onto aux links.\n"
         "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
         "      --aux-weight >= 2.0, else primary); default auto.\n"
+        "  --large-file-block-kb (opt-in, default OFF) enables large-file block mode: files >=\n"
+        "      --large-file-threshold are sliced into <n> KiB blocks (range 1024..4194304, power\n"
+        "      of two; 32768 = the 32 MiB reference block size) fetched in parallel\n"
+        "      across ALL healthy links, then verified whole-file (XXH3-128) before an atomic\n"
+        "      rename. Takes effect only with >=2 healthy links and a server advertising the\n"
+        "      file-range capability; otherwise the legacy single-stream path runs unchanged.\n"
+        "      Small files and single-link syncs are never affected. When block mode is on,\n"
+        "      --large-file-lane only applies to large files NOT in block mode.\n"
         "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
         "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
         "  --unbuffered-writes (client-only, default off) sets unbuffered write INTENT for client\n"

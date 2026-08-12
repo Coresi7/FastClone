@@ -221,8 +221,12 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
     NegotiateHelloAsServer(socket);
     const Frame claim = RecvFrame(socket);
     if (claim.type == MsgType::Auth) {
-        const std::string got(reinterpret_cast<const char*>(claim.payload.data()), claim.payload.size());
-        if (got != password) {
+        // Tolerant claim parse (T-largefile-block-multinic, D-02): bare password prefix +
+        // optional trailing capability byte / extension string. Legacy clients sending a
+        // bare password decode with capabilities=0; the server does not gate any behavior
+        // on client capabilities today.
+        AuthClaimInfo authClaim;
+        if (!DecodeAuthClaim(claim.payload, password, authClaim)) {
             SendSimple(socket, MsgType::AuthFail, "bad password");
             throw std::runtime_error("Authentication failed");
         }
@@ -237,7 +241,10 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         info.serverAddrs = serverAddrs;
         // FC7 always advertises delta capability: the server can generate block signatures
         // and serve byte ranges regardless of CLI (delta is a client-driven, opt-in flow).
+        // kCapFileRange (T-largefile-block-multinic): the server can serve FileRangeOpen
+        // byte-range reads; whether large-file block mode is used is client-gated.
         info.capabilities |= kCapDelta;
+        info.capabilities |= kCapFileRange;
         try {
             SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
         } catch (...) {
@@ -283,6 +290,7 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
         info.role = AuthOkRole::JoinAck;
         info.sessionId = session->sessionId;
         info.capabilities |= kCapDelta;
+        info.capabilities |= kCapFileRange;  // T-largefile-block-multinic: range reads on every lane
         try {
             SendFrame(socket, Frame{MsgType::AuthOk, 0, EncodeAuthOk(info)});
         } catch (...) {
@@ -820,6 +828,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
     // discipline as pendingNewStreams (adopted into activeRangeStreams, I/O outside mu).
     std::unordered_map<uint32_t, ServerRangeStream> activeRangeStreams;  // main-loop private
     std::vector<std::pair<uint32_t, ServerRangeStream>> pendingNewRangeStreams;
+    // Large-file block (T-largefile-block-multinic): same ServerRangeStream shape and
+    // hand-off discipline, but a SEPARATE container + serving branch so the delta range
+    // semantics stay untouched (state-machine isolation, AC-09). Replies use the
+    // FileRangeData/FileRangeEnd/FileRangeError frame family.
+    std::unordered_map<uint32_t, ServerRangeStream> activeFileRangeStreams;  // main-loop private
+    std::vector<std::pair<uint32_t, ServerRangeStream>> pendingNewFileRangeStreams;
     // Sized so all enumeration workers can each have a full flush chunk in flight without
     // serialising on backpressure (workers * kFrameFlushThreshold, rounded up). RAM is
     // cheap relative to the throughput win; the sender drains this continuously.
@@ -1009,7 +1023,8 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                            (frame.type == MsgType::FileOpen ||
                             frame.type == MsgType::FileBatchOpen ||
                             frame.type == MsgType::BlockSigRequest ||
-                            frame.type == MsgType::DeltaRangeOpen)) {
+                            frame.type == MsgType::DeltaRangeOpen ||
+                            frame.type == MsgType::FileRangeOpen)) {
                     // fastcheck: a Check session serves no transfer frames; a well-behaved FastCheck client will not send these frames
                     // (FR-28/AC-36). Log a diagnostic and ignore, do not set failed and do not throw, avoiding a false session-failed verdict.
                     if (debugEnabled) {
@@ -1252,6 +1267,37 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                         pendingNewRangeStreams.emplace_back(frame.streamId, std::move(rs));
                     }
                     outboundCv.notify_one();
+                } else if (frame.type == MsgType::FileRangeOpen) {
+                    // Large-file block (T-largefile-block-multinic): byte-range read for the
+                    // large-file block state machine. Same open/validation discipline as
+                    // DeltaRangeOpen above, but hands off to the SEPARATE
+                    // pendingNewFileRangeStreams and replies with the FileRange* frame family
+                    // (isolation, AC-09). Open/validation failure -> FileRangeError so the
+                    // client abandons block mode for this file and falls back to single-stream.
+                    const FileRangeOpenReq req = DecodeFileRangeOpen(frame.payload);
+                    const fs::path abs = JoinRel(options.rootDir, req.relPath);
+                    if (req.length == 0 || req.offset > UINT64_MAX - req.length) {
+                        enqueueHigh(Frame{MsgType::FileRangeError, frame.streamId,
+                                          EncodeFileRangeError(req.relPath)});
+                        continue;
+                    }
+                    const uint64_t readBound = req.offset + req.length;
+                    ServerRangeStream rs;
+                    rs.relativePath = req.relPath;
+                    rs.remaining = req.length;
+                    rs.nextReadOffset = req.offset;
+                    rs.fileId = GetServerDiskIoDriver().openFile(fc::PathToUtf8(abs), fc::io::OpKind::Read,
+                                                                /*unbuffered=*/true, readBound);
+                    if (rs.fileId == 0) {
+                        enqueueHigh(Frame{MsgType::FileRangeError, frame.streamId,
+                                          EncodeFileRangeError(req.relPath)});
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mu);
+                        pendingNewFileRangeStreams.emplace_back(frame.streamId, std::move(rs));
+                    }
+                    outboundCv.notify_one();
                 } else if (frame.type == MsgType::SyncDone) {
                     done.store(true);
                     sessionHashCv.notify_all();
@@ -1363,6 +1409,11 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                     didWork = true;
                 }
                 pendingNewRangeStreams.clear();
+                for (auto& kv : pendingNewFileRangeStreams) {
+                    activeFileRangeStreams.emplace(kv.first, std::move(kv.second));
+                    didWork = true;
+                }
+                pendingNewFileRangeStreams.clear();
                 if (debugEnabled) {
                     muWaitUs.push_back(std::chrono::duration_cast<std::chrono::microseconds>(muAcquired - muWaitStart).count());
                     const auto muReleased = std::chrono::steady_clock::now();
@@ -1568,6 +1619,60 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
                         ++it;
                     }
                 }
+
+                // Large-file block (T-largefile-block-multinic): serve file-range streams.
+                // Identical read/burst discipline to the delta range loop above, but replies
+                // with FileRangeData/FileRangeEnd and reports mid-range I/O errors as
+                // FileRangeError (isolated frame family + container, AC-09).
+                for (auto it = activeFileRangeStreams.begin(); it != activeFileRangeStreams.end();) {
+                    ServerRangeStream& rs = it->second;
+                    size_t burstBytes = 0;
+                    bool finished = false;
+                    std::vector<uint8_t> chunk;
+                    while (rs.remaining > 0 && burstBytes < perStreamBurstBytes) {
+                        const uint64_t toRead =
+                            std::min<uint64_t>(rs.remaining, static_cast<uint64_t>(effectiveChunkSize));
+                        bool readErr = false;
+                        const uint32_t got = DriverReadRangeChunk(
+                            rs.fileId, rs.nextReadOffset, static_cast<uint32_t>(toRead), chunk,
+                            readErr);
+                        if (readErr || got == 0) {
+                            rs.errored = true;
+                            break;
+                        }
+                        rs.nextReadOffset += got;
+                        burstBytes += got;
+                        rs.remaining -= static_cast<uint64_t>(got);
+                        sendFrames.push_back(
+                            Frame{MsgType::FileRangeData, it->first, std::move(chunk)});
+                        chunk.clear();
+                        didWork = true;
+                    }
+                    if (rs.errored) {
+                        sendFrames.push_back(Frame{MsgType::FileRangeError, it->first,
+                                                   EncodeFileRangeError(rs.relativePath)});
+                        if (rs.fileId != 0) {
+                            GetServerDiskIoDriver().closeFile(rs.fileId);
+                            rs.fileId = 0;
+                        }
+                        it = activeFileRangeStreams.erase(it);
+                        didWork = true;
+                        continue;
+                    }
+                    if (rs.remaining == 0) {
+                        sendFrames.push_back(Frame{MsgType::FileRangeEnd, it->first, {}});
+                        if (rs.fileId != 0) {
+                            GetServerDiskIoDriver().closeFile(rs.fileId);
+                            rs.fileId = 0;
+                        }
+                        it = activeFileRangeStreams.erase(it);
+                        finished = true;
+                        didWork = true;
+                    }
+                    if (!finished) {
+                        ++it;
+                    }
+                }
             }
             if (!sendFrames.empty()) {
                 SendFrameBatch(client, sendFrames);
@@ -1743,9 +1848,13 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
             }
             if (!didWork) {
                 std::unique_lock<std::mutex> lock(mu);
+                // NOTE: pendingNewFileRangeStreams joins the wake predicate; the pre-existing
+                // pendingNewRangeStreams stays out of it exactly as before (delta path kept
+                // byte-identical; the 2ms poll already self-corrects adoption either way).
                 outboundCv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
                     return done.load() || !outboundHigh.empty() || !outboundManifest.empty() ||
-                           !pendingNewStreams.empty() || !pendingNewBatchStreams.empty();
+                           !pendingNewStreams.empty() || !pendingNewBatchStreams.empty() ||
+                           !pendingNewFileRangeStreams.empty();
                 });
             }
         }
@@ -1773,6 +1882,12 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
         }
     }
     for (auto& kv : activeRangeStreams) {
+        if (kv.second.fileId != 0) {
+            GetServerDiskIoDriver().closeFile(kv.second.fileId);
+            kv.second.fileId = 0;
+        }
+    }
+    for (auto& kv : activeFileRangeStreams) {
         if (kv.second.fileId != 0) {
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
             kv.second.fileId = 0;

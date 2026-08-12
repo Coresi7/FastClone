@@ -49,15 +49,41 @@ struct AuthOkInfo {
     // AuthOk payload; DecodeAuthOk reads it only when bytes remain (default 0), so older
     // fixtures / probe code without the field decode as "no capabilities".
     uint8_t capabilities = 0;
+    // FC7 additive (T-largefile-block-multinic): trailing free-form extension string.
+    // Read only when bytes remain after `capabilities` (same tolerant style); absent => "".
+    std::string extensionString;
 };
 
 std::vector<uint8_t> EncodeAuthOk(const AuthOkInfo& info);
 AuthOkInfo DecodeAuthOk(const std::vector<uint8_t>& payload);
 
-// SessionJoin payload: sessionId(str) + password(str).
+// Auth payload (client -> server session claim, T-largefile-block-multinic): the bare
+// password bytes, optionally followed by capabilities(u8) + extensionString(str). The
+// server parses tolerantly: the payload must start with the expected password; the
+// capability byte and extension string are read only while bytes remain, so a legacy
+// client sending a bare password decodes as capabilities=0 / extensionString="".
+struct AuthClaimInfo {
+    uint8_t capabilities = 0;
+    std::string extensionString;
+};
+
+std::vector<uint8_t> EncodeAuthClaim(const std::string& password, uint8_t capabilities,
+                                     const std::string& extensionString);
+// Returns false only when the password prefix mismatches (authentication failure). A
+// well-formed password prefix with a missing/truncated trailing extension decodes with
+// defaults (tolerant), never throws.
+bool DecodeAuthClaim(const std::vector<uint8_t>& payload, const std::string& expectedPassword,
+                     AuthClaimInfo& out);
+
+// SessionJoin payload: sessionId(str) + password(str), optionally followed by
+// capabilities(u8) + extensionString(str) (client capability advertisement,
+// T-largefile-block-multinic). Trailing fields are read only while bytes remain, so a
+// legacy payload decodes with capabilities=0 / extensionString="".
 struct SessionJoinInfo {
     std::string sessionId;
     std::string password;
+    uint8_t capabilities = 0;
+    std::string extensionString;
 };
 
 std::vector<uint8_t> EncodeSessionJoin(const SessionJoinInfo& info);
@@ -125,5 +151,23 @@ struct DeltaRangeRequest {
 };
 std::vector<uint8_t> EncodeDeltaRangeOpen(const DeltaRangeRequest& req);
 DeltaRangeRequest DecodeDeltaRangeOpen(const std::vector<uint8_t>& payload);
+
+// --- Large-file block (file-range) transfer (FC7 additive, T-largefile-block-multinic) ---
+
+// FileRangeOpen: relPath + offset(u64) + length(u64) (wire-identical shape to
+// DeltaRangeOpen, but a separate MsgType family so the two state machines stay isolated).
+// FileRangeData payloads are raw bytes and FileRangeEnd is empty (no codec).
+struct FileRangeOpenReq {
+    std::string relPath;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+std::vector<uint8_t> EncodeFileRangeOpen(const FileRangeOpenReq& req);
+FileRangeOpenReq DecodeFileRangeOpen(const std::vector<uint8_t>& payload);
+
+// FileRangeError: relPath (same bare-string shape as DeltaError, separate codec names for
+// state-machine isolation).
+std::vector<uint8_t> EncodeFileRangeError(const std::string& relPath);
+std::string DecodeFileRangeError(const std::vector<uint8_t>& payload);
 
 }  // namespace fc

@@ -10,10 +10,10 @@
 ## 核心特性
 
 - 单 EXE：同一个程序可作为 `server` 或 `client` 运行
-- 多连接并行传输（多路径 / FC6）：可跨多块网卡叠加带宽；单网卡 / 单连接同样适用
+- 多连接并行传输（多路径 / FC7）：可跨多块网卡叠加带宽；单网卡 / 单连接同样适用
 - 镜像同步：服务端删除 -> 客户端也删除
 - 回退比对：`size + mtime` 不一致时使用 `XXH3_128`
-- 面向千万量级文件、TB 级数据的超大目录树：碎文件批量打包传输，多个文件在多条流 / 多条链路上并发（单个文件本身不跨流拆分）
+- 面向千万量级文件、TB 级数据的超大目录树：碎文件批量打包传输，多个文件在多条流 / 多条链路上并发（单个文件本身不跨流拆分；开启 `--large-file-block-kb` 的大文件块模式是可选例外，见下文）
 - 协议版本强校验（版本不匹配直接拒绝）
 - **FastCheck**：独立的只读比对程序，连接运行中的 server 报告本地目录与服务端的差异，不传输、不删除、不写任何文件（见 [FastCheck](#fastcheck-只读比对)）
 
@@ -46,7 +46,7 @@ FastClone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enab
 ### 客户端
 
 ```bash
-FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>]
+FastClone client --server <host[:port]>[,host:port...] --target <path> --password <pwd> [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>] [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>] [--large-file-block-kb <n>] [--delta-min-size <size>] [--unbuffered-writes] [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>] [--link <localIP|iface>=<serverIP[:port]>]... [--reconnect-retries <n>]
 ```
 
 - `--server`：支持 `10.0.0.8:27842` 或 `10.0.0.8`（省略端口默认 `27842`）；可用逗号分隔或重复传入多个端点，作为多路径的服务端地址
@@ -58,6 +58,7 @@ FastClone client --server <host[:port]>[,host:port...] --target <path> --passwor
 - `--large-file-threshold`：将 `>=` 该大小的文件固定走首要链路；默认 `1G`，范围 `1M..1T`，支持 `K/M/G` 后缀（与碎文件批处理阈值、接收队列阈值相互独立）
 - `--aux-weight`：传输调度中每条辅助链路的排序权重；默认 `1.0`，范围 `(0,16]`（首要链路固定为 `1.0`）。值越大，越多文件传输按比例倾斜到辅助链路
 - `--large-file-lane`：大文件（`>= --large-file-threshold`）在各链路间的路由方式：`primary`（固定走首要链路）、`aux`（与普通文件一样按权重调度）、`auto`（`--aux-weight >= 2.0` 时倾向辅助链路，否则固定走首要链路）；默认 `auto`
+- `--large-file-block-kb`：**可选开启，默认关闭**。给出该参数即启用大文件块模式：`>= --large-file-threshold` 的文件被切成 `<n>` KiB 的块（范围 `1024..4194304`，必须为 2 的幂；`32768` = 参考块大小 32 MiB），跨**全部**健康链路并行拉取，落盘后对整文件做 XXH3-128 校验再原子改名。仅在 `>= 2` 条健康链路且对端通告 file-range 能力（FC7 两端均为本版本）时生效；否则自动回退原单流路径，行为与旧版完全一致。小文件与单链路同步不受影响。开启块模式后，`--large-file-lane` 只作用于未进入块模式的大文件。与 `--large-file-threshold` 相互独立（阈值决定"哪些文件算大"，块大小只决定"切多大"）
 - `--delta-min-size`：对 `>=` 该大小、且发生变化的文件启用**二进制增量（delta）**传输——只下载变化的字节范围而非整文件，依据本地旧副本做匹配（灵感来自rsync。滚动校验 + XXH3-128，独立 MIT 实现）。默认 `0`（**关闭**）；设为正值（范围 `1M..1T`，支持 `K/M/G` 后缀）即开启。与 `--large-file-threshold` 相互独立。需要两端均为 FC7 协议（见下文「二进制增量传输」）
 - `--unbuffered-writes`：**仅客户端**，默认**关闭**。开启后，客户端**全部**文件内容写入——整文件 / 碎文件批量、普通单文件下载、以及 delta 复制/范围重建写——都经统一磁盘 IO 驱动以**无缓冲写意图**落盘（Windows `FILE_FLAG_NO_BUFFERING`、Linux `O_DIRECT`、macOS `F_NOCACHE`），使下载数据绕过系统页缓存、不在过滤驱动下堆积脏页。子扇区尾部与未对齐片段自动回退为缓冲写；无论开关是否开启，最终文件大小与内容都逐字节一致。与 `--queued-file-size` 配合时，接收侧受**同一预算**约束（接收队列 **加上** 待写/在飞的磁盘写），磁盘写落后不会使常驻/脏页集合增长超过阈值。默认关闭 = 现有行为不变。（服务端拒绝：`server --unbuffered-writes` 会以「仅客户端」用法错误退出。）
 - `--tcp-send-buffer` / `--tcp-recv-buffer`：以字节为单位固定（pin）`SO_SNDBUF` / `SO_RCVBUF`（范围 `64K..1G`，支持 `K/M/G` 后缀）；默认 `0` = 交给内核自动伸缩窗口。高 RTT 链路上推荐保持 `0`：内核的接收窗口自动伸缩（Linux `tcp_moderate_rcvbuf`、Windows Receive Window Auto-Tuning）会按带宽时延积（BDP）放大窗口，使单条连接也能跑满高 BDP 链路。显式指定一个值会**关闭**该方向的自动伸缩并把窗口钉死。**Windows 注意事项：** 若系统级关闭了接收窗口自动伸缩（部分「优化工具」或组策略会将其设为 `disabled`，可用 `netsh interface tcp show global` 查看），默认 `0` 会回退到 Windows 较小的系统默认值（约 64KB），从而拖慢高 RTT 吞吐。这类机器上请显式设置 `--tcp-recv-buffer`（例如 `--tcp-recv-buffer 32M`）以恢复较大的固定窗口，或用 `netsh int tcp set global autotuninglevel=normal` 重新启用自动伸缩
@@ -198,10 +199,10 @@ FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程�
 - **没有总时长窗口**：跑了 30 分钟以上的大传输中途断网，仍会重试满额预算，不会因超时而被放弃
 - `--reconnect-retries 0` 可禁用自动重连（行为与旧版一致：中断后退出码 `3`）
 - 已落盘且 `size+mtime` 一致的文件在重连后自动跳过，无需二次传输
-- **非块级断点续传**：大文件若传输中断，重连后从文件头重传（协议无 offset 字段）
-- **当前线协议为 FC6**（多路径会话：新增 `SessionJoin`，`AuthOk` 携带会话标识与服务端端点列表）；多连接下单条链路断开会把其在途文件迁移到健康链路重传，仅当所有链路都断开才触发会话级重连
+- **非块级断点续传**：大文件若传输中断，重连后从文件头重传（默认整文件路径无 offset 字段）。例外：开启 `--large-file-block-kb` 后，会话内单条链路断开只按块重路由重传在途块，已完成块不重传（同会话内块级续传）
+- **当前线协议为 FC7**（多路径会话 + 能力位协商：`SessionJoin`，`AuthOk` 携带会话标识、服务端端点列表与能力位）；多连接下单条链路断开会把其在途文件迁移到健康链路重传，仅当所有链路都断开才触发会话级重连
 - 协议/鉴权错误、帧 desync 等不可恢复错误立即退出（退出码 `1`），不消耗重连预算
-- 已知不可恢复错误包括：密码不匹配、协议版本不匹配（FC6）、服务端 Error 帧、帧 desync
+- 已知不可恢复错误包括：密码不匹配、协议版本不匹配（FC7）、服务端 Error 帧、帧 desync
 
 新增 CLI 参数：
 
@@ -209,14 +210,14 @@ FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程�
 
 
 
-## 多网卡并行传输（多路径，FC6）
+## 多网卡并行传输（多路径，FC7）
 
 当服务端与客户端各自拥有多块网卡时，FastClone 可在一次同步中**同时使用多条物理链路**以叠加带宽：
 
 - 一个会话由一个**连接池**组成：先建立首要链路（`--server` 的第一个端点 / `--link` 的第一条），再尽力建立辅助链路。
 - **自动选路**：客户端枚举本机网卡、对服务端下发的端点做可达性探测，按"地址族（IPv4 优先）> 同子网 > RTT"择优配对，并保证**每块物理网卡（客户端与服务端两侧）至多一条连接**（双栈网卡的 v4/v6 不会被当成两条链路）。
 - **显式指定**：用 `--link <本地IP|网卡名>=<服务端IP[:端口]>` 可绕过自动选路，列表第一条为首要链路。
-- **文件到链路的调度**：整文件传输不跨链路拆分。普通文件与碎文件批按"加权最短队列"策略分摊到各健康链路（在途流最少的链路优先；`--aux-weight` 让选择向辅助链路倾斜）。大文件（`>= --large-file-threshold`，默认 `1G`）按 `--large-file-lane` 路由：默认固定走首要链路（假定其为最佳链路），或在倾向辅助链路时与普通文件一样按权重调度。（二进制增量是例外——delta 文件的变化范围**会**跨链路分摊，见下文。）
+- **文件到链路的调度**：整文件传输默认不跨链路拆分。普通文件与碎文件批按"加权最短队列"策略分摊到各健康链路（在途流最少的链路优先；`--aux-weight` 让选择向辅助链路倾斜）。大文件（`>= --large-file-threshold`，默认 `1G`）按 `--large-file-lane` 路由：默认固定走首要链路（假定其为最佳链路），或在倾向辅助链路时与普通文件一样按权重调度。（两个可选例外——delta 文件的变化范围**会**跨链路分摊（见下文）；开启 `--large-file-block-kb` 后大文件按块跨全部健康链路并行拉取，会话内链路断开仅在途块整块重路由重传。）
 - 单网卡 / 单端点时自动退化为单连接，行为与此前一致。
 
 
@@ -255,7 +256,7 @@ FastCheck 在 Visual Studio solution（`FastClone.slnx`——`FastCheck` 工程�
 
 - 当前为明文 TCP + 口令，建议只在可信网络使用
 - 镜像模式会删除客户端多余文件/目录
-- 不支持单文件块级断点续传；中断后依赖自动重连或重跑（重跑/重连均可自动对比，相同文件无需二次传输）
+- 默认不支持单文件块级断点续传；中断后依赖自动重连或重跑（重跑/重连均可自动对比，相同文件无需二次传输）。开启 `--large-file-block-kb` 后，会话内链路级中断按块续传（在途块整块重路由，已完成块不重传）；跨进程/跨会话的块级续传仍不支持
 
 
 

@@ -71,6 +71,15 @@ struct CliOptions {
     // Large-file lane policy (aux-weight FR-12). Default Auto; with default auxWeight (<2.0)
     // Auto keeps the legacy primary-pin behavior, so the default is zero regression.
     LargeFileLane largeFileLane = LargeFileLane::Auto;
+    // Large-file block (file-range) transfer (T-largefile-block-multinic, opt-in). Block size
+    // in bytes for slicing large files across multiple NIC lanes; default 32 MiB. Fully
+    // orthogonal to largeFileThresholdBytes (which only decides WHAT is large). Block mode is
+    // enabled only when largeFileBlockFlagged is true (--large-file-block-kb explicitly
+    // given); otherwise the legacy single-lane large-file path runs unchanged (zero
+    // regression). Range [1M, 4G], power of two, enforced by the CLI parser.
+    uint64_t largeFileBlockBytes = 32ULL * 1024ULL * 1024ULL;
+    // True only when --large-file-block-kb was explicitly supplied (opt-in marker).
+    bool largeFileBlockFlagged = false;
     // Server endpoints for the connection pool (FR-005). servers[0] mirrors host/port for
     // call-site compatibility; multi-value via comma-separated or repeated --server.
     std::vector<std::pair<std::string, uint16_t>> servers;
