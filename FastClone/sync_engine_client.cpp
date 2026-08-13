@@ -704,7 +704,7 @@ int RunClient(const CliOptions& options) {
     // (binary-delta section 8.1 / AC-17). Set right after the primary handshake below.
     bool deltaEnabled = false;
     // Large-file block mode (T-largefile-block-multinic, design §4.1.3): true when the server
-    // advertised kCapFileRange in AuthOk. Combined with --large-file-block-kb + isLarge +
+    // advertised kCapFileRange in AuthOk. Combined with --large-file-block + isLarge +
     // >=2 healthy lanes at the admission gate (§3.2); false keeps every file on the legacy
     // FileOpen/FileChunk path (AC-08).
     bool serverCapFileRange = false;
@@ -2254,7 +2254,7 @@ int RunClient(const CliOptions& options) {
     // AC-01/04/05/07/08). Mirrors the tryEnterDelta layering: admitted files never enter
     // regularQueue; they wait for the H1 verify hash, then fan out as blocks via
     // tryStartFileRanges. All conditions required:
-    //   --large-file-block-kb explicitly given (opt-in, AC-07)  AND
+    //   --large-file-block explicitly given (opt-in, AC-07)  AND
     //   server advertised kCapFileRange (AC-08)                 AND
     //   remote fileSize >= largeFileThresholdBytes (AC-01/04)   AND
     //   >= 2 healthy lanes (AC-01/05)                           AND
@@ -2886,7 +2886,13 @@ int RunClient(const CliOptions& options) {
                           st.newFileBytes, st.newFileBytes);
             deltaAbandoned.insert(rel);
             deltaStates.erase(it);
-            scheduleTransfer(rel);
+            // T-largefile-block-multinic follow-up: a delta that reconstructed but failed final
+            // verify/rename used to fall back to a single-stream full transfer. Route it through
+            // block mode instead when opt-in block is available, so the full retransfer fans out
+            // across all NICs.
+            if (!tryEnterFileRange(rel)) {
+                scheduleTransfer(rel);
+            }
         }
         PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(),
                             lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted);
@@ -3124,7 +3130,14 @@ int RunClient(const CliOptions& options) {
                           res.benefitRejected ? &res.stats : nullptr);
             deltaAbandoned.insert(res.rel);
             deltaStates.erase(itState);
-            scheduleTransfer(res.rel);
+            // T-largefile-block-multinic follow-up: a delta that cannot help (too-different /
+            // early-stop / IO error) used to fall back to a single-stream full transfer. Route it
+            // through block mode instead when opt-in block is available (>=2 lanes +
+            // --large-file-block + server capability), so the full retransfer still fans out across
+            // all NICs instead of being pinned to one lane.
+            if (!tryEnterFileRange(res.rel)) {
+                scheduleTransfer(res.rel);
+            }
             return;
         }
         DeltaFileState& st = itState->second;

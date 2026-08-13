@@ -1,7 +1,7 @@
 # FastClone large-file block (file-range) integration test (Windows)
 # — T-largefile-block-multinic.
 #
-# Exercises the opt-in --large-file-block-kb mode (multi-NIC block fan-out) end to end:
+# Exercises the opt-in --large-file-block mode (multi-NIC block fan-out) end to end:
 #   FR-A  block mode ON, 2 loopback lanes: large files fan out as blocks across BOTH lanes,
 #         H1 hash prefetch + whole-file XXH3 verify + atomic rename; SHA256 bit-exact.
 #         Also covers V-10: one file is an exact block multiple, one has a short tail block.
@@ -11,6 +11,11 @@
 #   FR-D  block mode ON, 2 lanes, lane 2 through a throttled TCP proxy; the proxy is killed
 #         mid-transfer -> in-flight blocks reroute to the healthy lane and are re-fetched
 #         whole (idempotent, AC-03); final bytes stay SHA256 bit-exact.
+#   FR-E  block mode ON via the NO-VALUE form (`--large-file-block` alone -> default 32 MiB
+#         reference block); proves the opt-in path enables block mode end to end.
+#   FR-F  block mode ON + delta ON, 2 lanes: a large file whose local old version differs >65%
+#         from the server is admitted into delta then benefit-rejected (too different); the
+#         fallback is routed through block mode (kind=file_range) instead of single-stream.
 #
 # Usage: .\tests\file_range_integration.ps1 [-ExePath path\to\FastClone.exe] [-Port 27910]
 
@@ -25,7 +30,7 @@ function Resolve-FastCloneExe {
     param([string]$Hint)
     if ($Hint -and (Test-Path $Hint)) { return (Resolve-Path $Hint).Path }
     # Prefer the CMake build output (what build_and_test.ps1 builds/tests); the legacy VS
-    # x64\Release artifact may be stale and lack the --large-file-block-kb flag.
+    # x64\Release artifact may be stale and lack the --large-file-block flag.
     $candidates = @(
         "$PSScriptRoot\..\build\Release\FastClone.exe",
         "$PSScriptRoot\..\build\FastClone.exe",
@@ -184,7 +189,7 @@ New-Item -ItemType Directory -Force -Path $logDir, $src | Out-Null
 
 $password = "fc-fr-pw"
 $serverAddr = "127.0.0.1:$Port"
-$blockArgs = @("--large-file-threshold", "8M", "--large-file-block-kb", "8192")
+$blockArgs = @("--large-file-threshold", "8M", "--large-file-block", "8M")
 $twoLinks = @("--link", "127.0.0.1=127.0.0.1:$Port", "--link", "127.0.0.2=127.0.0.1:$Port")
 $oneLink = @("--link", "127.0.0.1=127.0.0.1:$Port")
 
@@ -273,6 +278,40 @@ try {
     Write-Host "  OK FR-C: single-lane fallback to legacy path, SHA256 match"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
 
+    # ================ FR-E: block ON via NO-VALUE switch, 2 lanes ====================
+    # Exercises the new no-value form `--large-file-block` (T-largefile-block-multinic
+    # follow-up): giving the flag without a size must enable block mode using the default
+    # 32 MiB reference block, and complete end to end with a clean verify + rename.
+    Write-Host ""
+    Write-Host "[FR-E] block mode ON via no-value switch (default 32M), 2 loopback lanes"
+    $tgt = Join-Path $env:TEMP "fc-fr-tgt-e-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgt | Out-Null
+    $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\E-server.out" -ErrLog "$logDir\E-server.err"
+    Start-Sleep -Seconds 1
+    # No-value form: `--large-file-block` with no size -> default 32 MiB reference block.
+    $clientArgsE = @("client", "--server", $serverAddr, "--target", $tgt,
+                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M", "--large-file-block")
+    $code = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsE -OutLog "$logDir\E-client.out" -ErrLog "$logDir\E-client.err"
+    if ($code -ne 0) { throw "FR-E: client expected exit 0, got $code" }
+    $srvCode = Wait-ExitCode -Proc $srv -TimeoutSec 120
+    if ($srvCode -ne 0) { throw "FR-E: server --once expected exit 0, got $srvCode" }
+    $diff = Compare-FileHashTrees -Src $srcHashes -Tgt (Get-FileHashTree -Root $tgt)
+    if ($null -ne $diff) { throw "FR-E: DATA INTEGRITY FAILURE: $diff" }
+    $frConnsE = Get-FileRangeConnIds -LogPath "$logDir\E-client.out"
+    if ($frConnsE.Count -lt 1) {
+        throw "FR-E: expected file_range blocks with the no-value switch, got connIds: $($frConnsE -join ',')"
+    }
+    if (-not (Select-String -Path "$logDir\E-client.out" -Pattern '\[file_range\] done' -Quiet)) {
+        throw "FR-E: missing '[file_range] done' (block finalize log)"
+    }
+    if (Select-String -Path "$logDir\E-client.out" -Pattern 'file_range_finalize_failed' -Quiet) {
+        throw "FR-E: unexpected finalize failure"
+    }
+    Write-Host "  OK FR-E: no-value switch enabled block mode (32M default), SHA256 match; lanes: $($frConnsE -join ',')"
+    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+
     # ================= FR-D: block ON, 2 lanes, kill lane mid-transfer ================
     Write-Host ""
     Write-Host "[FR-D] block mode ON, 2 lanes, kill lane 2 mid-transfer (AC-03 reroute)"
@@ -359,6 +398,85 @@ try {
     }
     Write-Host "  OK FR-D: lane kill -> block reroute, all SHA256 match (allocs=$allocCount)"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+
+    # ================ FR-F: delta too-different -> routed to block mode ================
+    # T-largefile-block-multinic follow-up: a large file whose LOCAL old version differs >65%
+    # from the server's new version is admitted into delta, then benefit-rejected (too different).
+    # The fix must route that fallback through block mode so the full retransfer fans out across
+    # BOTH NICs (kind=file_range) instead of falling back to a single-stream full transfer.
+    Write-Host ""
+    Write-Host "[FR-F] delta too-different fallback -> block mode, 2 loopback lanes"
+    # (a) First sync (plain, no delta/block) to materialize the local old copy.
+    $tgtF = Join-Path $env:TEMP "fc-fr-tgt-f-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgtF | Out-Null
+    $srvF1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\F-server1.out" -ErrLog "$logDir\F-server1.err"
+    Start-Sleep -Seconds 1
+    $clientArgsF1 = @("client", "--server", $serverAddr, "--target", $tgtF,
+                      "--password", $password) + $twoLinks
+    $codeF1 = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsF1 -OutLog "$logDir\F-client1.out" -ErrLog "$logDir\F-client1.err"
+    if ($codeF1 -ne 0) { throw "FR-F: first sync expected exit 0, got $codeF1" }
+    $srvF1Code = Wait-ExitCode -Proc $srvF1 -TimeoutSec 120
+    if ($srvF1Code -ne 0) { throw "FR-F: first server --once expected exit 0, got $srvF1Code" }
+    # Sanity: local copy of large_exact.bin must be bit-exact to the (original) server content.
+    $hashF1 = (Get-FileHash -Path (Join-Path $tgtF "large_exact.bin") -Algorithm SHA256).Hash
+    $hashSrcOrig = (Get-FileHash -Path (Join-Path $src "large_exact.bin") -Algorithm SHA256).Hash
+    if ($hashF1 -ne $hashSrcOrig) { throw "FR-F: first sync did not materialize local copy bit-exact" }
+
+    # (b) Mutate the SERVER file: change BOTH size and content (unstructured/random) so it is a
+    #     size-different changed file (goes through the TransferNow cascade, not the hash-defer
+    #     path) and is >65% different at the block level (delta benefit-reject). The fixture uses a
+    #     periodic pattern; a periodic->periodic mutation would coincidentally match under delta's
+    #     rolling hash, so we must use random bytes to force "too different".
+    $randF = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bufF = New-Object byte[] (1 * 1024 * 1024)
+    $streamF = [System.IO.File]::Create((Join-Path $src "large_exact.bin"))
+    try {
+        $remainingF = 20 * 1024 * 1024
+        while ($remainingF -gt 0) {
+            $takeF = [Math]::Min($bufF.Length, $remainingF)
+            $randF.GetBytes($bufF)
+            $streamF.Write($bufF, 0, $takeF)
+            $remainingF -= $takeF
+        }
+    } finally { $streamF.Close() }
+    $srcHashesF = Get-FileHashTree -Root $src   # NEW expected tree (post-mutation)
+
+    # (c) Second sync with delta + block, same target (local old present, differs).
+    $srvF2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\F-server2.out" -ErrLog "$logDir\F-server2.err"
+    Start-Sleep -Seconds 1
+    $clientArgsF2 = @("client", "--server", $serverAddr, "--target", $tgtF,
+                      "--password", $password) + $twoLinks + @(
+                        "--delta-min-size", "4M",
+                        "--large-file-threshold", "8M", "--large-file-block", "8M")
+    $codeF2 = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsF2 -OutLog "$logDir\F-client2.out" -ErrLog "$logDir\F-client2.err"
+    if ($codeF2 -ne 0) { throw "FR-F: second sync expected exit 0, got $codeF2" }
+    $srvF2Code = Wait-ExitCode -Proc $srvF2 -TimeoutSec 120
+    if ($srvF2Code -ne 0) { throw "FR-F: second server --once expected exit 0, got $srvF2Code" }
+
+    # (d) Assertions: delta attempted + benefit-rejected (logged to stderr), then routed to
+    #     block (kind=file_range, logged to stdout) instead of single-stream full transfer.
+    if (-not (Select-String -Path "$logDir\F-client2.err" -Pattern '\[delta\] fallback ' -Quiet)) {
+        throw "FR-F: expected a '[delta] fallback' line (delta admitted then benefit-rejected)"
+    }
+    if (-not (Select-String -Path "$logDir\F-client2.out" -Pattern 'kind=file_range' -Quiet)) {
+        throw "FR-F: expected kind=file_range (delta fallback must route to block, not single-stream)"
+    }
+    if (-not (Select-String -Path "$logDir\F-client2.out" -Pattern '\[file_range\] done' -Quiet)) {
+        throw "FR-F: missing '[file_range] done' (block finalize)"
+    }
+    $frConnsF = Get-FileRangeConnIds -LogPath "$logDir\F-client2.out"
+    if ($frConnsF.Count -lt 1) {
+        throw "FR-F: expected file_range blocks on >=1 lane, got connIds: $($frConnsF -join ',')"
+    }
+    # Data integrity: target must now match the NEW server tree (delta fallback re-fetched via block).
+    $diffF = Compare-FileHashTrees -Src $srcHashesF -Tgt (Get-FileHashTree -Root $tgtF)
+    if ($null -ne $diffF) { throw "FR-F: DATA INTEGRITY FAILURE: $diffF" }
+    Write-Host "  OK FR-F: delta too-different fallback routed to block (lanes: $($frConnsF -join ',')), SHA256 match"
+    Remove-Item -Recurse -Force $tgtF -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host "All file-range integration tests passed. Logs: $logDir"
