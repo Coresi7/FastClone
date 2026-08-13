@@ -320,19 +320,25 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             } else {
                 throw std::runtime_error("Invalid --large-file-lane (expected primary|aux|auto)");
             }
-        } else if (arg == "--large-file-block-kb") {
-            // Large-file block mode opt-in (T-largefile-block-multinic, AC-13). The value is a
-            // block size in KiB; giving the flag at all enables the mode (largeFileBlockFlagged).
-            // Strict validation: power-of-two KiB in [1024, 4194304] (= [1 MiB, 4 GiB]); anything
-            // else throws instead of silently adopting a dangerous default.
-            const long blockKb = ParseLongStrict(ArgAt(args, ++i), "--large-file-block-kb");
-            constexpr long kMinKb = 1024;             // 1 MiB lower bound
-            constexpr long kMaxKb = 4 * 1024 * 1024;  // 4 GiB upper bound
-            if (blockKb < kMinKb || blockKb > kMaxKb || (blockKb & (blockKb - 1)) != 0) {
-                throw std::runtime_error(
-                    "Invalid --large-file-block-kb (range: 1024..4194304, power of two)");
+        } else if (arg == "--large-file-block") {
+            // Large-file block mode opt-in (T-largefile-block-multinic, AC-13). The value is an
+            // optional block size with a K|M|G suffix; giving the flag at all enables the mode
+            // (largeFileBlockFlagged). With no value the 32 MiB reference block size is used.
+            // Strict validation: power-of-two bytes in [1M, 4G]; anything else throws instead of
+            // silently adopting a dangerous default.
+            uint64_t blockBytes = options.largeFileBlockBytes;  // default 32 MiB
+            if (i + 1 < args.size() && !args[i + 1].starts_with("--")) {
+                const uint64_t v =
+                    ParseSizeBytesStrict(ArgAt(args, ++i), "--large-file-block");
+                constexpr uint64_t kMin = 1ULL * 1024 * 1024;          // 1 MiB lower bound
+                constexpr uint64_t kMax = 4ULL * 1024 * 1024 * 1024;    // 4 GiB upper bound
+                if (v < kMin || v > kMax || (v & (v - 1)) != 0) {
+                    throw std::runtime_error(
+                        "Invalid --large-file-block (range 1M..4G, power of two; suffix K|M|G)");
+                }
+                blockBytes = v;
             }
-            options.largeFileBlockBytes = static_cast<uint64_t>(blockKb) * 1024ULL;
+            options.largeFileBlockBytes = blockBytes;
             options.largeFileBlockFlagged = true;
         } else if (arg == "--link") {
             options.linkPins.push_back(ParseLinkPin(ArgAt(args, ++i), options.port));
@@ -463,7 +469,7 @@ std::string BuildUsageText() {
         "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
-        "      [--large-file-block-kb <n>]\n"
+        "      [--large-file-block [<size>]]\n"
         "      [--delta-min-size <size>] [--unbuffered-writes]\n"
         "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -475,11 +481,12 @@ std::string BuildUsageText() {
         "      values pull proportionally more transfers onto aux links.\n"
         "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
         "      --aux-weight >= 2.0, else primary); default auto.\n"
-        "  --large-file-block-kb (opt-in, default OFF) enables large-file block mode: files >=\n"
-        "      --large-file-threshold are sliced into <n> KiB blocks (range 1024..4194304, power\n"
-        "      of two; 32768 = the 32 MiB reference block size) fetched in parallel\n"
+        "  --large-file-block [<size>] (opt-in, default OFF) enables large-file block mode:\n"
+        "      files >= --large-file-threshold are sliced into blocks and fetched in parallel\n"
         "      across ALL healthy links, then verified whole-file (XXH3-128) before an atomic\n"
-        "      rename. Takes effect only with >=2 healthy links and a server advertising the\n"
+        "      rename. <size> is optional (suffix K|M|G, range 1M..4G, power of two; default\n"
+        "      32M = the reference block size); when omitted the 32 MiB reference block size is\n"
+        "      used. Takes effect only with >=2 healthy links and a server advertising the\n"
         "      file-range capability; otherwise the legacy single-stream path runs unchanged.\n"
         "      Small files and single-link syncs are never affected. When block mode is on,\n"
         "      --large-file-lane only applies to large files NOT in block mode.\n"

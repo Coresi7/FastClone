@@ -422,39 +422,56 @@ void RunCliTests() {
     ExpectThrowWith(clientArgs({"--delta-min-size", ""}), "--delta-min-size");
     ExpectThrowWith(clientArgs({"--delta-min-size", "5X"}), "--delta-min-size");
 
-    // ---- T-largefile-block-multinic V-13 (AC-13/AC-07): --large-file-block-kb parsing --------
-    // Default: flag absent -> mode OFF (opt-in), field keeps the 32 MiB reference value.
+    // ---- T-largefile-block-multinic V-13 (AC-13/AC-07): --large-file-block parsing --------
+    // Opt-in: flag absent -> mode OFF, field keeps the 32 MiB reference value.
     {
         const fc::CliOptions opt = Parse(clientArgs({}));
         Require(!opt.largeFileBlockFlagged, "Expected block mode OFF by default (opt-in)");
         Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
                 "Expected default 32 MiB block size");
     }
-    // Legal values: lower bound 1024 KiB (1 MiB), 32768 (32 MiB), upper bound 4194304 (4 GiB).
+    // No-value form: --large-file-block enables block mode with the default 32 MiB block.
     {
-        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block-kb", "1024"}));
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block"}));
+        Require(opt.largeFileBlockFlagged, "Expected flag set with no value");
+        Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
+                "Expected default 32 MiB when size omitted");
+    }
+    // No-value form followed by another flag (heuristic: next token starts with --).
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "--diag"}));
+        Require(opt.largeFileBlockFlagged, "Expected flag set before another flag");
+        Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
+                "Expected default 32 MiB when size omitted");
+    }
+    // With a value: K|M|G suffix accepted; lower bound 1M, 32M reference, upper bound 4G.
+    // (Bare numbers are interpreted as bytes, NOT KiB -- so a value below 1M is rejected.)
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "1M"}));
         Require(opt.largeFileBlockFlagged, "Expected flag set when given");
-        Require(opt.largeFileBlockBytes == 1ULL * 1024 * 1024, "Expected 1024 KiB = 1 MiB");
+        Require(opt.largeFileBlockBytes == 1ULL * 1024 * 1024, "Expected 1M = 1 MiB");
     }
     {
-        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block-kb", "32768"}));
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "32M"}));
         Require(opt.largeFileBlockFlagged && opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
-                "Expected 32768 KiB = 32 MiB");
+                "Expected 32M = 32 MiB");
     }
     {
-        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block-kb", "4194304"}));
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "4G"}));
         Require(opt.largeFileBlockFlagged &&
                     opt.largeFileBlockBytes == 4ULL * 1024 * 1024 * 1024,
-                "Expected 4194304 KiB = 4 GiB (upper bound)");
+                "Expected 4G = 4 GiB (upper bound)");
     }
-    // Strict rejection (V-13): 0, below/above range, non power-of-two, non-numeric, empty.
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "0"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "512"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "8388608"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "1536"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "-1024"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", "abc"}), "--large-file-block-kb");
-    ExpectThrowWith(clientArgs({"--large-file-block-kb", ""}), "--large-file-block-kb");
+    // Strict rejection: 0, below/above range, non power-of-two, non-numeric, empty, bad suffix.
+    ExpectThrowWith(clientArgs({"--large-file-block", "0"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "1024"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "512"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "8G"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "7M"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "-1024"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "abc"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", ""}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "8X"}), "--large-file-block");
 
     // ---- unbuffered-writes V-01/V-02/V-03 (AC-01/AC-02/AC-03): --unbuffered-writes parsing ------
     // V-01 (AC-01): absent -> false (default, zero regression).

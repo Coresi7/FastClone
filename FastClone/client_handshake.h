@@ -19,7 +19,7 @@ inline constexpr const char* kProtocolVersion = "FC7";
 inline constexpr uint8_t kCapDelta = 0x01;
 // bit1 (FC7 additive, T-largefile-block-multinic): the peer can serve byte-range reads via
 // the FileRangeOpen/FileRangeData/FileRangeEnd frame family. The client enables large-file
-// block mode only when "its own --large-file-block-kb was given AND the server advertises
+// block mode only when "its own --large-file-block was given AND the server advertises
 // bit1"; otherwise it stays on the legacy FileOpen/FileChunk path (AC-08).
 inline constexpr uint8_t kCapFileRange = 0x02;
 
