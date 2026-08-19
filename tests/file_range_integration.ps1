@@ -16,6 +16,11 @@
 #   FR-F  block mode ON + delta ON, 2 lanes: a large file whose local old version differs >65%
 #         from the server is admitted into delta then benefit-rejected (too different); the
 #         fallback is routed through block mode (kind=file_range) instead of single-stream.
+#   FR-G  block mode ON, 2 lanes, batch pressure (300 small files): reserved lane slots keep
+#         file_range blocks allocatable on >=2 lanes (no batch starvation), block admission
+#         sends NO H1 HashRequest prefetch (client hash_req_sent == 0), and structural
+#         finalize validation still delivers SHA256-bit-exact bytes
+#         (T-block-lane-quota-and-h1-hash).
 #
 # Usage: .\tests\file_range_integration.ps1 [-ExePath path\to\FastClone.exe] [-Port 27910]
 
@@ -477,6 +482,78 @@ try {
     if ($null -ne $diffF) { throw "FR-F: DATA INTEGRITY FAILURE: $diffF" }
     Write-Host "  OK FR-F: delta too-different fallback routed to block (lanes: $($frConnsF -join ',')), SHA256 match"
     Remove-Item -Recurse -Force $tgtF -ErrorAction SilentlyContinue
+
+    # ================ FR-G: batch 占满 lane + 块流存活 + 无 H1 预读 ================
+    # T-block-lane-quota-and-h1-hash. Verifies on a small loopback fixture:
+    #   FR-1  reserved lane slots keep file_range allocable under batch pressure
+    #         (alloc kind=file_range > 0 on >= 2 lanes), and
+    #   FR-2  block admission no longer issues H1 HashRequest prefetches
+    #         (client hash_req_sent == 0; server hash_req_recv == 0 when observable),
+    #         while structural finalize validation still yields SHA256-bit-exact bytes.
+    # Uses its OWN fixture directory (gate note 6): FR-D above rebuilds large_tail.bin at
+    # 192 MiB, so reusing $src would couple FR-G to FR-D's mutation.
+    Write-Host ""
+    Write-Host "[FR-G] block ON, 2 lanes, batch-saturated + no-H1-prefetch"
+    $srcG = Join-Path $root "src-g"
+    New-Item -ItemType Directory -Force -Path $srcG | Out-Null
+    New-TestFixture -Src $srcG
+    # Plenty of small files to keep the batch queues pressuring the normal stream slots.
+    for ($i = 0; $i -lt 300; $i++) {
+        New-PatternFile -Path (Join-Path $srcG ("small_{0}.bin" -f $i)) -Size 8192 -Seed (1000 + $i)
+    }
+    $srcHashesG = Get-FileHashTree -Root $srcG
+    $tgtG = Join-Path $env:TEMP "fc-fr-tgt-g-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgtG | Out-Null
+    $srvG = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $srcG, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\G-server.out" -ErrLog "$logDir\G-server.err"
+    Start-Sleep -Seconds 1
+    # --streams 16 pins the LAN default so the reserved band is deterministic (2/lane);
+    # --diag guarantees the end-of-session [diag] line with hash_req_sent on stdout.
+    $clientArgsG = @("client", "--server", $serverAddr, "--target", $tgtG,
+                     "--password", $password) + $twoLinks + $blockArgs + @("--streams", "16", "--diag")
+    $codeG = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsG -OutLog "$logDir\G-client.out" -ErrLog "$logDir\G-client.err"
+    if ($codeG -ne 0) { throw "FR-G: client expected exit 0, got $codeG" }
+    $srvGCode = Wait-ExitCode -Proc $srvG -TimeoutSec 180
+    if ($srvGCode -ne 0) { throw "FR-G: server --once expected exit 0, got $srvGCode" }
+
+    # (a) Block streams survive batch pressure: allocs on >= 2 lanes (FR-1 / AC-01 logic level).
+    $frConnsG = Get-FileRangeConnIds -LogPath "$logDir\G-client.out"
+    if ($frConnsG.Count -lt 2) {
+        throw "FR-G: expected file_range blocks on >=2 lanes, got connIds: $($frConnsG -join ',')"
+    }
+    $allocG = (Select-String -Path "$logDir\G-client.out" -Pattern 'kind=file_range').Count
+    if ($allocG -lt 1) { throw "FR-G: expected >=1 file_range alloc" }
+
+    # (b) No H1 prefetch (FR-2 / AC-02/AC-10 logic level). First sync of a fresh target:
+    #     pre-fix the two large files each triggered one H1 HashRequest (hash_req_sent=2);
+    #     post-fix no HashRequest may be sent at all. The client [diag] line is printed at
+    #     session end (guaranteed), so this assertion is strict.
+    $diagLine = Select-String -Path "$logDir\G-client.out" -Pattern '\[diag\] .*hash_req_sent=(\d+)' |
+        Select-Object -Last 1
+    if (-not $diagLine) { throw "FR-G: missing client '[diag]' line with hash_req_sent" }
+    if ([int]$diagLine.Matches[0].Groups[1].Value -ne 0) {
+        throw "FR-G: client sent H1 HashRequests for block files (hash_req_sent != 0)"
+    }
+    #     Server-side cross-check: the 1s-periodic debug line goes to STDERR; when the run was
+    #     long enough to print one, its last sample must show hash_req_recv == 0.
+    $hashReqLine = Select-String -Path "$logDir\G-server.err" -Pattern 'hash_req_recv=(\d+)' |
+        Select-Object -Last 1
+    if ($hashReqLine -and [int]$hashReqLine.Matches[0].Groups[1].Value -gt 0) {
+        throw "FR-G: unexpected server hash_req_recv>0 (H1 prefetch not eliminated)"
+    }
+
+    # (c) End-to-end correctness: structural validation + atomic rename keep bytes bit-exact.
+    $diffG = Compare-FileHashTrees -Src $srcHashesG -Tgt (Get-FileHashTree -Root $tgtG)
+    if ($null -ne $diffG) { throw "FR-G: DATA INTEGRITY FAILURE: $diffG" }
+    if (-not (Select-String -Path "$logDir\G-client.out" -Pattern '\[file_range\] done' -Quiet)) {
+        throw "FR-G: missing '[file_range] done'"
+    }
+    if (Select-String -Path "$logDir\G-client.out" -Pattern 'file_range_finalize_failed' -Quiet) {
+        throw "FR-G: unexpected finalize failure"
+    }
+    Write-Host "  OK FR-G: file_range alloc=$allocG lanes=$($frConnsG -join ','), hash_req_sent=0, SHA256 match"
+    Remove-Item -Recurse -Force $tgtG -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host "All file-range integration tests passed. Logs: $logDir"

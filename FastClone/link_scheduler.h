@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -82,6 +83,29 @@ inline int SelectLeastLoadedLane(const std::vector<LaneLoad>& lanes,
         }
     }
     return best;
+}
+
+// File-range reserved lane slots (T-block-lane-quota-and-h1-hash FR-1, design section 3.1.1).
+// Returns how many stream slots per healthy lane are reserved EXCLUSIVELY for large-file block
+// (file_range) streams when block mode is active: normal streams (batch/regular/delta
+// miss-range) saturate at `streamLimit - reserved`, while file_range streams may use the full
+// `streamLimit`, so batch traffic can never starve block fan-out down to alloc=0.
+//   reserved = clamp(max(2, streamLimit/8), 2, 4), always < streamLimit (for streamLimit >= 2),
+// so normal streams always keep at least one slot (FR-1.2). Tiny limits (<= 2) degrade to 1.
+// Pure function; the caller gates activation (opt-in flag + server capability + >=2 healthy
+// lanes), so with block mode off this is never consulted (AC-08 zero regression).
+inline uint32_t ComputeFileRangeReservedSlots(uint32_t streamLimit) {
+    if (streamLimit <= 2) {
+        return 1;  // degenerate tiny limit: reserve one, still leaving one normal slot at 2
+    }
+    uint32_t r = std::max<uint32_t>(2, streamLimit / 8);
+    if (r > 4) {
+        r = 4;  // cap
+    }
+    if (r >= streamLimit) {
+        r = streamLimit - 1;  // hard invariant: reserved < limit
+    }
+    return r;
 }
 
 }  // namespace fc

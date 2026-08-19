@@ -962,6 +962,9 @@ int RunClient(const CliOptions& options) {
     std::unordered_map<uint64_t, ActiveFileRange> activeFileRanges;  // (connId,streamId) -> block
     std::unordered_map<std::string, FileRangeFileState> fileRangeStates;
     std::deque<std::string> pendingFileRangePlans;        // hash-ready rels awaiting block plan
+    // FR-2 (T-block-lane-quota-and-h1-hash): never written any more (admission no longer
+    // prefetches an H1 hash), so this set is ALWAYS EMPTY and every reader below is an
+    // unreachable no-op. Kept deliberately (design D-04) to minimize the diff; do not extend.
     std::unordered_set<std::string> fileRangePendingHash; // admitted, H1 hash in flight (§3.8)
     std::unordered_set<std::string> fileRangeAbandoned;   // never retry block mode this session
     // Admission gate (§3.2). Declared here and ASSIGNED after healthyConnCount comes into
@@ -2205,13 +2208,52 @@ int RunClient(const CliOptions& options) {
         }
     };
 
+    auto healthyConnCount = [&]() -> size_t {
+        size_t n = 0;
+        for (auto& cptr : pool) {
+            if (cptr->healthy.load()) {
+                ++n;
+            }
+        }
+        return n;
+    };
+
+    // File-range reserved slots (T-block-lane-quota-and-h1-hash FR-1, design section 3.1.6).
+    // The reservation is ONLY live while block mode can actually fan out (opt-in flag + server
+    // kCapFileRange + >=2 healthy lanes); otherwise it is 0 and every caller sees the full
+    // activeStreamLimit, keeping the block-off / single-NIC behavior byte-for-byte identical to
+    // before (AC-08). Lazy evaluation: activeStreamLimit can be halved by the WAN failure-rate
+    // backoff (main loop, same thread as every pickConnection call), so the reserved count is
+    // recomputed from the CURRENT limit on every pick instead of being snapshotted.
+    auto blockModeActive = [&]() -> bool {
+        return options.largeFileBlockFlagged && serverCapFileRange && (healthyConnCount() >= 2);
+    };
+    auto reservedSlots = [&]() -> uint32_t {
+        if (!blockModeActive()) {
+            return 0;
+        }
+        return ComputeFileRangeReservedSlots(activeStreamLimit);
+    };
+
     // Adaptive connection selection (design section 8): shortest-queue / least-outstanding-requests.
-    // Among healthy lanes below streamLimit, pick the one with the fewest in-flight streams
-    // (SelectLeastLoadedLane). This is self-correcting on lane speed -- a slow lane holds its
-    // streams longer so its inFlight stays high and it stops drawing new work, while a fast
+    // Among healthy lanes below the caller's stream cap, pick the one with the fewest in-flight
+    // streams (SelectLeastLoadedLane). This is self-correcting on lane speed -- a slow lane holds
+    // its streams longer so its inFlight stays high and it stops drawing new work, while a fast
     // lane drains and is refilled -- with no throughput measurement or feedback loop (FR-013 /
     // FR-014). forcePrimary (large files, FR-012) hard-pins to the primary lane.
-    auto pickConnection = [&](bool forcePrimary) -> ClientConnection* {
+    //
+    // reserveFileRange (T-block-lane-quota-and-h1-hash FR-1, design section 3.1.2): the DEFAULT
+    // (true) is for NORMAL streams (batch/regular/delta miss-range) and saturates them at
+    // activeStreamLimit - reservedSlots(), leaving the top [limit-reserved, limit) band of each
+    // lane unreachable to them. File-range block streams pass reserveFileRange=false and are
+    // capped at the full activeStreamLimit, so they can always land in that reserved band even
+    // when batch traffic has filled every normal slot (FR-1.4). inFlight stays the single shared
+    // per-lane counter -- the reservation only differentiates the admission cap, so failover /
+    // release bookkeeping is unchanged (FR-1.3).
+    auto pickConnection = [&](bool forcePrimary, bool reserveFileRange = true) -> ClientConnection* {
+        const uint32_t laneCap = reserveFileRange
+            ? (activeStreamLimit - reservedSlots())
+            : activeStreamLimit;
         std::vector<LaneLoad> lanes;
         lanes.reserve(pool.size());
         for (auto& cptr : pool) {
@@ -2237,28 +2279,25 @@ int RunClient(const CliOptions& options) {
             ld.bias = laneBias;
             lanes.push_back(ld);
         }
-        const int idx = SelectLeastLoadedLane(lanes, activeStreamLimit, forcePrimary);
+        const int idx = SelectLeastLoadedLane(lanes, laneCap, forcePrimary);
         return (idx >= 0) ? pool[static_cast<size_t>(idx)].get() : nullptr;
-    };
-    auto healthyConnCount = [&]() -> size_t {
-        size_t n = 0;
-        for (auto& cptr : pool) {
-            if (cptr->healthy.load()) {
-                ++n;
-            }
-        }
-        return n;
     };
 
     // Large-file block mode admission gate (T-largefile-block-multinic §3.2,
     // AC-01/04/05/07/08). Mirrors the tryEnterDelta layering: admitted files never enter
-    // regularQueue; they wait for the H1 verify hash, then fan out as blocks via
-    // tryStartFileRanges. All conditions required:
+    // regularQueue; they fan out as blocks via tryStartFileRanges. All conditions required:
     //   --large-file-block explicitly given (opt-in, AC-07)  AND
     //   server advertised kCapFileRange (AC-08)                 AND
     //   remote fileSize >= largeFileThresholdBytes (AC-01/04)   AND
     //   >= 2 healthy lanes (AC-01/05)                           AND
     //   not already abandoned/managed this session (anti-loop).
+    // T-block-lane-quota-and-h1-hash FR-2: admission no longer waits for an H1 verify hash
+    // (the H1 prefetch forced the server to read every block-admitted large file whole just to
+    // hash it). A file whose remote hash is already on hand for free (same-size content change
+    // resolved through compare) still gets a content verify at finalize; any other file keeps
+    // the all-zero sentinel and finalize falls back to structural validation (write-completion
+    // gate + size finalize + atomic rename) -- the same integrity model as the master
+    // single-stream path, which never content-verifies either.
     tryEnterFileRange = [&](const std::string& rel) -> bool {
         if (!options.largeFileBlockFlagged || !serverCapFileRange) {
             return false;
@@ -2278,7 +2317,10 @@ int RunClient(const CliOptions& options) {
         st.fileSize = it->second.fileSize;
         auto [itState, inserted] = fileRangeStates.emplace(rel, std::move(st));
         (void)inserted;
-        // H1 (§3.8): the whole-file verify hash must be on hand BEFORE any block fan-out.
+        // FR-2: adopt the remote hash only when it is already available for free (compare filled
+        // remoteHashes); otherwise verifyHash stays the all-zero sentinel (structural validation
+        // at finalize). NO HashRequest prefetch is issued and fan-out is never gated on a hash
+        // (fileRangePendingHash is never written any more).
         bool hashReady = false;
         {
             std::lock_guard<std::mutex> lock(hashResultMu);
@@ -2288,17 +2330,7 @@ int RunClient(const CliOptions& options) {
                 hashReady = true;
             }
         }
-        if (hashReady) {
-            pendingFileRangePlans.push_back(rel);  // block plan on the next main-loop pass
-        } else {
-            // Prefetch via the existing HashRequest pipeline. Isolation (§3.8/R-07): the
-            // fileRangePendingHash ledger keeps this OUT of the fallback accounting
-            // (hashRequested/fallbackCount); the HashResponse branch routes the answer away
-            // from fallbackReadyQueue and dispatchHashRequests skips the local-hash task.
-            fileRangePendingHash.insert(rel);
-            pendingHashRequests.push_back(rel);
-            pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());
-        }
+        pendingFileRangePlans.push_back(rel);  // block plan on the next main-loop pass
         if (debugEnabled) {
             std::cout << "[file_range] admit rel=" << rel << " sessionId=" << sessionId
                       << " bytes=" << itState->second.fileSize
@@ -2686,6 +2718,9 @@ int RunClient(const CliOptions& options) {
     // single-stream path. A merely SLOW server-side hash keeps the request in flight
     // (sent != received) and does NOT trip this sweep; a lane-down mid-wait is covered by
     // the failoverScan re-request hook (mirrors the delta-sig requeue).
+    // FR-2 (T-block-lane-quota-and-h1-hash, design D-04): fileRangePendingHash is never
+    // written any more, so this sweeper returns at the first check and is unreachable dead
+    // code. Kept deliberately (minimal diff / clean revert); removal is a separate follow-up.
     auto sweepFileRangePendingHashIfQuiescent = [&]() {
         if (fileRangePendingHash.empty()) {
             return;
@@ -2740,6 +2775,25 @@ int RunClient(const CliOptions& options) {
     // and large-file block paths share the one verify/rename implementation (§7 regression
     // minimisation). On any failure the temp is removed here and the caller runs its own
     // fallback bookkeeping (reason split: IoFailure vs VerifyFailure).
+    //
+    // FR-2 sentinel (T-block-lane-quota-and-h1-hash §3.2.3 / D-03): an all-zero verifyHash
+    // means "no free server-side hash was on hand at admission" -> the content-hash verify
+    // read is skipped entirely and integrity rests on the structural validation (write-
+    // completion gate + close-with-size-finalize + fsync + atomic rename + mtime stamp),
+    // which is exactly the master single-stream path's integrity model (that path never
+    // content-verifies either). CONVENTION (must not be broken by future edits): a real
+    // XXH3-128 of any file is never all zero (probability 2^-128), so all-zero unambiguously
+    // encodes "no hash available"; no legitimate path may ever store an all-zero hash as a
+    // real reference value. Delta callers always pass the real BlockSigResponse hash, so
+    // their verify behavior is unchanged.
+    auto isZeroFileHash = [](const Hash256& h) -> bool {
+        for (uint8_t b : h) {
+            if (b != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
     enum class TempFinalizeResult { Ok, IoFailure, VerifyFailure };
     auto finalizeTempVerifyRename = [&](const std::string& rel, uint64_t& tempFileId,
                                         const fs::path& tempPath, uint32_t submittedWrites,
@@ -2773,6 +2827,13 @@ int RunClient(const CliOptions& options) {
         }
         const fs::path target = JoinRel(options.rootDir, rel);
         bool verifyOk = false;
+        // FR-2 sentinel (see isZeroFileHash above): no free hash -> skip the whole-file verify
+        // read and accept on the structural validation alone (write gate + size finalize +
+        // rename), the same guarantee the master single-stream path gives.
+        const bool hasVerifyHash = !isZeroFileHash(verifyHash);
+        if (!hasVerifyHash) {
+            verifyOk = true;
+        } else
         // C10: stream the reconstructed temp through the unified driver into XXH3 for the verify
         // read, instead of ComputeFileHash's inline read. Same bytes -> identical Hash256, so the
         // verify decision is bit-identical (AC-25).
@@ -2899,10 +2960,12 @@ int RunClient(const CliOptions& options) {
     };
 
     // Large-file block finalize (T-largefile-block-multinic §3.4): all blocks landed (the
-    // pendingRanges barrier reached 0) -> drain writes, verify the whole temp against the H1
-    // verifyHash, atomic-rename + mtime stamp. Any failure abandons block mode for this file
-    // this session and falls back to the legacy single-stream whole-file download (the
-    // single-stream path's own integrity story guarantees bit-exactness; no per-block retry).
+    // pendingRanges barrier reached 0) -> drain writes, verify the whole temp against
+    // verifyHash when one was on hand for free at admission (FR-2: all-zero sentinel ->
+    // structural validation only), atomic-rename + mtime stamp. Any failure abandons block
+    // mode for this file this session and falls back to the legacy single-stream whole-file
+    // download (the single-stream path's own integrity story guarantees bit-exactness; no
+    // per-block retry).
     auto finalizeFileRange = [&](const std::string& rel) {
         auto it = fileRangeStates.find(rel);
         if (it == fileRangeStates.end()) {
@@ -3315,16 +3378,18 @@ int RunClient(const CliOptions& options) {
                 continue;  // abandoned/errored meanwhile
             }
             if (fileRangePendingHash.contains(rel)) {
-                continue;  // defensive: plan only after the H1 hash lands (§3.8)
+                continue;  // FR-2: set is never written any more; defensive no-op (design D-04)
             }
             beginFileRangePlan(rel);
         }
     };
 
-    // Assign queued blocks to healthy lanes (mirrors tryStartDeltaRanges; reuses
-    // pickConnection(false) weighted least-load so the blocks spread across ALL healthy
-    // lanes -- the multi-NIC aggregation point, AC-01). Runs only once the H1 verify hash
-    // is on hand (the plan itself is gated on it, so the pendingHash check is defensive).
+    // Assign queued blocks to healthy lanes (mirrors tryStartDeltaRanges; weighted least-load
+    // so the blocks spread across ALL healthy lanes -- the multi-NIC aggregation point, AC-01).
+    // FR-1 (T-block-lane-quota-and-h1-hash): reserveFileRange=false lets block streams use the
+    // FULL activeStreamLimit per lane, so they still get slots from the reserved band
+    // [limit-reserved, limit) even when batch traffic has saturated every normal slot
+    // (alloc kind=file_range can no longer be starved to 0, FR-1.4/AC-09).
     auto tryStartFileRanges = [&]() {
         while (!pendingFileRanges.empty()) {
             const FileRangeTask& peek = pendingFileRanges.front();
@@ -3333,9 +3398,11 @@ int RunClient(const CliOptions& options) {
                 continue;
             }
             if (fileRangePendingHash.contains(peek.rel)) {
-                break;  // H1 hash not ready yet; retry next pass (§3.8)
+                // FR-2: fileRangePendingHash is never written any more, so this is always
+                // false; kept as a defensive no-op (design D-04, do not extend).
+                break;
             }
-            ClientConnection* conn = pickConnection(false);
+            ClientConnection* conn = pickConnection(false, /*reserveFileRange=*/false);
             if (conn == nullptr) {
                 break;  // all lanes saturated; retry next pass
             }
@@ -4170,6 +4237,8 @@ int RunClient(const CliOptions& options) {
             // leave fileRangePendingHash stuck. Re-requesting is idempotent -- the first
             // response resolves the pending entry, late duplicates are ignored by the
             // HashResponse branch's fileRange guard.
+            // FR-2 (T-block-lane-quota-and-h1-hash): the set is never written any more, so
+            // this loop never iterates; kept as a harmless no-op (design D-04).
             for (const std::string& rel : fileRangePendingHash) {
                 pendingHashRequests.push_back(rel);
                 pendingHashRequestsAt.push_back(std::chrono::steady_clock::now());

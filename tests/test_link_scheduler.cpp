@@ -370,6 +370,75 @@ void TC_ForcePrimaryFallbackDefaultWeightUnchanged() {
             "default-weight forcePrimary fallback must match the legacy least-inFlight pick");
 }
 
+// ==========================================================================================
+// T-block-lane-quota-and-h1-hash (FR-1): file_range reserved lane slots.
+// The client-side pickConnection passes different saturation caps per caller class:
+// normal streams (batch/regular/delta miss-range) -> activeStreamLimit - reserved,
+// file_range block streams -> full activeStreamLimit. These tests pin the pure-function
+// table (V-02) and the two-cap composition over SelectLeastLoadedLane (V-01/V-03), which
+// is exactly how pickConnection wires it (sync_engine_client.cpp).
+// ==========================================================================================
+using fc::ComputeFileRangeReservedSlots;
+
+// ---- V-02 (AC-04/FR-1.2): reserved-slot table + the reserved < limit invariant -----------
+void TC_FileRangeReservedSlotsTable() {
+    Require(ComputeFileRangeReservedSlots(1) == 1, "limit=1 degrades to 1 (gate note 7)");
+    Require(ComputeFileRangeReservedSlots(2) == 1, "limit=2 degrades to 1");
+    Require(ComputeFileRangeReservedSlots(3) == 2, "limit=3 -> max(2,0)=2 (gate note 7 boundary)");
+    Require(ComputeFileRangeReservedSlots(4) == 2, "limit=4 (WAN floor) -> 2");
+    Require(ComputeFileRangeReservedSlots(8) == 2, "limit=8 -> 2");
+    Require(ComputeFileRangeReservedSlots(16) == 2, "limit=16 (LAN default) -> 2");
+    Require(ComputeFileRangeReservedSlots(24) == 3, "limit=24 -> 3");
+    Require(ComputeFileRangeReservedSlots(32) == 4, "limit=32 -> 4 (cap)");
+    Require(ComputeFileRangeReservedSlots(64) == 4, "limit=64 stays capped at 4");
+    for (uint32_t limit = 2; limit <= 64; ++limit) {
+        Require(ComputeFileRangeReservedSlots(limit) < limit,
+                "reserved must stay < limit so normal streams always keep >= 1 slot");
+    }
+}
+
+// ---- V-01 (AC-09/FR-1.4): batch-saturated lanes still yield file_range slots -------------
+void TC_FileRangeReservedSlotSurvivesBatchSaturation() {
+    const uint32_t limit = 16;                          // LAN default
+    const uint32_t reserved = ComputeFileRangeReservedSlots(limit);  // 2
+    // Batch traffic has filled every NORMAL slot on both lanes (inFlight == limit - reserved).
+    std::vector<LaneLoad> lanes = {
+        LaneLoad{true, limit - reserved, 1.0, 0},
+        LaneLoad{true, limit - reserved, 1.0, 0},
+    };
+    Require(SelectLeastLoadedLane(lanes, limit - reserved, false) == -1,
+            "normal streams must saturate at limit - reserved (batch cannot fill the band)");
+    const int idx = SelectLeastLoadedLane(lanes, limit, false);
+    Require(idx == 0,
+            "file_range (full-limit cap) must still allocate into the reserved band");
+    // Once the reserved band is also consumed, the hard cap rejects even file_range.
+    std::vector<LaneLoad> full = {
+        LaneLoad{true, limit, 1.0, 0},
+        LaneLoad{true, limit, 1.0, 0},
+    };
+    Require(SelectLeastLoadedLane(full, limit, false) == -1,
+            "file_range must never exceed the full streamLimit");
+}
+
+// ---- V-03 (AC-08/FR-1.5): reservation inactive -> normal cap == full limit ---------------
+void TC_FileRangeReservationInactiveZeroRegression() {
+    // When block mode is off / single NIC, the client's reservedSlots() returns 0, so every
+    // caller is capped at the full activeStreamLimit exactly as before the feature existed.
+    const uint32_t limit = 16;
+    const uint32_t reservedWhenInactive = 0;  // reservedSlots() gate result with block off
+    // A lane sitting in what WOULD be the reserved band (inFlight == limit - 1)...
+    std::vector<LaneLoad> lanes = {LaneLoad{true, limit - 1, 1.0, 0}};
+    // ...stays eligible for a NORMAL caller while the reservation is inactive (cap == limit)...
+    Require(SelectLeastLoadedLane(lanes, limit - reservedWhenInactive, false) == 0,
+            "with the reservation inactive the normal cap is the full limit (legacy behavior)");
+    // ...but the same lane is rejected for normal callers once the reservation is active.
+    Require(SelectLeastLoadedLane(lanes, limit - ComputeFileRangeReservedSlots(limit), false) == -1,
+            "with the reservation active a normal caller cannot enter the reserved band");
+    std::vector<LaneLoad> atFull = {LaneLoad{true, limit, 1.0, 0}};
+    Require(SelectLeastLoadedLane(atFull, limit - reservedWhenInactive, false) == -1,
+            "a lane at the full limit is still rejected when the reservation is inactive");
+}
+
 }  // namespace
 
 void RunLinkSchedulerTests() {
@@ -398,4 +467,8 @@ void RunLinkSchedulerTests() {
     TC_PrimaryDownAuxTieLowestIndex();
     TC_ForcePrimaryFallbackHonorsWeight();
     TC_ForcePrimaryFallbackDefaultWeightUnchanged();
+    // file_range reserved slots (T-block-lane-quota-and-h1-hash FR-1)
+    TC_FileRangeReservedSlotsTable();
+    TC_FileRangeReservedSlotSurvivesBatchSaturation();
+    TC_FileRangeReservationInactiveZeroRegression();
 }
