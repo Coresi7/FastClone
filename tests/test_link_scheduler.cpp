@@ -382,7 +382,9 @@ using fc::ComputeFileRangeReservedSlots;
 
 // ---- V-02 (AC-04/FR-1.2): reserved-slot table + the reserved < limit invariant -----------
 void TC_FileRangeReservedSlotsTable() {
-    Require(ComputeFileRangeReservedSlots(1) == 1, "limit=1 degrades to 1 (gate note 7)");
+    // T-streams1-reserved-starvation: limit=1 has nothing to reserve -> 0. A reserved value of
+    // 1 here starved normal streams to laneCap = 1 - 1 = 0 forever with --streams 1 + block.
+    Require(ComputeFileRangeReservedSlots(1) == 0, "limit=1 -> 0 (nothing to reserve)");
     Require(ComputeFileRangeReservedSlots(2) == 1, "limit=2 degrades to 1");
     Require(ComputeFileRangeReservedSlots(3) == 2, "limit=3 -> max(2,0)=2 (gate note 7 boundary)");
     Require(ComputeFileRangeReservedSlots(4) == 2, "limit=4 (WAN floor) -> 2");
@@ -391,9 +393,15 @@ void TC_FileRangeReservedSlotsTable() {
     Require(ComputeFileRangeReservedSlots(24) == 3, "limit=24 -> 3");
     Require(ComputeFileRangeReservedSlots(32) == 4, "limit=32 -> 4 (cap)");
     Require(ComputeFileRangeReservedSlots(64) == 4, "limit=64 stays capped at 4");
-    for (uint32_t limit = 2; limit <= 64; ++limit) {
-        Require(ComputeFileRangeReservedSlots(limit) < limit,
+    // System-level invariants over the full CLI value range (T-streams1-reserved-starvation):
+    // (a) reserved < limit, and (b) the NORMAL-stream cap limit - reserved is always >= 1, so
+    // normal streams can never be starved to 0 regardless of how small --streams is.
+    for (uint32_t limit = 1; limit <= 1024; ++limit) {
+        const uint32_t reserved = ComputeFileRangeReservedSlots(limit);
+        Require(reserved < limit,
                 "reserved must stay < limit so normal streams always keep >= 1 slot");
+        Require(limit - reserved >= 1,
+                "normal-stream cap (limit - reserved) must be >= 1 for every CLI --streams value");
     }
 }
 

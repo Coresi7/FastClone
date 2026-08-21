@@ -91,12 +91,16 @@ inline int SelectLeastLoadedLane(const std::vector<LaneLoad>& lanes,
 // miss-range) saturate at `streamLimit - reserved`, while file_range streams may use the full
 // `streamLimit`, so batch traffic can never starve block fan-out down to alloc=0.
 //   reserved = clamp(max(2, streamLimit/8), 2, 4), always < streamLimit (for streamLimit >= 2),
-// so normal streams always keep at least one slot (FR-1.2). Tiny limits (<= 2) degrade to 1.
+// so normal streams always keep at least one slot (FR-1.2). Tiny limits degrade to
+// streamLimit - 1 (limit=2 -> 1); limit=1 has nothing to reserve and degrades to 0, keeping
+// the normal-stream cap at the full limit so block and normal streams fairly share the single
+// slot (T-streams1-reserved-starvation: reserved==limit at limit=1 starved normal streams to
+// cap=0 forever).
 // Pure function; the caller gates activation (opt-in flag + server capability + >=2 healthy
 // lanes), so with block mode off this is never consulted (AC-08 zero regression).
 inline uint32_t ComputeFileRangeReservedSlots(uint32_t streamLimit) {
     if (streamLimit <= 2) {
-        return 1;  // degenerate tiny limit: reserve one, still leaving one normal slot at 2
+        return streamLimit - 1;  // degenerate tiny limit: 2 -> 1, 1 -> 0 (nothing to reserve)
     }
     uint32_t r = std::max<uint32_t>(2, streamLimit / 8);
     if (r > 4) {
