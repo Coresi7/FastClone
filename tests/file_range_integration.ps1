@@ -1,18 +1,21 @@
 # FastClone large-file block (file-range) integration test (Windows)
 # — T-largefile-block-multinic.
 #
-# Exercises the opt-in --large-file-block mode (multi-NIC block fan-out) end to end:
+# Exercises the --large-file-block mode (multi-NIC block fan-out) end to end. Since
+# T-largefile-block-auto-default the mode is three-state and defaults to AUTO (flag absent /
+# no value / the literal value auto): it activates whenever the server advertises the
+# file-range capability AND >=2 healthy links are up AND --large-file-lane is not given.
 #   FR-A  block mode ON, 2 loopback lanes: large files fan out as blocks across BOTH lanes,
 #         H1 hash prefetch + whole-file XXH3 verify + atomic rename; SHA256 bit-exact.
 #         Also covers V-10: one file is an exact block multiple, one has a short tail block.
-#   FR-B  block mode OFF (default), 2 lanes: legacy single-stream large file, zero regression
-#         (no file_range frames in the log).
+#   FR-B  block mode OFF via the explicit `--large-file-block off` form, 2 lanes: legacy
+#         single-stream large file, zero regression (no file_range frames in the log).
 #   FR-C  block mode ON but only 1 lane: gate falls back to the legacy path (AC-05).
 #   FR-D  block mode ON, 2 lanes, lane 2 through a throttled TCP proxy; the proxy is killed
 #         mid-transfer -> in-flight blocks reroute to the healthy lane and are re-fetched
 #         whole (idempotent, AC-03); final bytes stay SHA256 bit-exact.
-#   FR-E  block mode ON via the NO-VALUE form (`--large-file-block` alone -> default 32 MiB
-#         reference block); proves the opt-in path enables block mode end to end.
+#   FR-E  block mode via the NO-VALUE form (`--large-file-block` alone = AUTO, default 32 MiB
+#         reference block), 2 lanes: auto activates block mode end to end (C-4).
 #   FR-F  block mode ON + delta ON, 2 lanes: a large file whose local old version differs >65%
 #         from the server is admitted into delta then benefit-rejected (too different); the
 #         fallback is routed through block mode (kind=file_range) instead of single-stream.
@@ -21,6 +24,13 @@
 #         sends NO H1 HashRequest prefetch (client hash_req_sent == 0), and structural
 #         finalize validation still delivers SHA256-bit-exact bytes
 #         (T-block-lane-quota-and-h1-hash).
+#   FR-H  block mode ABSENT (default auto), 2 lanes: auto-activation with the 32 MiB
+#         reference block (plan shows block=33554432), blocks fan out on >=2 lanes,
+#         SHA256 bit-exact (T-largefile-block-auto-default AC-01/AC-03).
+#   FR-I  default auto + explicit --large-file-lane -> treated as off (C-3 case 1): no
+#         file_range frames, the lane-pinned legacy route still applies, exit 0 (AC-19).
+#   FR-J  --large-file-block 8M + --large-file-lane -> parse-time rejection (C-3 case 2):
+#         non-zero exit and the error message names BOTH flags (AC-20).
 #
 # Usage: .\tests\file_range_integration.ps1 [-ExePath path\to\FastClone.exe] [-Port 27910]
 
@@ -237,9 +247,12 @@ try {
     Write-Host "  OK FR-A: $($srcHashes.Count) files SHA256-match; file_range lanes: $($frConns -join ',')"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
 
-    # ============================ FR-B: block OFF, 2 lanes ===========================
+    # ================= FR-B: block OFF (explicit off form), 2 lanes ==================
+    # Since T-largefile-block-auto-default the DEFAULT is auto (which would activate on 2
+    # lanes), so the legacy regression path is pinned via the explicit off form instead
+    # (AC-07/AC-22): --large-file-block off keeps block mode unconditionally inactive.
     Write-Host ""
-    Write-Host "[FR-B] block mode OFF (default), 2 loopback lanes"
+    Write-Host "[FR-B] block mode OFF (explicit --large-file-block off), 2 loopback lanes"
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-b-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
@@ -247,7 +260,8 @@ try {
     ) -OutLog "$logDir\B-server.out" -ErrLog "$logDir\B-server.err"
     Start-Sleep -Seconds 1
     $clientArgsB = @("client", "--server", $serverAddr, "--target", $tgt,
-                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M")
+                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M",
+                     "--large-file-block", "off")
     $code = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsB -OutLog "$logDir\B-client.out" -ErrLog "$logDir\B-client.err"
     if ($code -ne 0) { throw "FR-B: client expected exit 0, got $code" }
     $srvCode = Wait-ExitCode -Proc $srv -TimeoutSec 120
@@ -257,7 +271,10 @@ try {
     if (Select-String -Path "$logDir\B-client.out" -Pattern 'kind=file_range' -Quiet) {
         throw "FR-B: unexpected kind=file_range with the switch OFF (AC-07 regression)"
     }
-    Write-Host "  OK FR-B: default path unchanged (no file_range frames), SHA256 match"
+    if (Select-String -Path "$logDir\B-client.out" -Pattern '\[file_range\]' -Quiet) {
+        throw "FR-B: unexpected [file_range] lines with the switch OFF (AC-07 regression)"
+    }
+    Write-Host "  OK FR-B: explicit off keeps the legacy path (no file_range frames), SHA256 match"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
 
     # ============================ FR-C: block ON, 1 lane =============================
@@ -283,19 +300,22 @@ try {
     Write-Host "  OK FR-C: single-lane fallback to legacy path, SHA256 match"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
 
-    # ================ FR-E: block ON via NO-VALUE switch, 2 lanes ====================
-    # Exercises the new no-value form `--large-file-block` (T-largefile-block-multinic
-    # follow-up): giving the flag without a size must enable block mode using the default
-    # 32 MiB reference block, and complete end to end with a clean verify + rename.
+    # ============ FR-E: NO-VALUE form = AUTO, 2 lanes (auto-activates) ==============
+    # Since T-largefile-block-auto-default (C-4) the no-value form `--large-file-block`
+    # classifies as AUTO (not force-on): with 2 healthy lanes + this server build the auto
+    # gate activates block mode with the default 32 MiB reference block, and completes end
+    # to end with a clean verify + rename. Assertion shapes (multi connId + done + SHA256)
+    # are unchanged from the pre-auto semantics (AC-22/AC-06).
     Write-Host ""
-    Write-Host "[FR-E] block mode ON via no-value switch (default 32M), 2 loopback lanes"
+    Write-Host "[FR-E] no-value form = auto (default 32M), auto-activates on 2 loopback lanes"
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-e-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
     ) -OutLog "$logDir\E-server.out" -ErrLog "$logDir\E-server.err"
     Start-Sleep -Seconds 1
-    # No-value form: `--large-file-block` with no size -> default 32 MiB reference block.
+    # No-value form: `--large-file-block` with no size -> AUTO with the default 32 MiB
+    # reference block (C-4); the auto gate activates it here (2 lanes + capable server).
     $clientArgsE = @("client", "--server", $serverAddr, "--target", $tgt,
                      "--password", $password) + $twoLinks + @("--large-file-threshold", "8M", "--large-file-block")
     $code = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsE -OutLog "$logDir\E-client.out" -ErrLog "$logDir\E-client.err"
@@ -314,7 +334,7 @@ try {
     if (Select-String -Path "$logDir\E-client.out" -Pattern 'file_range_finalize_failed' -Quiet) {
         throw "FR-E: unexpected finalize failure"
     }
-    Write-Host "  OK FR-E: no-value switch enabled block mode (32M default), SHA256 match; lanes: $($frConnsE -join ',')"
+    Write-Host "  OK FR-E: no-value = auto, block mode auto-activated (32M default), SHA256 match; lanes: $($frConnsE -join ',')"
     Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
 
     # ================= FR-D: block ON, 2 lanes, kill lane mid-transfer ================
@@ -554,6 +574,121 @@ try {
     }
     Write-Host "  OK FR-G: file_range alloc=$allocG lanes=$($frConnsG -join ','), hash_req_sent=0, SHA256 match"
     Remove-Item -Recurse -Force $tgtG -ErrorAction SilentlyContinue
+
+    # ============ FR-H: default ABSENT (auto) + 2 lanes -> auto-activation ============
+    # T-largefile-block-auto-default AC-01/AC-03: no --large-file-block on the command line at
+    # all -> Auto; with 2 healthy lanes + this server build block mode activates by DEFAULT
+    # with the 32 MiB reference block (plan shows block=33554432; the >=32 MiB file slices
+    # into blocks=ceil(size/32MiB)=3), fans out on >=2 lanes, SHA256 bit-exact.
+    # Uses its OWN fixture directory: FR-D/FR-F above mutate $src, and the plan assertion
+    # needs a file >= the 32 MiB reference block (New-TestFixture files are smaller).
+    Write-Host ""
+    Write-Host "[FR-H] default auto (no block flag), 2 loopback lanes -> auto-activation"
+    $srcH = Join-Path $root "src-h"
+    New-Item -ItemType Directory -Force -Path $srcH | Out-Null
+    Set-Content -Path (Join-Path $srcH "notes.txt") -Value "small batch file" -NoNewline
+    New-PatternFile -Path (Join-Path $srcH "small_64k.bin") -Size 65536 -Seed 11
+    # 80 MiB + 123 bytes -> 2 full 32 MiB reference blocks + a tail block (blocks=3).
+    New-PatternFile -Path (Join-Path $srcH "large_auto.bin") -Size (80L * 1024 * 1024 + 123) -Seed 71
+    $srcHashesH = Get-FileHashTree -Root $srcH
+    $tgtH = Join-Path $env:TEMP "fc-fr-tgt-h-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgtH | Out-Null
+    $srvH = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $srcH, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\H-server.out" -ErrLog "$logDir\H-server.err"
+    Start-Sleep -Seconds 1
+    # No --large-file-block at all: the default auto gate must activate block mode.
+    $clientArgsH = @("client", "--server", $serverAddr, "--target", $tgtH,
+                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M")
+    $codeH = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsH -OutLog "$logDir\H-client.out" -ErrLog "$logDir\H-client.err"
+    if ($codeH -ne 0) { throw "FR-H: client expected exit 0, got $codeH" }
+    $srvHCode = Wait-ExitCode -Proc $srvH -TimeoutSec 120
+    if ($srvHCode -ne 0) { throw "FR-H: server --once expected exit 0, got $srvHCode" }
+    $diffH = Compare-FileHashTrees -Src $srcHashesH -Tgt (Get-FileHashTree -Root $tgtH)
+    if ($null -ne $diffH) { throw "FR-H: DATA INTEGRITY FAILURE: $diffH" }
+    if (-not (Select-String -Path "$logDir\H-client.out" -Pattern 'kind=file_range' -Quiet)) {
+        throw "FR-H: expected kind=file_range (default auto must activate on 2 lanes)"
+    }
+    $frConnsH = Get-FileRangeConnIds -LogPath "$logDir\H-client.out"
+    if ($frConnsH.Count -lt 2) {
+        throw "FR-H: expected file_range blocks on >=2 lanes, got connIds: $($frConnsH -join ',')"
+    }
+    # AC-03: the default auto block is the 32 MiB reference; the 80 MiB+123 file plans 3 blocks.
+    if (-not (Select-String -Path "$logDir\H-client.out" -Pattern '\[file_range\] plan .*block=33554432 blocks=3' -Quiet)) {
+        throw "FR-H: expected '[file_range] plan ... block=33554432 blocks=3' (default 32 MiB reference block)"
+    }
+    if (-not (Select-String -Path "$logDir\H-client.out" -Pattern '\[file_range\] done' -Quiet)) {
+        throw "FR-H: missing '[file_range] done' (block finalize log)"
+    }
+    if (Select-String -Path "$logDir\H-client.out" -Pattern 'file_range_finalize_failed' -Quiet) {
+        throw "FR-H: unexpected finalize failure"
+    }
+    Write-Host "  OK FR-H: default auto activated (block=33554432, lanes: $($frConnsH -join ',')), SHA256 match"
+    Remove-Item -Recurse -Force $tgtH -ErrorAction SilentlyContinue
+
+    # ============ FR-I: default auto + explicit --large-file-lane -> treated as off ======
+    # T-largefile-block-auto-default AC-19 (C-3 case 1): the PRESENCE of --large-file-lane is
+    # the mutual-exclusion signal; auto folds to off (lane wins) -> NO file_range frames, and
+    # the lane pinning still applies to legacy large files (kind=file ... large=1 primary=1).
+    # (The lane value domain is primary|aux|auto; the requirements' `... lane 1` shorthand
+    # maps to `primary`.)
+    # Uses its OWN fixture directory (FR-D/FR-F mutate $src).
+    Write-Host ""
+    Write-Host "[FR-I] default auto + --large-file-lane primary -> treated as off, 2 loopback lanes"
+    $srcI = Join-Path $root "src-i"
+    New-Item -ItemType Directory -Force -Path $srcI | Out-Null
+    New-TestFixture -Src $srcI
+    $srcHashesI = Get-FileHashTree -Root $srcI
+    $tgtI = Join-Path $env:TEMP "fc-fr-tgt-i-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgtI | Out-Null
+    $srvI = Start-FastCloneProcess -Exe $exe -CliArgs @(
+        "server", "--dir", $srcI, "--password", $password, "--port", "$Port", "--once"
+    ) -OutLog "$logDir\I-server.out" -ErrLog "$logDir\I-server.err"
+    Start-Sleep -Seconds 1
+    $clientArgsI = @("client", "--server", $serverAddr, "--target", $tgtI,
+                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M",
+                     "--large-file-lane", "primary")
+    $codeI = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsI -OutLog "$logDir\I-client.out" -ErrLog "$logDir\I-client.err"
+    if ($codeI -ne 0) { throw "FR-I: client expected exit 0, got $codeI" }
+    $srvICode = Wait-ExitCode -Proc $srvI -TimeoutSec 120
+    if ($srvICode -ne 0) { throw "FR-I: server --once expected exit 0, got $srvICode" }
+    $diffI = Compare-FileHashTrees -Src $srcHashesI -Tgt (Get-FileHashTree -Root $tgtI)
+    if ($null -ne $diffI) { throw "FR-I: DATA INTEGRITY FAILURE: $diffI" }
+    if (Select-String -Path "$logDir\I-client.out" -Pattern 'kind=file_range' -Quiet) {
+        throw "FR-I: unexpected kind=file_range (auto+lane must fold to off)"
+    }
+    if (Select-String -Path "$logDir\I-client.out" -Pattern '\[file_range\]' -Quiet) {
+        throw "FR-I: unexpected [file_range] lines (auto+lane must fold to off)"
+    }
+    # Lane routing still observable: large files take the legacy single-stream path pinned to
+    # the primary lane (alloc kind=file ... large=1 primary=1).
+    if (-not (Select-String -Path "$logDir\I-client.out" -Pattern 'kind=file connId=\d+ .*large=1 primary=1' -Quiet)) {
+        throw "FR-I: expected a lane-pinned legacy large-file alloc (kind=file large=1 primary=1)"
+    }
+    Write-Host "  OK FR-I: auto+lane folded to off (no file_range), lane pinning applied, SHA256 match"
+    Remove-Item -Recurse -Force $tgtI -ErrorAction SilentlyContinue
+
+    # ============ FR-J: forced ON (size) + --large-file-lane -> parse-time rejection =====
+    # T-largefile-block-auto-default AC-20 (C-3 case 2): an explicit contradiction must be
+    # rejected at parse time -- non-zero exit, the error message names BOTH flags, and no
+    # side is silently adopted. No server is needed: parsing fails before any connection.
+    Write-Host ""
+    Write-Host "[FR-J] --large-file-block 8M + --large-file-lane primary -> non-zero exit"
+    $tgtJ = Join-Path $env:TEMP "fc-fr-tgt-j-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $tgtJ | Out-Null
+    $clientArgsJ = @("client", "--server", $serverAddr, "--target", $tgtJ,
+                     "--password", $password) + $twoLinks + @("--large-file-threshold", "8M",
+                     "--large-file-block", "8M", "--large-file-lane", "primary")
+    $codeJ = Invoke-FastCloneSync -Exe $exe -CliArgs $clientArgsJ -OutLog "$logDir\J-client.out" -ErrLog "$logDir\J-client.err"
+    if ($codeJ -eq 0) { throw "FR-J: client expected a NON-zero exit (on+lane must be rejected), got 0" }
+    if (-not (Select-String -Path "$logDir\J-client.err" -Pattern '--large-file-block' -Quiet)) {
+        throw "FR-J: error message must name --large-file-block"
+    }
+    if (-not (Select-String -Path "$logDir\J-client.err" -Pattern '--large-file-lane' -Quiet)) {
+        throw "FR-J: error message must name --large-file-lane"
+    }
+    Write-Host "  OK FR-J: on+lane rejected at parse time (exit=$codeJ), error names both flags"
+    Remove-Item -Recurse -Force $tgtJ -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host "All file-range integration tests passed. Logs: $logDir"

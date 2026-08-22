@@ -422,45 +422,77 @@ void RunCliTests() {
     ExpectThrowWith(clientArgs({"--delta-min-size", ""}), "--delta-min-size");
     ExpectThrowWith(clientArgs({"--delta-min-size", "5X"}), "--delta-min-size");
 
-    // ---- T-largefile-block-multinic V-13 (AC-13/AC-07): --large-file-block parsing --------
-    // Opt-in: flag absent -> mode OFF, field keeps the 32 MiB reference value.
+    // ---- T-largefile-block-auto-default V-13~V-18 (AC-13~AC-18): --large-file-block
+    // ---- three-state parsing (C-1/C-4: value domain {auto, off, <size>}) -----------------
+    // AC-13(a): flag absent -> Auto, keeps the 32 MiB reference block size, intent allowed.
     {
         const fc::CliOptions opt = Parse(clientArgs({}));
-        Require(!opt.largeFileBlockFlagged, "Expected block mode OFF by default (opt-in)");
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected block mode Auto by default");
         Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
                 "Expected default 32 MiB block size");
+        Require(opt.largeFileBlockAllowed(), "Expected default intent allowed (Auto, no lane)");
+        Require(!opt.largeFileLaneFlagged, "Expected no lane signal by default");
     }
-    // No-value form: --large-file-block enables block mode with the default 32 MiB block.
+    // AC-13(c): no-value form -> Auto with the default 32 MiB block (NOT force-on).
     {
         const fc::CliOptions opt = Parse(clientArgs({"--large-file-block"}));
-        Require(opt.largeFileBlockFlagged, "Expected flag set with no value");
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected no-value form classified as Auto (not On)");
         Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
                 "Expected default 32 MiB when size omitted");
+        Require(opt.largeFileBlockAllowed(), "Expected no-value Auto intent allowed");
     }
-    // No-value form followed by another flag (heuristic: next token starts with --).
+    // AC-06/AC-13(c): no-value form followed by another flag (heuristic: next token starts
+    // with --) -> still Auto; the following flag is not consumed as a size.
     {
         const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "--diag"}));
-        Require(opt.largeFileBlockFlagged, "Expected flag set before another flag");
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected no-value form before another flag classified as Auto");
         Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
                 "Expected default 32 MiB when size omitted");
+        Require(opt.diagnostics, "Expected --diag still parsed (not swallowed as a size)");
     }
-    // With a value: K|M|G suffix accepted; lower bound 1M, 32M reference, upper bound 4G.
-    // (Bare numbers are interpreted as bytes, NOT KiB -- so a value below 1M is rejected.)
+    // AC-13(d)/AC-17: explicit "auto" keyword -> Auto (self-documenting, identical to the
+    // flag being absent); the keyword is special-cased BEFORE size parsing, so it is never
+    // swallowed by the next-token size heuristic.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "auto"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected explicit auto keyword classified as Auto");
+        Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
+                "Expected default 32 MiB with explicit auto");
+        Require(opt.largeFileBlockAllowed(), "Expected explicit auto intent allowed");
+    }
+    // AC-13(b)/AC-17: explicit "off" keyword -> Off, intent never allowed; likewise
+    // special-cased before size parsing.
+    {
+        const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "off"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Off,
+                "Expected explicit off keyword classified as Off");
+        Require(!opt.largeFileBlockAllowed(), "Expected off intent never allowed");
+    }
+    // AC-13(e): a <size> value -> On (the only force-on entry, C-2); K|M|G suffix accepted;
+    // lower bound 1M, 32M reference, upper bound 4G. (Bare numbers are interpreted as bytes,
+    // NOT KiB -- so a value below 1M is rejected.)
     {
         const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "1M"}));
-        Require(opt.largeFileBlockFlagged, "Expected flag set when given");
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::On,
+                "Expected size form classified as On");
         Require(opt.largeFileBlockBytes == 1ULL * 1024 * 1024, "Expected 1M = 1 MiB");
+        Require(opt.largeFileBlockAllowed(), "Expected On intent allowed");
     }
     {
         const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "32M"}));
-        Require(opt.largeFileBlockFlagged && opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
-                "Expected 32M = 32 MiB");
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::On &&
+                    opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
+                "Expected 32M = On + 32 MiB (force-on with the default block)");
     }
     {
         const fc::CliOptions opt = Parse(clientArgs({"--large-file-block", "4G"}));
-        Require(opt.largeFileBlockFlagged &&
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::On &&
                     opt.largeFileBlockBytes == 4ULL * 1024 * 1024 * 1024,
-                "Expected 4G = 4 GiB (upper bound)");
+                "Expected 4G = On + 4 GiB (upper bound)");
     }
     // Strict rejection: 0, below/above range, non power-of-two, non-numeric, empty, bad suffix.
     ExpectThrowWith(clientArgs({"--large-file-block", "0"}), "--large-file-block");
@@ -472,6 +504,88 @@ void RunCliTests() {
     ExpectThrowWith(clientArgs({"--large-file-block", "abc"}), "--large-file-block");
     ExpectThrowWith(clientArgs({"--large-file-block", ""}), "--large-file-block");
     ExpectThrowWith(clientArgs({"--large-file-block", "8X"}), "--large-file-block");
+    // AC-15: "on" is NOT a legal value -- rejected like an illegal size, and the message must
+    // spell out the legal value set {auto, off, <size>}.
+    ExpectThrowWith(clientArgs({"--large-file-block", "on"}), "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "on"}), "auto|off|<size>");
+
+    // AC-16 (FR-07): repeated --large-file-block occurrences resolve last-one-wins; all of
+    // these parse successfully (distinct from the FR-06 off-then-bare-size rejection below).
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "8M", "--large-file-block", "off"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Off,
+                "Expected last occurrence wins: 8M then off -> Off");
+    }
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "off", "--large-file-block"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected trailing no-value occurrence wins: off then no-value -> Auto");
+        Require(opt.largeFileBlockBytes == 32ULL * 1024 * 1024,
+                "Expected Auto to keep the 32 MiB reference block");
+    }
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "auto", "--large-file-block", "8M"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::On,
+                "Expected last occurrence wins: auto then 8M -> On");
+        Require(opt.largeFileBlockBytes == 8ULL * 1024 * 1024, "Expected On + 8 MiB");
+    }
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "off", "--large-file-block", "off"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Off,
+                "Expected repeated off idempotent (Off)");
+    }
+    // AC-14 (FR-06/D-04): once `off` consumed its keyword the branch ends; a following bare
+    // size token is NOT consumed by the flag and falls to the Unknown argument branch
+    // (non-zero exit, message points at the stray token).
+    ExpectThrowWith(clientArgs({"--large-file-block", "off", "8M"}), "Unknown argument");
+    ExpectThrowWith(clientArgs({"--large-file-block", "off", "8M"}), "8M");
+
+    // AC-18 (FR-17~FR-20, C-3): three-state x lane mutual-exclusion matrix. (The lane value
+    // domain is primary|aux|auto; the requirements' shorthand `--large-file-lane 1` maps to
+    // `primary` -- the first/primary lane.)
+    // (a) Auto (no-value form) + explicit lane -> parses fine; Auto stays observable, the
+    //     lane signal is set, and the intent folds to not-allowed at the runtime gate
+    //     (C-3 case 1, lane wins).
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "--large-file-lane", "primary"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected auto+lane keeps Auto classification");
+        Require(opt.largeFileLaneFlagged, "Expected lane signal set");
+        Require(!opt.largeFileBlockAllowed(),
+                "Expected auto+lane intent folded to not-allowed (lane wins)");
+    }
+    // (b) Explicit auto + explicit `--large-file-lane auto` (value equals the default) ->
+    //     same as (a): the PRESENCE of the lane flag is the exclusion signal (B-16).
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "auto", "--large-file-lane", "auto"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Auto,
+                "Expected explicit auto + lane auto keeps Auto classification");
+        Require(opt.largeFileLaneFlagged, "Expected lane signal set for explicit lane auto");
+        Require(!opt.largeFileBlockAllowed(),
+                "Expected explicit auto+lane folded to not-allowed (B-16)");
+    }
+    // (c) On (forced via <size>) + explicit lane -> parse-time rejection naming BOTH flags
+    //     (C-3 case 2, D-05).
+    ExpectThrowWith(clientArgs({"--large-file-block", "8M", "--large-file-lane", "primary"}),
+                    "--large-file-block");
+    ExpectThrowWith(clientArgs({"--large-file-block", "8M", "--large-file-lane", "primary"}),
+                    "--large-file-lane");
+    // (d) Off + explicit lane -> legal combination (C-3 case 3): parses fine, Off kept, the
+    //     lane signal is set, and the intent stays not-allowed.
+    {
+        const fc::CliOptions opt =
+            Parse(clientArgs({"--large-file-block", "off", "--large-file-lane", "primary"}));
+        Require(opt.largeFileBlockMode == fc::LargeFileBlockMode::Off,
+                "Expected off+lane keeps Off classification");
+        Require(opt.largeFileLaneFlagged, "Expected lane signal set with off+lane");
+        Require(!opt.largeFileBlockAllowed(), "Expected off+lane intent not allowed");
+    }
 
     // ---- unbuffered-writes V-01/V-02/V-03 (AC-01/AC-02/AC-03): --unbuffered-writes parsing ------
     // V-01 (AC-01): absent -> false (default, zero regression).

@@ -2219,14 +2219,18 @@ int RunClient(const CliOptions& options) {
     };
 
     // File-range reserved slots (T-block-lane-quota-and-h1-hash FR-1, design section 3.1.6).
-    // The reservation is ONLY live while block mode can actually fan out (opt-in flag + server
-    // kCapFileRange + >=2 healthy lanes); otherwise it is 0 and every caller sees the full
-    // activeStreamLimit, keeping the block-off / single-NIC behavior byte-for-byte identical to
-    // before (AC-08). Lazy evaluation: activeStreamLimit can be halved by the WAN failure-rate
-    // backoff (main loop, same thread as every pickConnection call), so the reserved count is
-    // recomputed from the CURRENT limit on every pick instead of being snapshotted.
+    // The reservation is ONLY live while block mode can actually fan out (user intent allows
+    // it + server kCapFileRange + >=2 healthy lanes); otherwise it is 0 and every caller sees
+    // the full activeStreamLimit, keeping the block-off / single-NIC behavior byte-for-byte
+    // identical to before (AC-08). Lazy evaluation: activeStreamLimit can be halved by the WAN
+    // failure-rate backoff (main loop, same thread as every pickConnection call), so the
+    // reserved count is recomputed from the CURRENT limit on every pick instead of being
+    // snapshotted.
     auto blockModeActive = [&]() -> bool {
-        return options.largeFileBlockFlagged && serverCapFileRange && (healthyConnCount() >= 2);
+        // T-largefile-block-auto-default: the static intent predicate largeFileBlockAllowed()
+        // (three-state mode + Auto-with-lane fold, D-03) replaces the old opt-in flag; the
+        // objective conditions (server capability + >=2 healthy lanes) are unchanged.
+        return options.largeFileBlockAllowed() && serverCapFileRange && (healthyConnCount() >= 2);
     };
     auto reservedSlots = [&]() -> uint32_t {
         if (!blockModeActive()) {
@@ -2286,7 +2290,8 @@ int RunClient(const CliOptions& options) {
     // Large-file block mode admission gate (T-largefile-block-multinic §3.2,
     // AC-01/04/05/07/08). Mirrors the tryEnterDelta layering: admitted files never enter
     // regularQueue; they fan out as blocks via tryStartFileRanges. All conditions required:
-    //   --large-file-block explicitly given (opt-in, AC-07)  AND
+    //   block mode allowed by the user's CLI intent (T-largefile-block-auto-default:
+    //   three-state largeFileBlockAllowed(), i.e. On, or Auto without --large-file-lane) AND
     //   server advertised kCapFileRange (AC-08)                 AND
     //   remote fileSize >= largeFileThresholdBytes (AC-01/04)   AND
     //   >= 2 healthy lanes (AC-01/05)                           AND
@@ -2299,7 +2304,9 @@ int RunClient(const CliOptions& options) {
     // gate + size finalize + atomic rename) -- the same integrity model as the master
     // single-stream path, which never content-verifies either.
     tryEnterFileRange = [&](const std::string& rel) -> bool {
-        if (!options.largeFileBlockFlagged || !serverCapFileRange) {
+        // Same shared intent predicate as blockModeActive (D-03): largeFileBlockAllowed()
+        // folds Auto+lane to not-allowed here, so the two gates can never drift apart.
+        if (!options.largeFileBlockAllowed() || !serverCapFileRange) {
             return false;
         }
         if (fileRangeAbandoned.contains(rel) || fileRangeStates.contains(rel) ||

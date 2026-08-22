@@ -309,6 +309,9 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             }
             options.auxWeight = w;
         } else if (arg == "--large-file-lane") {
+            // Presence is the C-3 mutual-exclusion signal against block mode (FR-17), set
+            // regardless of the value (explicit "auto" counts too; PM inference B-16).
+            options.largeFileLaneFlagged = true;
             // Large-file lane policy primary|aux|auto (FR-12).
             const std::string& v = ArgAt(args, ++i);
             if (v == "primary") {
@@ -321,25 +324,41 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
                 throw std::runtime_error("Invalid --large-file-lane (expected primary|aux|auto)");
             }
         } else if (arg == "--large-file-block") {
-            // Large-file block mode opt-in (T-largefile-block-multinic, AC-13). The value is an
-            // optional block size with a K|M|G suffix; giving the flag at all enables the mode
-            // (largeFileBlockFlagged). With no value the 32 MiB reference block size is used.
-            // Strict validation: power-of-two bytes in [1M, 4G]; anything else throws instead of
-            // silently adopting a dangerous default.
-            uint64_t blockBytes = options.largeFileBlockBytes;  // default 32 MiB
+            // Large-file block mode three-state classification (T-largefile-block-auto-default,
+            // C-1/C-4): the value domain is {auto, off, <size>}. No value -> Auto; the keywords
+            // "off"/"auto" are special-cased BEFORE size parsing (FR-08); anything else goes
+            // through strict size parsing and classifies as On (size is the only force-on
+            // entry, C-2). "on" is NOT a legal value: reject it with the legal value set in
+            // the message (FR-01/AC-15). Repeated occurrences simply overwrite mode+bytes, so
+            // the LAST occurrence wins (FR-07). D-04: once a keyword is consumed this branch
+            // ends without consuming any further bare token, so `--large-file-block off 8M`
+            // leaves `8M` to the Unknown argument branch (FR-06/AC-14).
+            options.largeFileBlockMode = LargeFileBlockMode::Auto;  // no-value default
+            uint64_t blockBytes = 32ULL * 1024 * 1024;              // Auto/Off stay at 32 MiB
             if (i + 1 < args.size() && !args[i + 1].starts_with("--")) {
-                const uint64_t v =
-                    ParseSizeBytesStrict(ArgAt(args, ++i), "--large-file-block");
-                constexpr uint64_t kMin = 1ULL * 1024 * 1024;          // 1 MiB lower bound
-                constexpr uint64_t kMax = 4ULL * 1024 * 1024 * 1024;    // 4 GiB upper bound
-                if (v < kMin || v > kMax || (v & (v - 1)) != 0) {
+                const std::string& tok = ArgAt(args, ++i);
+                if (tok == "off") {
+                    options.largeFileBlockMode = LargeFileBlockMode::Off;
+                } else if (tok == "auto") {
+                    // Explicit auto: self-documenting, identical to the flag being absent.
+                } else if (tok == "on") {
                     throw std::runtime_error(
-                        "Invalid --large-file-block (range 1M..4G, power of two; suffix K|M|G)");
+                        "Invalid --large-file-block (expected auto|off|<size>; 'on' is not a "
+                        "value; use --large-file-block <size> to force on)");
+                } else {
+                    const uint64_t v = ParseSizeBytesStrict(tok, "--large-file-block");
+                    constexpr uint64_t kMin = 1ULL * 1024 * 1024;          // 1 MiB lower bound
+                    constexpr uint64_t kMax = 4ULL * 1024 * 1024 * 1024;    // 4 GiB upper bound
+                    if (v < kMin || v > kMax || (v & (v - 1)) != 0) {
+                        throw std::runtime_error(
+                            "Invalid --large-file-block (range 1M..4G, power of two; suffix "
+                            "K|M|G; or auto|off)");
+                    }
+                    blockBytes = v;
+                    options.largeFileBlockMode = LargeFileBlockMode::On;
                 }
-                blockBytes = v;
             }
             options.largeFileBlockBytes = blockBytes;
-            options.largeFileBlockFlagged = true;
         } else if (arg == "--link") {
             options.linkPins.push_back(ParseLinkPin(ArgAt(args, ++i), options.port));
         } else if (arg == "--password") {
@@ -438,6 +457,16 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (options.exitAfterSync && options.onceMulti) {
         throw std::runtime_error("--once and --once-multi are mutually exclusive");
     }
+    // C-3 case 2 (FR-19/AC-20): forced block mode (On via explicit <size>) + an explicit
+    // --large-file-lane is an explicit contradiction (block fan-out vs single-stream lane
+    // pinning). Reject at parse time (D-05); the message names BOTH flags. Auto+lane is NOT
+    // an error (it folds to off at the runtime gate, FR-18); off+lane is legal (FR-20).
+    if (options.largeFileBlockMode == LargeFileBlockMode::On && options.largeFileLaneFlagged) {
+        throw std::runtime_error(
+            "--large-file-block and --large-file-lane are mutually exclusive: forced block "
+            "mode cannot combine with lane pinning (use --large-file-block off + "
+            "--large-file-lane, or drop --large-file-lane)");
+    }
     if (options.exitAfterSync && options.enableHashMemcache) {
         throw std::runtime_error("--once and --enable-hash-memcache are mutually exclusive");
     }
@@ -469,7 +498,7 @@ std::string BuildUsageText() {
         "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"
-        "      [--large-file-block [<size>]]\n"
+        "      [--large-file-block [auto|off|<size>]]\n"
         "      [--delta-min-size <size>] [--unbuffered-writes]\n"
         "      [--tcp-send-buffer <size>] [--tcp-recv-buffer <size>]\n"
         "      [--link <localIP|iface>=<serverIP[:port]>]...\n"
@@ -479,17 +508,24 @@ std::string BuildUsageText() {
         "  --large-file-threshold pins files >= <size> to the primary link (default 1G, suffix K|M|G).\n"
         "  --aux-weight sets the ordering weight of every aux link (default 1.0, range (0,16]); higher\n"
         "      values pull proportionally more transfers onto aux links.\n"
-        "  --large-file-lane routes large files: primary (pin), aux (weighted), or auto (aux when\n"
-        "      --aux-weight >= 2.0, else primary); default auto.\n"
-        "  --large-file-block [<size>] (opt-in, default OFF) enables large-file block mode:\n"
+        "  --large-file-lane routes large files on the legacy single-stream path: primary (pin),\n"
+        "      aux (weighted), or auto (aux when --aux-weight >= 2.0, else primary); default auto.\n"
+        "      Mutually exclusive with block mode: giving --large-file-lane at all (any value)\n"
+        "      opts out of block-mode auto-activation (auto is treated as off), and combining it\n"
+        "      with --large-file-block <size> (forced on) is rejected as an error. Only\n"
+        "      --large-file-block off + --large-file-lane is a legal combination.\n"
+        "  --large-file-block [auto|off|<size>] controls large-file block mode (default auto):\n"
         "      files >= --large-file-threshold are sliced into blocks and fetched in parallel\n"
         "      across ALL healthy links, then verified whole-file (XXH3-128) before an atomic\n"
-        "      rename. <size> is optional (suffix K|M|G, range 1M..4G, power of two; default\n"
-        "      32M = the reference block size); when omitted the 32 MiB reference block size is\n"
-        "      used. Takes effect only with >=2 healthy links and a server advertising the\n"
-        "      file-range capability; otherwise the legacy single-stream path runs unchanged.\n"
-        "      Small files and single-link syncs are never affected. When block mode is on,\n"
-        "      --large-file-lane only applies to large files NOT in block mode.\n"
+        "      rename. auto (flag absent, given without a value, or the literal value auto)\n"
+        "      activates block mode whenever the server advertises the file-range capability\n"
+        "      AND >=2 healthy links are up AND --large-file-lane is not given -- multi-link\n"
+        "      setups now enter block mode by default (block size is the 32 MiB reference).\n"
+        "      <size> (suffix K|M|G, range 1M..4G, power of two) forces block mode on with\n"
+        "      that block size, still subject to the server capability and >=2 healthy links.\n"
+        "      off keeps the legacy single-stream path unconditionally; with off, behavior is\n"
+        "      byte-for-byte identical to versions before block mode existed. Small files and\n"
+        "      single-link syncs are never affected.\n"
         "  --delta-min-size enables block-level binary delta for changed files >= <size> (default 0\n"
         "      = disabled; positive range 1M..1T, suffix K|M|G); orthogonal to --large-file-threshold.\n"
         "  --unbuffered-writes (client-only, default off) sets unbuffered write INTENT for client\n"

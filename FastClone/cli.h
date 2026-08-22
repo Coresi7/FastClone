@@ -23,6 +23,18 @@ enum class LargeFileLane {
     Auto
 };
 
+// Large-file block mode intent (T-largefile-block-auto-default, C-4). Three states:
+//   Auto: flag absent / no value / explicit "auto"; activation is decided at runtime
+//         (server kCapFileRange + >=2 healthy links + no explicit --large-file-lane),
+//         with the default 32 MiB block.
+//   On  : explicit <size> (the only force-on entry); block size = largeFileBlockBytes.
+//   Off : explicit "off"; never activates.
+enum class LargeFileBlockMode {
+    Auto,
+    On,
+    Off
+};
+
 // Explicit client->server link pin (design section 9.3 / FR-008). Established verbatim; the
 // list order defines the primary link. local may be a source IP or an interface name.
 struct LinkPin {
@@ -71,16 +83,32 @@ struct CliOptions {
     // Large-file lane policy (aux-weight FR-12). Default Auto; with default auxWeight (<2.0)
     // Auto keeps the legacy primary-pin behavior, so the default is zero regression.
     LargeFileLane largeFileLane = LargeFileLane::Auto;
-    // Large-file block (file-range) transfer (T-largefile-block-multinic, opt-in). Block size
-    // in bytes for slicing large files across multiple NIC lanes; default 32 MiB. Fully
-    // orthogonal to largeFileThresholdBytes (which only decides WHAT is large). Block mode is
-    // enabled only when largeFileBlockFlagged is true (--large-file-block explicitly given,
-    // with an optional K|M|G size; omitted size defaults to 32 MiB); otherwise the legacy
-    // single-lane large-file path runs unchanged (zero regression). Range [1M, 4G], power of
-    // two, enforced by the CLI parser.
+    // Large-file block (file-range) transfer (T-largefile-block-auto-default, C-4). Three-state
+    // intent: Auto (default / no value / explicit "auto") activates at runtime when the server
+    // advertises kCapFileRange and >=2 healthy links are up and --large-file-lane was NOT given;
+    // On (explicit <size>) forces the mode on subject to the same objective limits; Off
+    // (explicit "off") keeps the legacy single-lane large-file path unconditionally (the
+    // zero-regression escape hatch, byte-for-byte identical to the pre-block-mode default).
+    LargeFileBlockMode largeFileBlockMode = LargeFileBlockMode::Auto;
+    // Block size in bytes for slicing large files across multiple NIC lanes. Only consumed in
+    // the On state (parsed <size>, range [1M, 4G], power of two, enforced by the CLI parser);
+    // Auto/Off always keep the 32 MiB reference default. Fully orthogonal to
+    // largeFileThresholdBytes (which only decides WHAT is large).
     uint64_t largeFileBlockBytes = 32ULL * 1024ULL * 1024ULL;
-    // True only when --large-file-block was explicitly supplied (opt-in marker).
-    bool largeFileBlockFlagged = false;
+    // True when --large-file-lane appeared on the command line at all (including the explicit
+    // "auto" value, which is indistinguishable from the default in largeFileLane itself).
+    // Presence is the C-3 mutual-exclusion signal against block mode (D-02).
+    bool largeFileLaneFlagged = false;
+    // Static "is block mode allowed by the user" intent predicate, shared by both runtime
+    // gates (blockModeActive / tryEnterFileRange) so the two cannot drift (D-03).
+    // On is always allowed (On+lane already throws at parse time, so On never coexists with
+    // laneFlagged here); Auto folds to not-allowed when --large-file-lane appeared (C-3 case 1,
+    // folded at the runtime gate, not at parse time, so the Auto+lane signal stays
+    // observable); Off is never allowed.
+    bool largeFileBlockAllowed() const {
+        return largeFileBlockMode == LargeFileBlockMode::On ||
+               (largeFileBlockMode == LargeFileBlockMode::Auto && !largeFileLaneFlagged);
+    }
     // Server endpoints for the connection pool (FR-005). servers[0] mirrors host/port for
     // call-site compatibility; multi-value via comma-separated or repeated --server.
     std::vector<std::pair<std::string, uint16_t>> servers;
