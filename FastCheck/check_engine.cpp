@@ -5,6 +5,7 @@
 #include "disk_io_driver.h"
 #include "file_index.h"
 #include "protocol_codec.h"
+#include "sync_util.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -44,42 +45,14 @@ CompareMode ToCompareMode(Mode mode) {
     }
 }
 
-#ifdef _WIN32
-std::wstring Utf8ToWideLocal(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
-    const int len = MultiByteToWideChar(CP_UTF8, 0, value.c_str(),
-                                        static_cast<int>(value.size()), nullptr, 0);
-    if (len <= 0) {
-        return {};
-    }
-    std::wstring output(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()),
-                        output.data(), len);
-    return output;
-}
-#endif
-
-// Join a relative path (UTF-8, forward slashes) onto the local root directory. Self-contained, does not depend on
-// sync_util::JoinRel (which is not in the FastCheck link closure).
+// Join a relative path (UTF-8, forward slashes) onto the local root directory. Delegates to
+// FastClone's fc::JoinRel so the verify-side path building is byte-for-byte identical to the
+// transfer-side. On Windows that means the extended-length "\\?\" prefix is applied, which is
+// required to open paths beyond MAX_PATH (260); the earlier self-contained re-implementation
+// silently dropped that prefix and mis-reported long-path files as Missing. FastCheck already
+// links sync_util.cpp, so calling JoinRel here is safe.
 fs::path JoinLocal(const fs::path& root, const std::string& rel) {
-#ifdef _WIN32
-    std::wstring full = root.wstring();
-    if (!full.empty() && full.back() != L'\\' && full.back() != L'/') {
-        full.push_back(L'\\');
-    }
-    std::wstring relW = Utf8ToWideLocal(rel);
-    for (wchar_t& c : relW) {
-        if (c == L'/') {
-            c = L'\\';
-        }
-    }
-    full += relW;
-    return fs::path(full);
-#else
-    return root / fs::path(rel);
-#endif
+    return fc::JoinRel(root, rel);
 }
 
 // Replicates sync_engine_client's probeLocalFile: one syscall to get size+mtime, yielding optional<FileEntry>.
