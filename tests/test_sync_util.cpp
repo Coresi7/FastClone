@@ -263,6 +263,8 @@ void RemoveLongTree(const fs::path& absRoot) {
 #endif
 }
 
+}  // namespace
+
 // FastClone long-path capability: a file whose absolute path exceeds MAX_PATH must be creatable,
 // readable, and hashable via fc::JoinRel + fc::CreateDirectoriesLong. FastClone already applies the
 // "\\?\" extended-length prefix on the writer/reader side; this guards that path so the two tools
@@ -303,5 +305,3 @@ void RunLongPathTests() {
 
     RemoveLongTree(fc::JoinRel(root, std::string()));
 }
-
-}  // namespace

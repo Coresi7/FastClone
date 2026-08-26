@@ -129,10 +129,10 @@ void WriteFileLong(const fs::path& abs, const std::string& content) {
         throw std::runtime_error("WriteFileLong: CreateFileW failed");
     }
     DWORD written = 0;
-    if (!WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
+    if (!::WriteFileW(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
         written != static_cast<DWORD>(content.size())) {
         CloseHandle(h);
-        throw std::runtime_error("WriteFileLong: WriteFile short/error");
+        throw std::runtime_error("WriteFileLong: WriteFileW short/error");
     }
     CloseHandle(h);
 #else
@@ -1485,7 +1485,8 @@ void TestLongPathFileReportedIdentical() {
 
     CheckOptions o = BaseOptions(targetRoot, Mode::Fast);
     std::atomic<bool> interrupted{false};
-    const EngineOutcome outcome = RunCheck(o, mock.Make(), interrupted);
+    FrameChannel ch = mock.Make();
+    const EngineOutcome outcome = RunCheck(o, ch, interrupted);
 
     Expect(outcome.exit == kIdentical,
            "long-path target file must verify identical, not Missing (exit 0)");
