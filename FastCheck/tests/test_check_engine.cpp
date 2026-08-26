@@ -4,6 +4,7 @@
 #include "file_index.h"
 #include "protocol.h"
 #include "protocol_codec.h"
+#include "sync_util.h"
 
 #include <algorithm>
 #include <atomic>
@@ -116,6 +117,57 @@ void WriteFile(const fs::path& path, const std::string& content) {
     fs::create_directories(path.parent_path());
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << content;
+}
+
+// Create a file at an arbitrary (possibly >MAX_PATH) absolute path, using the extended-length
+// "\\?\" form so deep paths work on Windows -- mirrors how FastClone/FastCheck actually open files.
+void WriteFileLong(const fs::path& abs, const std::string& content) {
+#ifdef _WIN32
+    HANDLE h = CreateFileW(abs.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("WriteFileLong: CreateFileW failed");
+    }
+    DWORD written = 0;
+    if (!WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
+        written != static_cast<DWORD>(content.size())) {
+        CloseHandle(h);
+        throw std::runtime_error("WriteFileLong: WriteFile short/error");
+    }
+    CloseHandle(h);
+#else
+    std::ofstream out(abs, std::ios::binary | std::ios::trunc);
+    out << content;
+#endif
+}
+
+// Recursively delete a (possibly >MAX_PATH) subtree using extended-length "\\?\" paths.
+// std::filesystem::remove_all reconstructs child paths without the prefix and fails to descend
+// into >MAX_PATH directories, so delete deepest-first via the Win32 API directly.
+void RemoveLongTree(const fs::path& absRoot) {
+#ifdef _WIN32
+    const std::wstring w = absRoot.wstring();  // already \\?\-prefixed
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((w + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+                continue;
+            }
+            const std::wstring child = w + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveLongTree(fs::path(child));
+            } else {
+                DeleteFileW(child.c_str());
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(w.c_str());
+#else
+    std::error_code ec;
+    fs::remove_all(absRoot, ec);
+#endif
 }
 
 std::string MakeDeterministicContent(size_t n, uint32_t salt) {
@@ -1395,6 +1447,55 @@ void TestStrictToctouFailed() {
 
 }  // namespace
 
+// Long-path regression for the JoinLocal -> fc::JoinRel fix: a target file whose absolute path
+// exceeds MAX_PATH (260) must be located and hashed, not reported Missing. Before the fix JoinLocal
+// dropped the Windows extended-length "\\?\" prefix, so GetFileAttributesExW/CreateFileW failed on the
+// long path and the file was mis-reported Missing -- i.e. FastClone succeeded but FastCheck reported a
+// mismatch. Uses a scripted mock server (no real network) that serves the manifest entry and the
+// matching hash for the long relative path.
+void TestLongPathFileReportedIdentical() {
+    const fs::path targetRoot = MakeTempDir();
+    std::string longRel;
+    for (int i = 0; i < 60 && fc::JoinRel(targetRoot, longRel).wstring().size() <= 300; ++i) {
+        if (!longRel.empty()) {
+            longRel += "/";
+        }
+        longRel += "abcdefghij";  // 10 ASCII chars per directory segment
+    }
+    const fs::path abs = fc::JoinRel(targetRoot, longRel);
+#ifdef _WIN32
+    // Ensure we actually exercise the >MAX_PATH scenario; otherwise the test passes even if the
+    // prefix handling silently regresses on short paths.
+    Expect(abs.wstring().size() > 260,
+           "long-path test precond: absolute path exceeds MAX_PATH");
+    Expect(abs.wstring().compare(0, 4, L"\\\\?\\") == 0,
+           "long-path test precond: extended-length \\\\?\\ prefix is applied");
+#endif
+    fc::CreateDirectoriesLong(abs.parent_path());
+    const std::string content = MakeDeterministicContent(4096, 7);
+    WriteFileLong(abs, content);
+
+    const Hash256 expected = ComputeFileHash(abs);
+
+    MockChannel mock;
+    mock.useResponder = true;
+    mock.hashResponder[longRel] = expected;
+    mock.inbound.push_back(ManifestEntryFrame(longRel, static_cast<uint64_t>(content.size())));
+    mock.inbound.push_back(ManifestEndFrame());
+
+    CheckOptions o = BaseOptions(targetRoot, Mode::Fast);
+    std::atomic<bool> interrupted{false};
+    const EngineOutcome outcome = RunCheck(o, mock.Make(), interrupted);
+
+    Expect(outcome.exit == kIdentical,
+           "long-path target file must verify identical, not Missing (exit 0)");
+    Expect(outcome.result.counters.missing == 0, "long-path file not reported Missing");
+    Expect(outcome.result.counters.diff == 0, "long-path file content matches (no diff)");
+    Expect(outcome.result.counters.extraLocal == 0, "no spurious extra files");
+
+    RemoveLongTree(fc::JoinRel(targetRoot, std::string()));
+}
+
 void RunCheckEngineTests() {
     TestSizeOnlyCountsNoHash();
     TestStrictHashSameAndDiff();
@@ -1427,4 +1528,5 @@ void RunCheckEngineTests() {
     TestResolveMaxHashWorkers();
     TestLocalWorkerCapAimd();
     TestNetWindowAimd();
+    TestLongPathFileReportedIdentical();
 }

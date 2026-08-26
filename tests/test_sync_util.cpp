@@ -1,6 +1,19 @@
 #include "sync_util.h"
+#include "file_index.h"  // ComputeFileHash / Hash256 / HashEquals
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -172,3 +185,123 @@ void RunSyncUtilTests() {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+namespace {
+
+// Create a file at an arbitrary (possibly >MAX_PATH) absolute path, using the extended-length
+// "\\?\" form so deep paths work on Windows -- mirrors how FastClone actually opens files.
+void WriteFileLong(const fs::path& abs, const std::string& content) {
+#ifdef _WIN32
+    HANDLE h = CreateFileW(abs.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("WriteFileLong: CreateFileW failed");
+    }
+    DWORD written = 0;
+    if (!WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
+        written != static_cast<DWORD>(content.size())) {
+        CloseHandle(h);
+        throw std::runtime_error("WriteFileLong: WriteFile short/error");
+    }
+    CloseHandle(h);
+#else
+    std::ofstream out(abs, std::ios::binary | std::ios::trunc);
+    out << content;
+#endif
+}
+
+std::string ReadFileLong(const fs::path& abs) {
+#ifdef _WIN32
+    HANDLE h = CreateFileW(abs.wstring().c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("ReadFileLong: CreateFileW failed");
+    }
+    std::string out;
+    char buf[65536];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        out.append(buf, static_cast<size_t>(got));
+    }
+    CloseHandle(h);
+    return out;
+#else
+    std::ifstream in(abs, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+#endif
+}
+
+// Recursively delete a (possibly >MAX_PATH) subtree using extended-length "\\?\" paths.
+// std::filesystem::remove_all reconstructs child paths without the prefix and fails to descend
+// into >MAX_PATH directories, so delete deepest-first via the Win32 API directly.
+void RemoveLongTree(const fs::path& absRoot) {
+#ifdef _WIN32
+    const std::wstring w = absRoot.wstring();  // already \\?\-prefixed
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((w + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+                continue;
+            }
+            const std::wstring child = w + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveLongTree(fs::path(child));
+            } else {
+                DeleteFileW(child.c_str());
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(w.c_str());
+#else
+    std::error_code ec;
+    fs::remove_all(absRoot, ec);
+#endif
+}
+
+// FastClone long-path capability: a file whose absolute path exceeds MAX_PATH must be creatable,
+// readable, and hashable via fc::JoinRel + fc::CreateDirectoriesLong. FastClone already applies the
+// "\\?\" extended-length prefix on the writer/reader side; this guards that path so the two tools
+// stay aligned on long-path support (the FastCheck side had the regression this guards against).
+void RunLongPathTests() {
+    const fs::path root = MakeTempDir();
+    std::string longRel;
+    for (int i = 0; i < 60 && fc::JoinRel(root, longRel).wstring().size() <= 300; ++i) {
+        if (!longRel.empty()) {
+            longRel += "/";
+        }
+        longRel += "abcdefghij";  // 10 ASCII chars per directory segment
+    }
+    const fs::path abs = fc::JoinRel(root, longRel);
+#ifdef _WIN32
+    // Ensure we actually exercise the >MAX_PATH scenario; otherwise the test passes even if the
+    // prefix handling silently regresses on short paths.
+    Expect(abs.wstring().size() > 260,
+           "long-path test precond: absolute path exceeds MAX_PATH");
+    Expect(abs.wstring().compare(0, 4, L"\\\\?\\") == 0,
+           "long-path test precond: extended-length \\\\?\\ prefix is applied");
+#endif
+    fc::CreateDirectoriesLong(abs.parent_path());
+    std::string content;
+    content.resize(4096);
+    for (size_t i = 0; i < content.size(); ++i) {
+        content[i] = static_cast<char>((i * 197u + 11u) & 0xFF);
+    }
+    WriteFileLong(abs, content);
+
+    const std::string readBack = ReadFileLong(abs);
+    Expect(readBack == content,
+           "long-path file round-trips content (create+read at >MAX_PATH)");
+
+    const fc::Hash256 h1 = fc::ComputeFileHash(abs);
+    const fc::Hash256 h2 = fc::ComputeFileHash(abs);
+    Expect(fc::HashEquals(h1, h2), "long-path file hash is stable across calls");
+
+    RemoveLongTree(fc::JoinRel(root, std::string()));
+}
+
+}  // namespace

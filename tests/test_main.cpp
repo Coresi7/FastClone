@@ -13,6 +13,7 @@ void RunReadGateTests();
 void RunFileIndexTests();
 void RunManifestDirentTests();
 void RunSyncUtilTests();
+void RunLongPathTests();
 void RunReconnectClassifierTests();
 void RunRouteSelectionTests();
 void RunLinkSchedulerTests();
@@ -37,6 +38,7 @@ int main() {
         RunFileIndexTests();
         RunManifestDirentTests();
         RunSyncUtilTests();
+        RunLongPathTests();
         RunRouteSelectionTests();
         RunLinkSchedulerTests();
         RunWanTuningTests();
