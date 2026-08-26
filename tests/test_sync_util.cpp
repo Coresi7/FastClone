@@ -198,7 +198,7 @@ void WriteFileLong(const fs::path& abs, const std::string& content) {
         throw std::runtime_error("WriteFileLong: CreateFileW failed");
     }
     DWORD written = 0;
-    if (!::WriteFileW(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
+    if (!::WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) ||
         written != static_cast<DWORD>(content.size())) {
         CloseHandle(h);
         throw std::runtime_error("WriteFileLong: WriteFileW short/error");
