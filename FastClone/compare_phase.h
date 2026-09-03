@@ -50,21 +50,25 @@ CompareCategory ClassifyByHash(bool localReadable,
 // sync_util.cpp copy and this copy. Returns false when the value cannot be meaningfully converted (the caller falls back to the raw value).
 bool TryNormalizeMtimeToUnixNs(int64_t rawMtime, int64_t& outUnixNs);
 
-// Predicate for the sync decision "is a local item missing on the remote side" (called in place by
-// RemoveLocalExtras). Pure function, zero overhead: equivalent to !remoteFiles.contains(relPath).
-// Templated to be compatible with the sync side's unordered_map<string,FileEntry> and the check
-// side's unordered_set<string> - both provide contains(key), avoiding, on the sync hot path, copying
-// out a keyset just to accommodate one concrete type (that would change the pipeline and break the byte-level equivalence of the pure refactor).
+// Predicate for the sync decision "is a local item missing on the remote side". Pure
+// function, zero overhead: equivalent to !remoteFiles.contains(relPath).
+// Templated to be compatible with the sync side's unordered_map<string,FileEntry> and the
+// check side's unordered_set<string> - both provide contains(key), avoiding, on the sync
+// hot path, copying out a keyset just to accommodate one concrete type (that would
+// change the pipeline and break the byte-level equivalence of the pure refactor).
+// The shared extra enumeration (fc::CollectExtraFiles[AndDirs], extra_scan.h - where the
+// former CollectExtraLocal implementation moved to, task unify-probe-extra-shared D-07)
+// reuses this same contains() constraint; both sides now scan extras through that one TU.
 template <typename RemoteContainer>
 inline bool IsLocalExtra(const std::string& relPath, const RemoteContainer& remoteFilePaths) {
     return !remoteFilePaths.contains(relPath);
 }
 
-// Read-only enumerate the local targetRoot and return the relative paths of extra files "not contained
-// in the server manifest" (normalized to forward slashes). Reuses file_index::BuildIndex self-contained
-// enumeration, does not touch the sync engine, only returns EXTRA, never deletes.
-std::vector<std::string> CollectExtraLocal(const std::filesystem::path& targetRoot,
-                                           const std::unordered_set<std::string>& manifestPaths);
+// NOTE (unify-probe-extra-shared D-07): the former CollectExtraLocal(targetRoot,
+// manifestPaths) declaration/implementation was MOVED to FastClone/extra_scan.h/.cpp as
+// the shared fc::CollectExtraFiles / fc::CollectExtraFilesAndDirs templates (FR-06 single
+// extra-enumeration entry for both FastClone and FastCheck). This TU keeps only the
+// compare decision core + counters (the four protected functions stay diff-free, AC-12c).
 
 // Unified counter struct + single-line render (check progress and final summary). Writes to any ostream for unit testing.
 struct CompareCounters {

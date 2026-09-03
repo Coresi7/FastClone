@@ -22,6 +22,12 @@ void RunWritePathAccountingTests();
 void RunComparePhaseTests();
 void RunComparePipelineTests();
 void RunProtocolCodecTests();
+// unify-probe-extra-shared: shared probe / extra-scan / source-gate tests.
+namespace fc::test {
+void RunSharedProbeTestsFastCloneSide();
+void RunSharedExtraScanTestsFastCloneSide();
+void RunSharedSourceGateTests();
+}
 
 int main() {
     try {
@@ -46,6 +52,9 @@ int main() {
         RunComparePhaseTests();
         RunComparePipelineTests();
         RunProtocolCodecTests();
+        fc::test::RunSharedProbeTestsFastCloneSide();
+        fc::test::RunSharedExtraScanTestsFastCloneSide();
+        fc::test::RunSharedSourceGateTests();
         std::cout << "All FastClone tests passed." << std::endl;
         return 0;
     } catch (const std::exception& ex) {

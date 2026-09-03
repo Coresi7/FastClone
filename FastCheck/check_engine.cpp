@@ -3,7 +3,9 @@
 #include "compare_phase.h"
 #include "compare_pipeline.h"
 #include "disk_io_driver.h"
+#include "extra_scan.h"     // unify-probe-extra-shared: shared extra enumeration + SelfExcludeUnderRoot
 #include "file_index.h"
+#include "local_probe.h"    // unify-probe-extra-shared: shared probe (FR-01 unique entry)
 #include "protocol_codec.h"
 #include "sync_util.h"
 
@@ -55,80 +57,12 @@ fs::path JoinLocal(const fs::path& root, const std::string& rel) {
     return fc::JoinRel(root, rel);
 }
 
-// Replicates sync_engine_client's probeLocalFile: one syscall to get size+mtime, yielding optional<FileEntry>.
-// The mtime unit matches the manifest side (Win=FILETIME ticks, POSIX=Unix ns), for DecideCompare's normalized comparison.
-std::optional<FileEntry> ProbeLocal(const fs::path& root, const std::string& rel) {
-    const fs::path abs = JoinLocal(root, rel);
-#ifdef _WIN32
-    WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (GetFileAttributesExW(abs.wstring().c_str(), GetFileExInfoStandard, &data) == 0) {
-        return std::nullopt;
-    }
-    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        return std::nullopt;
-    }
-    FileEntry entry;
-    entry.relativePath = rel;
-    entry.isDirectory = false;
-    entry.fileSize = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
-                     static_cast<uint64_t>(data.nFileSizeLow);
-    ULARGE_INTEGER mt{};
-    mt.LowPart = data.ftLastWriteTime.dwLowDateTime;
-    mt.HighPart = data.ftLastWriteTime.dwHighDateTime;
-    entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
-    return entry;
-#else
-    std::error_code ec;
-    if (!fs::exists(abs, ec) || ec) {
-        return std::nullopt;
-    }
-    if (!fs::is_regular_file(abs, ec) || ec) {
-        return std::nullopt;
-    }
-    FileEntry entry;
-    entry.relativePath = rel;
-    entry.isDirectory = false;
-    entry.fileSize = static_cast<uint64_t>(fs::file_size(abs, ec));
-    if (ec) {
-        return std::nullopt;
-    }
-    entry.mtimeNs = ToUnixNs(fs::last_write_time(abs, ec));
-    if (ec) {
-        return std::nullopt;
-    }
-    return entry;
-#endif
-}
-
-// Strict-mode local probe injected into the ComparePipeline (fastcheck-compare-pipeline D-03). Strict
-// ignores mtime, so a single std::filesystem::directory_entry cached metadata query yields both the
-// type and the size (preserving the redundant-syscall-elim single-query semantics, dev-map RS-01):
-// not-found / directory / special / unreadable -> nullopt (Missing); a regular file -> size only.
-// DecideCompare(Strict, ...) then decides Missing / Diff (size differs) / needHash (size equal). mtime
-// is deliberately left 0 because Strict never consults it.
-std::optional<FileEntry> StrictProbe(const fs::path& root, const std::string& rel) {
-    const fs::path abs = JoinLocal(root, rel);
-    std::error_code ec;
-    const fs::directory_entry entry(abs, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-    std::error_code tec;
-    if (!entry.is_regular_file(tec) || tec) {
-        return std::nullopt;  // not found / directory / special -> Missing
-    }
-    std::error_code sec;
-    const uint64_t localSize = static_cast<uint64_t>(entry.file_size(sec));
-    if (sec) {
-        return std::nullopt;  // size unreadable -> Missing
-    }
-    FileEntry fe;
-    fe.relativePath = rel;
-    fe.isDirectory = false;
-    fe.fileSize = localSize;
-    fe.mtimeNs = 0;  // Strict ignores mtime
-    return fe;
-}
+// unify-probe-extra-shared (FR-01 / D-06): the former ProbeLocal / StrictProbe local
+// implementations were REMOVED. Every pre-decision local metadata read now goes through
+// the shared fc::ProbeLocalFile / fc::ProbeLocalFileSizeOnly (FastClone/local_probe.cpp,
+// on-demand form with ctx == nullptr: one syscall per file, no cross-call snapshot, I-6).
+// The on-demand forms are verbatim migrations of the former implementations, so the mtime
+// representation is unchanged (Win = raw FILETIME ticks, POSIX = Unix ns via ToUnixNs).
 
 }  // namespace
 
@@ -708,8 +642,9 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
 
     // Shared compare pipeline (fastcheck-compare-pipeline §4.1). The recv main thread only parses a
     // frame, inserts into manifestPaths, and Enqueue()s; ALL local metadata probing runs in the compare
-    // worker pool (FR-02/AC-01/NFR-02). probe = ProbeLocal (Fast/SizeOnly, size+mtime, verbatim) or
-    // StrictProbe (Strict, size-only directory_entry, D-03), injected so DecideCompare reaches the same
+    // worker pool (FR-02/AC-01/NFR-02). probe = fc::ProbeLocalFile (Fast/SizeOnly, size+mtime) or
+    // fc::ProbeLocalFileSizeOnly (Strict, size-only), both via the shared on-demand form
+    // (unify-probe-extra-shared FR-01/D-06, ctx == nullptr), injected so DecideCompare reaches the same
     // verdict as before (AC-24). onResultsReady wakes the main loop via the existing readyCv. Declared
     // after clientDriver (§6.4) and explicitly Stop()/Join()ed before clientDriver is destroyed (AC-16).
     fc::ComparePipelineConfig compareCfg;
@@ -718,8 +653,8 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
     compareCfg.batchPop = 32;
     fc::LocalProbeFn compareProbe =
         (mode == CompareMode::Strict)
-            ? fc::LocalProbeFn([&](const std::string& rel) { return StrictProbe(targetRoot, rel); })
-            : fc::LocalProbeFn([&](const std::string& rel) { return ProbeLocal(targetRoot, rel); });
+            ? fc::LocalProbeFn([&](const std::string& rel) { return fc::ProbeLocalFileSizeOnly(targetRoot, rel); })
+            : fc::LocalProbeFn([&](const std::string& rel) { return fc::ProbeLocalFile(targetRoot, rel, nullptr); });
     fc::ComparePipeline comparePipeline(compareCfg, compareProbe, [&]() { readyCv.notify_one(); });
 
     // Bounded in-flight for the compare pipeline (NFR-07/AC-31); overflow parks in delayedCompareEntries
@@ -874,11 +809,19 @@ EngineOutcome RunCheck(const CheckOptions& o, FrameChannel& ch,
         std::cerr << "error: local file read failed during check: " << errorText << std::endl;
     } else {
         // Full comparison: enumerate local extras (FR-19), then decide exit code 0/1 (FR-14).
-        const std::vector<std::string> extras = CollectExtraLocal(targetRoot, manifestPaths);
+        // unify-probe-extra-shared (FR-06/FR-08, small change B): the enumeration is the
+        // shared fc::CollectExtraFiles (same walk FastClone's delete pass uses), and the
+        // exclude is injected by the shared SelfExcludeUnderRoot with the same rule as the
+        // sync side - this process's executable, only when it lies under the target root -
+        // so tool binaries parked inside the target no longer show up as extra (S6).
+        const fc::ExtraScanOptions extraScanOptions{fc::SelfExcludeUnderRoot(targetRoot),
+                                                    /*collectDirs=*/false};
+        const std::vector<std::string> extras =
+            fc::CollectExtraFiles(targetRoot, manifestPaths, extraScanOptions);
         for (const std::string& rel : extras) {
             FileEntry extraEntry;
             extraEntry.relativePath = rel;
-            const std::optional<FileEntry> local = ProbeLocal(targetRoot, rel);
+            const std::optional<FileEntry> local = fc::ProbeLocalFile(targetRoot, rel, nullptr);
             // record fills remoteSize from remote.fileSize (not set for EXTRA) and localSize from local.
             record(fc::CompareCategory::Extra, extraEntry, local, false);
         }

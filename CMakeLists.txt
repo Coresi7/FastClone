@@ -47,8 +47,10 @@ add_executable(FastClone
     FastClone/compare_phase.cpp
     FastClone/compare_pipeline.cpp
     FastClone/delta.cpp
+    FastClone/extra_scan.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
+    FastClone/local_probe.cpp
     FastClone/main.cpp
     FastClone/net_topology.cpp
     FastClone/parallel_dir_walk.cpp
@@ -103,8 +105,10 @@ add_executable(FastCloneTests
     FastClone/compare_phase.cpp
     FastClone/compare_pipeline.cpp
     FastClone/delta.cpp
+    FastClone/extra_scan.cpp
     FastClone/file_index.cpp
     FastClone/hash_memcache.cpp
+    FastClone/local_probe.cpp
     FastClone/net_topology.cpp
     FastClone/parallel_dir_walk.cpp
     FastClone/protocol.cpp
@@ -125,6 +129,9 @@ add_executable(FastCloneTests
     tests/test_read_gate.cpp
     tests/test_file_index.cpp
     tests/test_manifest_dirent.cpp
+    tests/test_shared_probe.cpp
+    tests/test_shared_extra_scan.cpp
+    tests/test_shared_source_gate.cpp
     tests/test_sync_util.cpp
     tests/test_hash_memcache.cpp
     tests/test_reconnect.cpp
@@ -142,6 +149,10 @@ target_compile_definitions(FastCloneTests PRIVATE FASTCLONE_ENABLE_CLI_TESTS)
 # translation unit carries no unused #include "sync_util.h".
 target_compile_definitions(FastCloneTests PRIVATE
     FASTCLONE_CLI_SRC=${CMAKE_CURRENT_SOURCE_DIR}/FastClone/cli.cpp)
+# unify-probe-extra-shared (AC-05, form A): let the source-gate test locate the repo root
+# so it can scan sync_engine_client.cpp / check_engine.cpp for residual probe primitives.
+target_compile_definitions(FastCloneTests PRIVATE
+    FASTCLONE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # file_index.cpp pulls in xxhash; reuse the same resolution as the main target.
 if(XXHASH_FOUND)
@@ -218,8 +229,10 @@ set(FASTCHECK_SHARED_SOURCES
     FastCheck/check_report.cpp
     FastClone/compare_phase.cpp
     FastClone/compare_pipeline.cpp
+    FastClone/extra_scan.cpp
     FastClone/file_index.cpp
     FastClone/client_handshake.cpp
+    FastClone/local_probe.cpp
     FastClone/parallel_dir_walk.cpp
     FastClone/protocol.cpp
     FastClone/protocol_codec.cpp
@@ -264,9 +277,32 @@ add_executable(FastCheckTests
     FastCheck/tests/test_check_engine.cpp
     FastCheck/tests/test_check_report.cpp
     FastCheck/tests/test_check_cli.cpp
+    FastCheck/tests/test_shared_probe.cpp
+    FastCheck/tests/test_shared_extra_scan.cpp
 )
 fastcheck_configure_target(FastCheckTests)
+# unify-probe-extra-shared-converge: the shared test fixture header (test_fixture_support.h)
+# lives in tests/. Added to FastCheckTests ONLY (after the shared configure call) so the
+# FastCheck production target's include path carries no test directories.
+target_include_directories(FastCheckTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 add_test(NAME FastCheckTests COMMAND FastCheckTests)
+
+# unify-probe-extra-shared (FR-13): process-level end-to-end consistency invariant
+# "FastClone sync exit 0 => FastCheck (fast AND strict) diff=0 missing=0 extra_local=0".
+# Windows carrier is registered here; the POSIX carrier (tests/clone_check_consistency.sh)
+# is CI/manual-invocation only, same as tests/data_integrity_integration.sh (design §7.2).
+if(WIN32)
+    add_test(NAME clone_check_consistency
+        COMMAND powershell -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/clone_check_consistency.ps1
+                -ExePath $<TARGET_FILE:FastClone>
+                -CheckExePath $<TARGET_FILE:FastCheck>
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_tests_properties(clone_check_consistency PROPERTIES
+        DEPENDS data_integrity_integration
+        TIMEOUT 900)
+endif()
 
 # Optional io_uring (Linux only). When liburing is present the io_uring backend compiles and links
 # against it; when absent, disk_io_backend_uring.cpp's __has_include guard leaves only the bounded

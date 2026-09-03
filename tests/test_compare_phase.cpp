@@ -1,4 +1,5 @@
 #include "compare_phase.h"
+#include "extra_scan.h"  // unify-probe-extra-shared D-07: CollectExtraLocal moved here as CollectExtraFiles
 
 #include <chrono>
 #include <cstdint>
@@ -131,7 +132,7 @@ void TestCollectExtraLocal() {
     WriteFile(dir / "sub" / "c.txt", "ccc");
 
     std::unordered_set<std::string> manifest = {"a.txt"};
-    std::vector<std::string> extras = fc::CollectExtraLocal(dir, manifest);
+    std::vector<std::string> extras = fc::CollectExtraFiles(dir, manifest);
     bool hasB = false;
     bool hasC = false;
     bool hasA = false;
@@ -157,7 +158,7 @@ void TestCollectExtraLocalDotDotSkip() {
     WriteFile(dir / "a.txt", "a");
     WriteFile(dir / "sub" / "b.txt", "b");
 
-    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    const std::vector<std::string> extras = fc::CollectExtraFiles(dir, std::unordered_set<std::string>{});
     bool hasA = false;
     bool hasB = false;
     for (const std::string& rel : extras) {
@@ -190,7 +191,7 @@ void TestCollectExtraLocalSymlinkFile() {
     }
 
     const std::unordered_set<std::string> manifest = {"real_target.txt"};
-    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, manifest);
+    const std::vector<std::string> extras = fc::CollectExtraFiles(dir, manifest);
     bool hasFlink = false;
     for (const std::string& rel : extras) {
         if (rel == "flink.txt") hasFlink = true;
@@ -221,7 +222,7 @@ void TestCollectExtraLocalSymlinkDirNotRecursed() {
         return;  // no privilege -> skip
     }
 
-    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    const std::vector<std::string> extras = fc::CollectExtraFiles(dir, std::unordered_set<std::string>{});
     bool hasNormal = false;
     bool recursed = false;
     bool hasLinkDir = false;
@@ -268,7 +269,7 @@ void TestCollectExtraLocalPermissionDenied() {
         return;
     }
 
-    const std::vector<std::string> extras = fc::CollectExtraLocal(dir, /*manifest=*/{});
+    const std::vector<std::string> extras = fc::CollectExtraFiles(dir, std::unordered_set<std::string>{});
     bool hasVisible = false;
     bool hasSecret = false;
     for (const std::string& rel : extras) {

@@ -2,6 +2,8 @@
 
 #include "compare_phase.h"
 #include "compare_pipeline.h"
+#include "extra_scan.h"     // unify-probe-extra-shared: shared extra enumeration + SelfExcludeUnderRoot
+#include "local_probe.h"    // unify-probe-extra-shared: shared probe + DirProbeCache
 #include "write_path_accounting.h"
 
 #include <shared_mutex>
@@ -92,16 +94,18 @@ struct RemoveLocalExtrasResult {
     size_t failedOps = 0;
 };
 
-// Parallel reconciliation + delete. The local tree is walked by the same worker-pool
-// engine as enumeration (deletion is pure metadata I/O -- listing dirs + unlinking --
-// so it hits the exact MFT-latency wall single-threaded; fan-out raises queue depth).
-// Per directory, a worker FIRST enumerates fully, THEN deletes the files that are absent
-// from the remote manifest: never delete while the directory handle is open (modifying a
-// directory mid-enumeration is undefined on both NTFS and POSIX). remoteFiles/remoteDirs
-// are immutable here (post-ManifestEnd), so the membership lookups are lock-free
-// concurrent reads. Extra directories are collected per worker and removed deepest-first
-// at the very end (serial: directory count is tiny next to files, and deepest-first has
-// an inherent ordering dependency).
+// Parallel reconciliation + delete (unify-probe-extra-shared FR-06: the enumeration phase
+// is now the shared fc::CollectExtraFilesAndDirs walk, one implementation for both this
+// side and FastCheck; the delete/action layer stays here). Deletion is pure metadata I/O
+// -- unlinking hits the same MFT-latency wall single-threaded -- so the delete fan-out is
+// kept. The two-phase invariant is preserved structurally (I-7): the shared walk returns
+// its results BY VALUE, so by the time we delete anything below, the whole tree has been
+// enumerated and every find handle is closed (never delete while a directory handle is
+// open - modifying a directory mid-enumeration is undefined on both NTFS and POSIX).
+// remoteFiles/remoteDirs are immutable here (post-ManifestEnd), so the shared walk's
+// membership lookups are lock-free concurrent reads. Extra directories are removed
+// deepest-first at the very end (serial: directory count is tiny next to files, and
+// deepest-first has an inherent ordering dependency).
 RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
                                           const std::unordered_set<std::string>& remoteDirs,
                                           const std::unordered_map<std::string, FileEntry>& remoteFiles,
@@ -110,160 +114,58 @@ RemoveLocalExtrasResult RemoveLocalExtras(const fs::path& root,
     RemoveLocalExtrasResult result;
     std::atomic<uint64_t> deletedFiles{0};
     std::atomic<uint64_t> failedOps{0};
-    std::mutex extraDirsMu;
-    std::vector<std::string> extraDirs;        // local dirs absent from remoteDirs
-    const std::atomic<bool> noCancel{false};   // deletion walk is not cancellable
 
-    struct DelCtx {
-        std::vector<std::string> extraDirs;    // per-worker, merged on finish
-        std::vector<std::string> localDirs;    // every existing local dir this worker saw
-    };
-    auto mergeCtx = [&](DelCtx& ctx) {
-        std::lock_guard<std::mutex> lock(extraDirsMu);
-        extraDirs.insert(extraDirs.end(),
-                         std::make_move_iterator(ctx.extraDirs.begin()),
-                         std::make_move_iterator(ctx.extraDirs.end()));
-        ctx.extraDirs.clear();
-        // Hand back the set of directories that already exist locally so the caller can
-        // skip create_directories() for them (on a re-sync that is all of them, and those
-        // calls are pure wasted, filter-driver-intercepted metadata I/O).
-        existingLocalDirs.insert(std::make_move_iterator(ctx.localDirs.begin()),
-                                 std::make_move_iterator(ctx.localDirs.end()));
-        ctx.localDirs.clear();
-    };
+    // Phase 1: shared parallel scan (extra_scan.cpp) - exclude injected by the caller,
+    // dir info collected (FastClone form). The same (tree, remote set, exclude) triple
+    // FastCheck scans => the same extraFiles answer (FR-09).
+    const fc::ExtraScanOptions scanOptions{exclude, /*collectDirs=*/true};
+    fc::ExtraScanResult scan = fc::CollectExtraFilesAndDirs(root, remoteFiles, remoteDirs, scanOptions);
 
-    const unsigned numWorkers = ResolveDirWalkWorkerCount();
+    // Phase 2: delete the extra files now that the enumeration is fully closed. The
+    // deleted/failed accounting is unchanged: remove() success -> deleted, error_code
+    // set -> failed.
+    const size_t fileCount = scan.extraFiles.size();
+    if (fileCount > 0) {
+        const unsigned deleteWorkers =
+            std::min<unsigned>(ResolveDirWalkWorkerCount(), static_cast<unsigned>(fileCount));
+        std::atomic<size_t> nextFile{0};
+        auto deleteWorker = [&]() {
+            size_t i = nextFile.fetch_add(1, std::memory_order_relaxed);
+            while (i < fileCount) {
+                std::error_code ec;
+                if (fs::remove(JoinRel(root, scan.extraFiles[i]), ec)) {
+                    deletedFiles.fetch_add(1, std::memory_order_relaxed);
+                } else if (ec) {
+                    failedOps.fetch_add(1, std::memory_order_relaxed);
+                }
+                i = nextFile.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+        if (deleteWorkers <= 1) {
+            deleteWorker();
+        } else {
+            std::vector<std::thread> deletePool;
+            deletePool.reserve(deleteWorkers);
+            for (unsigned t = 0; t < deleteWorkers; ++t) {
+                deletePool.emplace_back(deleteWorker);
+            }
+            for (std::thread& t : deletePool) {
+                t.join();
+            }
+        }
+    }
 
-#ifdef _WIN32
-    struct PendingDir {
-        std::wstring absDir;
-        std::string relDir;
-    };
-    const std::wstring excludeW = exclude.has_value() ? ToExtendedLengthPath(*exclude) : L"";
-    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, DelCtx& ctx) {
-        WIN32_FIND_DATAW fd{};
-        HANDLE hFind = OpenDirFind(current.absDir, fd);
-        if (hFind == INVALID_HANDLE_VALUE) {
-            return;
-        }
-        // Phase 1: enumerate fully; collect deletions but do NOT touch the directory yet.
-        std::vector<std::wstring> filesToDelete;
-        do {
-            const wchar_t* name = fd.cFileName;
-            if ((name[0] == L'.' && name[1] == L'\0') ||
-                (name[0] == L'.' && name[1] == L'.' && name[2] == L'\0')) {
-                continue;
-            }
-            std::wstring absPath = current.absDir;
-            if (!absPath.empty() && absPath.back() != L'\\' && absPath.back() != L'/') {
-                absPath.push_back(L'\\');
-            }
-            absPath.append(name);
-            if (!excludeW.empty() && _wcsicmp(absPath.c_str(), excludeW.c_str()) == 0) {
-                continue;
-            }
-            const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            const std::string nameUtf8 = WideToUtf8(name);
-            std::string relPath = BuildRelPath(current.relDir, nameUtf8);
-            if (isDir) {
-                if (!remoteDirs.contains(relPath)) {
-                    ctx.extraDirs.push_back(relPath);
-                }
-                ctx.localDirs.push_back(relPath);
-                subdirs.push_back(PendingDir{std::move(absPath), std::move(relPath)});
-            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck pure refactor: equivalent predicate
-                filesToDelete.push_back(std::move(absPath));
-            }
-        } while (FindNextFileW(hFind, &fd) != 0);
-        FindClose(hFind);
-        // Phase 2: delete now that the find handle is closed.
-        for (const std::wstring& abs : filesToDelete) {
-            std::error_code ec;
-            if (fs::remove(fs::path(abs), ec)) {
-                deletedFiles.fetch_add(1, std::memory_order_relaxed);
-            } else if (ec) {
-                failedOps.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    };
-    ParallelDirWalk(PendingDir{ToExtendedLengthPath(root), std::string()}, numWorkers, kDeleteDirPopBatch,
-                    noCancel, "client-delete-walk", DelCtx{}, processDir, mergeCtx);
-#else
-    struct PendingDir {
-        fs::path absDir;
-        std::string relDir;
-    };
-    auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, DelCtx& ctx) {
-        std::error_code ec;
-        fs::directory_iterator it(current.absDir, fs::directory_options::skip_permission_denied, ec);
-        const fs::directory_iterator end;
-        if (ec) {
-            return;
-        }
-        std::vector<fs::path> filesToDelete;
-        for (; it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-            const fs::path& absPath = it->path();
-            if (exclude.has_value()) {
-                std::error_code eqec;
-                if (fs::equivalent(absPath, *exclude, eqec) && !eqec) {
-                    continue;
-                }
-            }
-            const bool isDir = it->is_directory(ec);
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-            const bool isRegular = it->is_regular_file(ec);
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-            if (!isDir && !isRegular) {
-                continue;
-            }
-            const bool isSymlink = it->is_symlink(ec);
-            if (ec) {
-                ec.clear();
-            }
-            const std::string name = absPath.filename().string();
-            std::string relPath = BuildRelPath(current.relDir, name);
-            if (relPath.empty()) {
-                continue;
-            }
-            if (isDir) {
-                if (!remoteDirs.contains(relPath)) {
-                    ctx.extraDirs.push_back(relPath);
-                }
-                ctx.localDirs.push_back(relPath);
-                if (!isSymlink) {
-                    subdirs.push_back(PendingDir{absPath, std::move(relPath)});
-                }
-            } else if (IsLocalExtra(relPath, remoteFiles)) {  // fastcheck pure refactor: equivalent predicate
-                filesToDelete.push_back(absPath);
-            }
-        }
-        for (const fs::path& abs : filesToDelete) {
-            std::error_code rec;
-            if (fs::remove(abs, rec)) {
-                deletedFiles.fetch_add(1, std::memory_order_relaxed);
-            } else if (rec) {
-                failedOps.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    };
-    ParallelDirWalk(PendingDir{root, std::string()}, numWorkers, kDeleteDirPopBatch,
-                    noCancel, "client-delete-walk", DelCtx{}, processDir, mergeCtx);
-#endif
+    // Hand back the set of directories that already exist locally so the caller can
+    // skip create_directories() for them (on a re-sync that is all of them, and those
+    // calls are pure wasted, filter-driver-intercepted metadata I/O).
+    existingLocalDirs.insert(std::make_move_iterator(scan.localDirs.begin()),
+                             std::make_move_iterator(scan.localDirs.end()));
 
-    std::sort(extraDirs.begin(), extraDirs.end(), [](const std::string& a, const std::string& b) {
+    // Extra directories: remove deepest-first.
+    std::sort(scan.extraDirs.begin(), scan.extraDirs.end(), [](const std::string& a, const std::string& b) {
         return a.size() > b.size();
     });
-    for (const std::string& dir : extraDirs) {
+    for (const std::string& dir : scan.extraDirs) {
         std::error_code ec;
         fs::remove(JoinRel(root, dir), ec);
         if (ec) {
@@ -652,21 +554,11 @@ int RunClient(const CliOptions& options) {
     std::error_code ec;
     fs::create_directories(options.rootDir, ec);
 
-    std::optional<fs::path> selfPath = CurrentExePath();
-    if (selfPath.has_value()) {
-        std::error_code sec;
-        const fs::path canonicalRoot = fs::weakly_canonical(options.rootDir, sec);
-        if (sec) {
-            selfPath = std::nullopt;
-        } else {
-            const fs::path canonicalSelf = fs::weakly_canonical(*selfPath, sec);
-            if (sec || !IsPathUnderRoot(canonicalRoot, canonicalSelf)) {
-                selfPath = std::nullopt;
-            } else {
-                selfPath = canonicalSelf;
-            }
-        }
-    }
+    // unify-probe-extra-shared (FR-08 / OQ-01=A): the extra-walk exclude target is
+    // computed by the shared injector - this process's executable file, kept only when
+    // it lies under the sync root - so FastCheck injects the exact same rule and the two
+    // sides agree on exclusions (rule-level parity, small change B).
+    const std::optional<fs::path> selfPath = fc::SelfExcludeUnderRoot(options.rootDir);
 
     // --- Session reconnect loop: cross-session vs per-session state ---
     // PERSIST across reconnect attempts of a single drop (declared outside while):
@@ -1671,98 +1563,16 @@ int RunClient(const CliOptions& options) {
         }
     };
 
-    // Lazy directory cache: when a compare probe first touches a directory, enumerate
-    // it once with FindFirstFile/FindNextFile (getting all files' size+mtime in one
-    // sequential MFT read) and cache the results. Subsequent probes for files in the
-    // same directory hit memory. This avoids both the full-tree pre-scan (too slow on
-    // huge slow disks) and the per-file GetFileAttributesExW (random MFT access that
-    // collapses IOPS under concurrency).
-    std::shared_mutex dirCacheMu;
-    std::unordered_map<std::string, std::unordered_map<std::string, FileEntry>> dirCache;
-
-    auto probeLocalFile = [&](const std::string& relPath) -> std::optional<FileEntry> {
-        // Split relPath into directory + filename (relPath uses forward slashes).
-        const auto slashPos = relPath.find_last_of('/');
-        const std::string dirPart = (slashPos == std::string::npos) ? "." : relPath.substr(0, slashPos);
-        const std::string filePart = (slashPos == std::string::npos) ? relPath : relPath.substr(slashPos + 1);
-
-        // Fast path: directory already cached (shared lock, concurrent reads).
-        {
-            std::shared_lock<std::shared_mutex> lock(dirCacheMu);
-            auto dirIt = dirCache.find(dirPart);
-            if (dirIt != dirCache.end()) {
-                auto fileIt = dirIt->second.find(filePart);
-                if (fileIt != dirIt->second.end()) {
-                    FileEntry entry = fileIt->second;
-                    entry.relativePath = relPath;
-                    return entry;
-                }
-                return std::nullopt;  // directory cached, file not found -> missing
-            }
-        }
-
-        // Slow path: enumerate the directory once (exclusive lock).
-        {
-            std::unique_lock<std::shared_mutex> lock(dirCacheMu);
-            // Double-check after acquiring exclusive lock.
-            auto dirIt = dirCache.find(dirPart);
-            if (dirIt != dirCache.end()) {
-                auto fileIt = dirIt->second.find(filePart);
-                if (fileIt != dirIt->second.end()) {
-                    FileEntry entry = fileIt->second;
-                    entry.relativePath = relPath;
-                    return entry;
-                }
-                return std::nullopt;
-            }
-
-            const fs::path absDir = (dirPart == ".") ? options.rootDir : JoinRel(options.rootDir, dirPart);
-            std::unordered_map<std::string, FileEntry> files;
-#ifdef _WIN32
-            WIN32_FIND_DATAW fd;
-            HANDLE hFind = FindFirstFileW((absDir.wstring() + L"\\*").c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
-                    FileEntry entry;
-                    entry.isDirectory = false;
-                    entry.fileSize = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) |
-                                     static_cast<uint64_t>(fd.nFileSizeLow);
-                    ULARGE_INTEGER mt{};
-                    mt.LowPart = fd.ftLastWriteTime.dwLowDateTime;
-                    mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
-                    entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
-                    std::string fileName = fs::path(fd.cFileName).string();
-                    files.emplace(std::move(fileName), std::move(entry));
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
-            }
-#else
-            for (const auto& item : fs::directory_iterator(absDir, fs::directory_options::skip_permission_denied)) {
-                std::error_code ec;
-                if (!item.is_regular_file(ec) || ec) continue;
-                const auto lwt = item.last_write_time(ec);
-                if (ec) continue;
-                const auto sz = item.file_size(ec);
-                if (ec) continue;
-                FileEntry entry;
-                entry.isDirectory = false;
-                entry.fileSize = static_cast<uint64_t>(sz);
-                entry.mtimeNs = static_cast<int64_t>(lwt.time_since_epoch().count());
-                files.emplace(item.path().filename().string(), std::move(entry));
-            }
-#endif
-            auto [insertedIt, inserted] = dirCache.emplace(dirPart, std::move(files));
-            (void)inserted;
-            auto fileIt = insertedIt->second.find(filePart);
-            if (fileIt != insertedIt->second.end()) {
-                FileEntry entry = fileIt->second;
-                entry.relativePath = relPath;
-                return entry;
-            }
-            return std::nullopt;
-        }
-    };
+    // Lazy directory cache (unify-probe-extra-shared §4.2): migrated verbatim into
+    // fc::DirProbeCache (local_probe.cpp) - the ONE shared probe implementation both
+    // this side and FastCheck use. When a compare probe first touches a directory, it
+    // is enumerated once (all files' size+mtime in one sequential MFT read) and cached;
+    // subsequent probes for files in the same directory hit memory. This avoids both
+    // the full-tree pre-scan (too slow on huge slow disks) and the per-file random
+    // metadata access (random MFT reads that collapse IOPS under concurrency).
+    // Semantics preserved item by item (I-5): lazy, directory-level, shared_mutex
+    // double-checked, slow path once per directory, zero-syscall cache hits.
+    fc::DirProbeCache dirCache;
 
     // Compare workers follow logical CPU concurrency (hardware_concurrency),
     // with a small safety floor for low-core machines.
@@ -1772,12 +1582,14 @@ int RunClient(const CliOptions& options) {
     const size_t maxInFlightCompareTasks = std::max<size_t>(8192, static_cast<size_t>(compareWorkerCount) * 256);
     // Compare active cap: starts at full worker count (no throttle on fast disks).
     // Follows the write-cap controller's deterioration/growth signals to throttle
-    // concurrent GetFileAttributesExW calls on slow disks where parallel metadata
-    // queries cause IOPS collapse (observed: 4636 single-thread -> ~486 at 2 threads).
+    // concurrent metadata-probe calls on slow disks where parallel metadata queries
+    // cause IOPS collapse (observed: 4636 single-thread -> ~486 at 2 threads).
     uint32_t compareActiveCap = compareWorkerCount;
-    // Shared compare pipeline (fastcheck-compare-pipeline §5): Fast mode, probe = probeLocalFile
-    // injected verbatim (preserves the FILETIME-ticks mtime representation, D-04/AC-24), workers wake
-    // the main loop via compareResultCv. Declared AFTER clientDriver (§6.4 lifetime): its destructor
+    // Shared compare pipeline (fastcheck-compare-pipeline §5): Fast mode, probe =
+    // fc::ProbeLocalFile batch form via dirCache (unify-probe-extra-shared FR-01; the
+    // platform mtime representation is unchanged: raw FILETIME ticks on Windows / Unix
+    // ns on POSIX, D-04/AC-24), workers wake the main loop via compareResultCv. Declared
+    // AFTER clientDriver (§6.4 lifetime): its destructor
     // Stop()+Join()s the workers before clientDriver is destroyed (the compare workers do not touch the
     // driver, but the ordering matches the design's teardown contract). Explicit Stop()/Join() below
     // keep the deterministic teardown order on the clean and catch paths.
@@ -1785,8 +1597,12 @@ int RunClient(const CliOptions& options) {
     comparePipelineCfg.mode = CompareMode::Fast;
     comparePipelineCfg.workerCount = compareWorkerCount;
     comparePipelineCfg.batchPop = 32;
-    fc::ComparePipeline comparePipeline(comparePipelineCfg, probeLocalFile,
-                                        [&]() { compareResultCv.notify_one(); });
+    fc::ComparePipeline comparePipeline(
+        comparePipelineCfg,
+        [&rootDir = options.rootDir, &dirCache](const std::string& rel) {
+            return fc::ProbeLocalFile(rootDir, rel, &dirCache);  // batch form (FastClone)
+        },
+        [&]() { compareResultCv.notify_one(); });
     comparePipeline.SetActiveCap(compareActiveCap);  // initial = full (no throttle)
 
     // Directory-creation worker pool (see dirTasks declaration). Each worker pops a
@@ -4448,9 +4264,9 @@ int RunClient(const CliOptions& options) {
                     lastCapSampleSnapshot = sample;
 
                     // Sync compare active cap to the write controller's direction. Compare's
-                    // GetFileAttributesExW competes with writes for disk IOPS; when the write
+                    // metadata probes compete with writes for disk IOPS; when the write
                     // controller detects deterioration, compare must throttle too.
-                    // Floor is 4: a single GetFileAttributesExW worker is too slow on any disk
+                    // Floor is 4: a single compare-probe worker is too slow on any disk
                     // (observed 38 files/s at cap=1 vs 1412 at cap=10 on a slow RAID SSD).
                     constexpr uint32_t kCompareCapMin = 4;
                     switch (writeCapState.lastReason) {
