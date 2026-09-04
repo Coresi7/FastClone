@@ -209,6 +209,8 @@
     <!-- Shared with FastClone: parallel directory walker (extra-detection) + UTF/path helpers used by compare_phase.cpp. -->
     <ClCompile Include="..\FastClone\parallel_dir_walk.cpp" />
     <ClCompile Include="..\FastClone\sync_util.cpp" />
+    <ClCompile Include="..\FastClone\extra_scan.cpp" />
+    <ClCompile Include="..\FastClone\local_probe.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

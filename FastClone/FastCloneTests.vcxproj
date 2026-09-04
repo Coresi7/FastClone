@@ -90,13 +90,18 @@
     <!-- Forward slashes so FASTCLONE_CLI_SRC is a valid C string literal (backslashes escape). -->
     <FastCloneCliSrc>$(ProjectDir)cli.cpp</FastCloneCliSrc>
     <FastCloneCliSrc>$(FastCloneCliSrc.Replace('\','/'))</FastCloneCliSrc>
+    <!-- Forward slashes so FASTCLONE_SOURCE_DIR is a valid C string literal for the
+         source-gate test (test_shared_source_gate.cpp scans sync_engine_client.cpp /
+         check_engine.cpp). Mirrors CMake FastCloneTests' FASTCLONE_SOURCE_DIR. -->
+    <FastCloneSourceDir>$(ProjectDir)..</FastCloneSourceDir>
+    <FastCloneSourceDir>$(FastCloneSourceDir.Replace('\','/'))</FastCloneSourceDir>
   </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);FASTCLONE_SOURCE_DIR="$(FastCloneSourceDir)";_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -115,7 +120,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);FASTCLONE_SOURCE_DIR="$(FastCloneSourceDir)";_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -132,7 +137,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);FASTCLONE_SOURCE_DIR="$(FastCloneSourceDir)";_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -151,7 +156,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_WIN32_WINNT=0x0A00;WIN32_LEAN_AND_MEAN;NOMINMAX;FASTCLONE_ENABLE_CLI_TESTS;FASTCLONE_CLI_SRC=$(FastCloneCliSrc);FASTCLONE_SOURCE_DIR="$(FastCloneSourceDir)";_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -208,6 +213,13 @@
     <ClCompile Include="parallel_dir_walk.cpp" />
     <ClCompile Include="transfer_tuning.cpp" />
     <ClCompile Include="win_socket.cpp" />
+    <!-- Production sources newly added to mirror CMake FastCloneTests (extra-scan / local-probe). -->
+    <ClCompile Include="extra_scan.cpp" />
+    <ClCompile Include="local_probe.cpp" />
+    <!-- Shared probe/extra/source-gate fixtures (mirror CMake FastCloneTests). -->
+    <ClCompile Include="..\tests\test_shared_probe.cpp" />
+    <ClCompile Include="..\tests\test_shared_extra_scan.cpp" />
+    <ClCompile Include="..\tests\test_shared_source_gate.cpp" />
     <!-- Test sources. test_cli.cpp builds under MSVC too: it widens its ASCII argv to
          wchar_t** to match ParseCli's wmain signature, so the former C2664 no longer applies.
          FASTCLONE_ENABLE_CLI_TESTS is defined per configuration below so test_main.cpp runs
