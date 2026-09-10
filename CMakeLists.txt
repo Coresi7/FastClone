@@ -26,8 +26,17 @@ if(MSVC)
     # CMAKE_CXX_FLAGS on the command line would drop /EHsc, breaking exception
     # unwinding (C4530): RAII locks/thread destructors would not run and test
     # processes could deadlock. /EHsc is given explicitly so standard exception
-    # unwinding is always enabled.
+    # unwinding is always enabled. Applies to both cl.exe and clang-cl.
     add_compile_options(/utf-8 /EHsc)
+    # Whole Program Optimization for genuine MSVC (cl.exe) non-Debug configs,
+    # matching the hand-maintained FastClone/FastCheck .vcxproj Release
+    # (WholeProgramOptimization=true => /GL compile + /LTCG link). clang-cl is
+    # excluded here: it already gets cross-TU optimization via ThinLTO in the
+    # Clang branch below, and /GL must not be mixed with -flto=thin.
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        add_compile_options($<$<NOT:$<CONFIG:Debug>>:/GL>)
+        add_link_options($<$<NOT:$<CONFIG:Debug>>:/LTCG>)
+    endif()
 endif()
 
 # --- Compiler performance tuning for clang / clang-cl ---
