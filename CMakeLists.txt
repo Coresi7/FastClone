@@ -30,6 +30,41 @@ if(MSVC)
     add_compile_options(/utf-8 /EHsc)
 endif()
 
+# --- Compiler performance tuning for clang / clang-cl ---
+# clang-cl reports CMAKE_CXX_COMPILER_ID "Clang" while defining MSVC=ON.
+# The VS generator is multi-config (CMAKE_BUILD_TYPE empty), so we scope
+# optimization flags to non-Debug configs via generator expressions.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(MSVC)
+        # clang-cl driver: MSVC-style flags + /clang: passthrough for LLVM opts.
+        # /O2 speed + /Ob2 aggressive inline; -march/-mtune=native enables host
+        # SSE4.2/AVX2 (helps xxhash & byte comparisons); ThinLTO via lld-link.
+        # Applied for non-Debug single-config builds (e.g. -DCMAKE_BUILD_TYPE=Release).
+        if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+            add_compile_options(/O2 /Ob2 /clang:-march=native /clang:-mtune=native /clang:-flto=thin)
+            # NOTE: CMake links via lld-link.exe directly (not the clang-cl driver),
+            # so linker opts must be plain lld-link flags, not /clang: passthrough.
+            # -flto=thin matches the compile-time bitcode; linker is already lld-link.
+            add_link_options(-flto=thin)
+        endif()
+    else()
+        # Plain clang (Linux/macOS): -O3 + native ISA + ThinLTO.
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        add_compile_options(
+            $<$<NOT:$<CONFIG:Debug>>:-O3 -march=native -mtune=native -flto=thin>)
+        add_link_options(
+            $<$<NOT:$<CONFIG:Debug>>:-fuse-ld=lld -flto=thin>)
+    endif()
+    # PGO (two-phase) — enable after collecting a profdata from a real run:
+    #   configure -DFASTCLONE_PGO=gen, run a representative workload, then
+    #   -DFASTCLONE_PGO=use -DFASTCLONE_PROFDATA=<path>/fastclone.profdata
+    # if(FASTCLONE_PGO STREQUAL "gen")
+    #     add_compile_options($<$<NOT:$<CONFIG:Debug>>:/clang:-fprofile-generate>)
+    # elseif(FASTCLONE_PGO STREQUAL "use" AND FASTCLONE_PROFDATA)
+    #     add_compile_options($<$<NOT:$<CONFIG:Debug>>:/clang:-fprofile-use=${FASTCLONE_PROFDATA}>)
+    # endif()
+endif()
+
 # Unified disk IO driver sources (unified-disk-io-driver). The platform backend .cpp files are
 # each guarded by their platform macro so exactly one compiles to real code per OS; the others
 # compile to an empty translation unit (design D-04, strong isolation).
