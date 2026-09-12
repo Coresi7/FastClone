@@ -15,10 +15,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fc::io {
@@ -83,7 +85,41 @@ public:
     // already-submitted ops are still reaped (design section 3.6 / AC-23). Idempotent.
     void requestCancel();
 
+    // server-memory-retention C1: session-level release of a file's driver-side bookkeeping —
+    // undelivered completions (incl. their payload memory), global order slots and wait state.
+    // Contract the caller must satisfy (else undefined behavior):
+    //   (a) no further ops will be submitted for fileId after this call;
+    //   (b) no reader/stream is still using fileId.
+    // Idempotent; may be called repeatedly; thread-safe. If ops are still outstanding (accepted,
+    // completion not yet delivered), the cleanup is only REGISTERED here and runs automatically
+    // after the LAST completion is delivered — a file with ops in flight loses nothing before
+    // that, so an in-flight completion is never dropped ahead of its delivery (hard constraint 1).
+    void releaseFile(uint64_t fileId);
+    void releaseFiles(const std::vector<uint64_t>& fileIds);
+
     IoCounters counters() const;
+
+    // Driver-internal retention snapshot (observability only; no behavior change). Exposed so
+    // tests and field diagnostics can assert that the driver does NOT keep state for a file
+    // after it is closed, and that undelivered completions do not pile up across sessions.
+    // The FastClone server shares ONE process-scoped driver across every session, so anything
+    // retained here is retained for the lifetime of the process (server memory-retention).
+    struct RetentionSnapshot {
+        size_t trackedFiles = 0;     // completionsByFile_ entries (= files with undelivered
+                                     // completions; was: every fileId ever completed)
+        size_t waitStates = 0;       // fileWait_ entries (= files with a waiter blocked in
+                                     // waitForFile; was: every fileId ever waited on)
+        size_t completionOrder = 0;  // undelivered completions in the global order list, i.e.
+                                     // the true instantaneous backlog. SEMANTIC CHANGE: this
+                                     // used to count ever-appended slots that only a global
+                                     // drain (which the server never calls) would pop, so old
+                                     // field values are NOT comparable with new ones.
+        size_t retainedBytes = 0;    // payload bytes still held by undelivered completions
+        size_t pendingReleases = 0;  // files whose release is deferred until the last
+                                     // outstanding completion is delivered (should be 0 at rest)
+        size_t outstandingFiles = 0; // files with accepted-but-not-yet-delivered ops
+    };
+    RetentionSnapshot retentionSnapshot() const;
 
     // Human-readable name of the active platform backend (e.g. "Linux io_uring"), for a one-line
     // startup diagnostic. Reflects the runtime choice, including the io_uring -> pool fallback.
@@ -96,13 +132,39 @@ public:
     std::vector<OpKind> scheduleLog() const;
 
 private:
+    // One arrived, not-yet-delivered completion. Embeds the intrusive global-order list links so
+    // the order bookkeeping slot and the completion are 1:1 and a delivered completion removes its
+    // slot in O(1) with zero extra heap allocation (server-memory-retention B2, design D-03).
+    struct PendingCompletion {
+        IoCompletion completion;
+        PendingCompletion* orderPrev = nullptr;
+        PendingCompletion* orderNext = nullptr;
+    };
+
+    // Per-file wait state. Referenced via shared_ptr so a waiter blocked in cv.wait_for holds its
+    // own reference: erasing the map entry while the waiter is blocked can never dangle the cv
+    // (server-memory-retention B3, design D-02). `waiters`/`dead` make the entry vanish with the
+    // last waiter instead of outliving the wait.
     struct FileWaitState {
         std::condition_variable cv;
+        int waiters = 0;   // threads currently blocked on this state (protected by cmu_)
+        bool dead = false; // release requested: wake waiters; last one out erases the entry
     };
 
     void SchedulerLoop();
     bool PickAndSubmit();  // returns true if an op was submitted this step
     void EnqueueCompletion(IoCompletion completion);
+    // Intrusive global-order list (replaces the unbounded deque<uint64_t> whose slots were never
+    // reclaimed until a global drain that the server never performs). Slots are 1:1 with live
+    // PendingCompletion nodes and vanish with delivery, so orderCount_ always equals the true
+    // undelivered backlog (B2). Both run under cmu_; O(1), no allocation.
+    void OrderLink(PendingCompletion* pc);
+    void OrderUnlink(PendingCompletion* pc);
+    // C1: drop ALL driver-side bookkeeping of fileId (undelivered completions + payloads, order
+    // slots, wait state). Caller must hold cmu_; only ever reached through the release machinery
+    // (releaseFile immediate branch / EnqueueCompletion delayed-release settlement), which the
+    // outstanding-op accounting gates so no live reader can lose a completion it awaits.
+    void ReleaseFileLocked(uint64_t fileId);
 
     IoDriverConfig cfg_;
     std::unique_ptr<PlatformIoBackend> backend_;
@@ -119,14 +181,38 @@ private:
     bool stop_ = false;
     uint64_t inFlight_ = 0;
 
-    std::mutex cmu_;
-    std::unordered_map<uint64_t, std::deque<IoCompletion>> completionsByFile_;
-    std::unordered_map<uint64_t, FileWaitState> fileWait_;
-    std::deque<uint64_t> completionOrder_;  // fileIds in completion order for the global drain
+    mutable std::mutex cmu_;
+    // std::list (not deque): node addresses are stable across push/pop of other nodes, which is
+    // what keeps the intrusive order links valid (design D-04). Entries are erased the moment a
+    // drain empties a file's queue (B1), so the map only tracks files that actually have
+    // undelivered completions — bounded by live work, not by files-ever-touched.
+    std::unordered_map<uint64_t, std::list<PendingCompletion>> completionsByFile_;
+    // Wait states exist only while a thread is actually blocked in waitForFile (the fast path
+    // returns without creating one) and are erased by the last waiter / by release, so the map
+    // is empty whenever nobody is waiting (B3).
+    std::unordered_map<uint64_t, std::shared_ptr<FileWaitState>> fileWait_;
+    // Global completion-order list (B2): order of EnqueueCompletion calls; the head is the oldest
+    // undelivered completion. Invariant I: the node set is exactly the set of PendingCompletion
+    // nodes sitting in completionsByFile_ lists, in enqueue order.
+    PendingCompletion* orderHead_ = nullptr;
+    PendingCompletion* orderTail_ = nullptr;
+    size_t orderCount_ = 0;
 
     mutable std::mutex countMu_;
     IoCounters counters_;
     std::vector<OpKind> scheduleLog_;
+    // server-memory-retention C1 delayed-release accounting (all under countMu_):
+    //   fileOutstanding_[fid] = ops accepted (via submit) whose completion has not been
+    //                           delivered (i.e. not yet passed through EnqueueCompletion);
+    //   pendingRelease_       = files whose releaseFile arrived while ops were outstanding —
+    //                           the cleanup runs in EnqueueCompletion's settlement once the
+    //                           last outstanding completion is delivered (invariant II:
+    //                           an entry in pendingRelease_ implies outstanding ops exist).
+    // Exactly one increment (submit) and one decrement (EnqueueCompletion settlement) per op;
+    // requestCancel's flush and PickAndSubmit's hard-failure synthesis both deliver their
+    // completions through EnqueueCompletion, so they need no separate decrement.
+    std::unordered_map<uint64_t, uint32_t> fileOutstanding_;
+    std::unordered_set<uint64_t> pendingRelease_;
 
     std::thread scheduler_;
 };

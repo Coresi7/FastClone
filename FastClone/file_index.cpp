@@ -455,6 +455,29 @@ Hash256 ComputeFileHashViaDriver(fc::io::DiskIoDriver& driver, const fs::path& p
         throw std::runtime_error("ComputeFileHashViaDriver: open failed");
     }
 
+    // server-memory-retention D-05: release the driver's per-file completion bookkeeping on
+    // EVERY exit of this function — the small-file branch alone has 7 throw exits and the
+    // large-file branch abandons its SequentialReader mid-window on error, and the hash fileId
+    // is NOT tracked by any session container, so nothing else ever reclaims it (the process-
+    // scoped server driver would keep the entry + read-ahead payload until exit). Declared
+    // BEFORE `closer` so it destructs AFTER it: closeFile (no further ops can be submitted)
+    // strictly precedes releaseFile. Safety: on the normal exit all ops have settled, so the
+    // release is immediate; on a throw exit ops may still be outstanding — releaseFile then
+    // only REGISTERS and the cleanup runs after the last completion is delivered, so no
+    // in-flight completion is ever dropped (driver delayed-release contract).
+    struct DriverFileReleaser {
+        fc::io::DiskIoDriver& drv;
+        uint64_t fileId = 0;
+        ~DriverFileReleaser() {
+            try {
+                drv.releaseFile(fileId);
+            } catch (...) {
+                // This destructor also runs during exception unwinding; an escaping exception
+                // would std::terminate the hash worker. Release failure must stay non-fatal.
+            }
+        }
+    } releaser{driver, fid};
+
     struct FileCloser {
         fc::io::DiskIoDriver& driver;
         uint64_t fileId = 0;

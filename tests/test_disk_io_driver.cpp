@@ -1927,6 +1927,381 @@ void TestNormalizeManifestMtimeToUnixNsDirection() {
             "S-02: year-2100 ticks map to ~4e18 ns (post-2038, sane)");
 }
 
+// --- server memory-retention repro -------------------------------------------------------------
+// The FastClone server keeps ONE process-scoped DiskIoDriver (GetServerDiskIoDriver()). Every
+// session reads through it. A session that ends early -- the client's socket dies mid-transfer --
+// only reaches the teardown closeFile() loop ("C10: release any driver file handles"), which
+// releases the OS handle but drops none of the driver's per-file completion bookkeeping. Anything
+// the driver retains is retained until the process exits, which is what an operator sees as
+// "memory climbs during a transfer and is never given back, aborted or not".
+//
+// Three session shapes are driven through the SAME driver instance:
+//   A: session runs to completion            (control group -- must retain nothing either)
+//   B: session abandoned mid-read            (read-ahead window already consumed by the reader)
+//   C: session abandoned with ops in flight  (worst case: late completions land with no reader)
+void TestDriverRetentionAcrossAbandonedSessions() {
+    IoDriverConfig cfg;
+    cfg.chunkBytes = 1u << 20;  // 1 MiB: the server's chunk granularity
+    cfg.maxInFlight = 64;
+
+    auto backend = std::make_unique<MockBackend>(cfg);
+    MockBackend* mock = backend.get();
+    DiskIoDriver drv(cfg, std::move(backend));
+
+    const std::vector<uint8_t> content = RandomBytes(8u << 20, 4242u);  // 8 MiB = 8 chunks
+    const uint64_t size = static_cast<uint64_t>(content.size());
+    constexpr int kSessions = 24;
+
+    const auto baseline = drv.retentionSnapshot();
+    Require(baseline.trackedFiles == 0 && baseline.waitStates == 0 && baseline.completionOrder == 0,
+            "retention: a fresh driver starts with empty completion bookkeeping");
+
+    // Phase A: sessions that run to completion.
+    for (int i = 0; i < kSessions; ++i) {
+        const uint64_t fid = drv.openFile("retention_a.bin", OpKind::Read, true, size);
+        Require(fid != 0, "retention A: read open succeeds");
+        mock->setReadData(fid, content);
+        SequentialReader reader(drv, fid, size, cfg.chunkBytes, 4);
+        uint64_t got = 0;
+        for (;;) {
+            std::vector<uint8_t> chunk;
+            bool ok = true;
+            const uint32_t n = reader.next(chunk, ok);
+            Require(ok, "retention A: chunk read ok");
+            if (n == 0) {
+                break;
+            }
+            got += n;
+        }
+        Require(got == size, "retention A: whole file read back");
+        drv.closeFile(fid);
+    }
+    const auto afterComplete = drv.retentionSnapshot();
+
+    // Phase B: session abandoned mid-read; teardown closes the handle only.
+    for (int i = 0; i < kSessions; ++i) {
+        const uint64_t fid = drv.openFile("retention_b.bin", OpKind::Read, true, size);
+        Require(fid != 0, "retention B: read open succeeds");
+        mock->setReadData(fid, content);
+        {
+            SequentialReader reader(drv, fid, size, cfg.chunkBytes, 4);
+            std::vector<uint8_t> chunk;
+            bool ok = true;
+            const uint32_t n = reader.next(chunk, ok);  // submits a 4-op read-ahead window
+            Require(ok && n > 0, "retention B: first chunk read ok");
+        }  // reader abandoned: the rest of the window is never consumed
+        drv.closeFile(fid);
+        // Q-1 (server-memory-retention): a real session teardown releases the driver's per-file
+        // bookkeeping after the abandon (the server's RAII guard does this after the hash
+        // drain). The driver has no session concept and physically cannot self-heal an
+        // abandoned read-ahead window, so the session lifecycle must call releaseFiles — that
+        // is exactly what the server-side guard added in this change does.
+        drv.releaseFiles({fid});
+    }
+    // Let every deferred release settle before snapshotting: a session whose ops were still
+    // landing when its releaseFiles ran has its cleanup deferred to the last completion.
+    for (int i = 0; i < 5000; ++i) {
+        const auto s = drv.retentionSnapshot();
+        if (s.pendingReleases == 0 && s.trackedFiles == 0 && s.completionOrder == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto afterAbandon = drv.retentionSnapshot();
+
+    // Phase C: worst case -- ops still in flight when the session is abandoned. The backend is
+    // paused so the window cannot be reaped at abort time; unpausing afterwards delivers the
+    // completions into a driver that nobody will ever drain.
+    for (int i = 0; i < kSessions; ++i) {
+        const uint64_t fid = drv.openFile("retention_c.bin", OpKind::Read, true, size);
+        Require(fid != 0, "retention C: read open succeeds");
+        mock->setReadData(fid, content);
+        mock->pause(true);
+        std::vector<IoRequest> batch;
+        for (uint32_t k = 0; k < 4; ++k) {
+            IoRequest r;
+            r.kind = OpKind::Read;
+            r.fileId = fid;
+            r.offset = static_cast<uint64_t>(k) * cfg.chunkBytes;
+            r.length = cfg.chunkBytes;
+            r.prio = Prio::Large;
+            r.userTag = k;
+            batch.push_back(std::move(r));
+        }
+        size_t took = 0;
+        for (int tries = 0; !batch.empty() && tries < 2000; ++tries) {
+            took += drv.submit(batch);
+            if (!batch.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        Require(took == 4, "retention C: 4 read-ahead ops submitted");
+        drv.closeFile(fid);  // server teardown: handle closed while the ops are in flight
+        mock->pause(false);  // late completions now land with no reader left to drain them
+        // Q-1: same teardown lifecycle as B, but here ops are still IN FLIGHT when the release
+        // arrives — the driver must defer the cleanup to the last completion's delivery (a
+        // file with ops outstanding must not lose a single byte before that) and still end up
+        // fully clean, which is what the server guard guarantees for aborted sessions.
+        drv.releaseFiles({fid});
+    }
+    // Give the scheduler time to deliver every late completion before snapshotting.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // ... and let every deferred release fire (the last session's settle may outlive the sleep
+    // by a scheduler tick under load; poll for it so the snapshot is deterministic).
+    for (int i = 0; i < 5000; ++i) {
+        const auto s = drv.retentionSnapshot();
+        if (s.pendingReleases == 0 && s.trackedFiles == 0 && s.completionOrder == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto afterLate = drv.retentionSnapshot();
+
+    auto dump = [](const char* tag, const DiskIoDriver::RetentionSnapshot& s) {
+        std::printf("[diag][retention] %-26s tracked_files=%zu wait_states=%zu"
+                    " completion_order=%zu retained_bytes=%zu\n",
+                    tag, s.trackedFiles, s.waitStates, s.completionOrder, s.retainedBytes);
+    };
+    dump("after_complete_sessions", afterComplete);
+    dump("after_abandoned_sessions", afterAbandon);
+    dump("after_inflight_abandoned", afterLate);
+
+    Require(afterComplete.trackedFiles == 0,
+            "retention A: completed sessions leave no per-file completion entry");
+    Require(afterAbandon.trackedFiles == 0,
+            "retention B: abandoned sessions leave no per-file completion entry");
+    Require(afterLate.trackedFiles == 0,
+            "retention C: sessions abandoned in flight leave no per-file completion entry");
+    Require(afterLate.waitStates == 0, "retention: no per-file wait state survives closeFile");
+    Require(afterLate.completionOrder == 0,
+            "retention: no completion-order entry survives its session (per-file drains only)");
+    // server-memory-retention (Q-1 strengthening, additive): the full four-metric zero for
+    // every phase, including the read-ahead payload bytes (retainedBytes) the abandoned phases
+    // used to hold (4 MiB per session at baseline), plus the deferred-release ledger.
+    Require(afterComplete.waitStates == 0 && afterComplete.completionOrder == 0 &&
+                afterComplete.retainedBytes == 0,
+            "retention A: completed sessions leave no wait state, order slot or payload either");
+    Require(afterAbandon.waitStates == 0 && afterAbandon.completionOrder == 0 &&
+                afterAbandon.retainedBytes == 0,
+            "retention B: released abandoned sessions leave no wait state, order slot or payload");
+    Require(afterLate.retainedBytes == 0,
+            "retention C: released in-flight sessions leave no read-ahead payload behind");
+    Require(afterAbandon.pendingReleases == 0 && afterLate.pendingReleases == 0,
+            "retention: every deferred release settled (no pendingRelease left behind)");
+}
+
+// --- server-memory-retention C1: releaseFile semantics -----------------------------------------
+
+// Bounded submit: unlike SubmitSingle, gives up after a deadline instead of spinning forever
+// (a cancelled driver accepts nothing and would spin SubmitSingle indefinitely).
+bool SubmitBounded(DiskIoDriver& drv, std::vector<IoRequest>& batch, int ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!batch.empty() && std::chrono::steady_clock::now() < deadline) {
+        if (drv.submit(batch) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    return batch.empty();
+}
+
+// True once the driver's retention ledger is fully clean (all six metrics zero).
+bool RetentionSettled(const DiskIoDriver& drv) {
+    const auto s = drv.retentionSnapshot();
+    return s.trackedFiles == 0 && s.waitStates == 0 && s.completionOrder == 0 &&
+           s.retainedBytes == 0 && s.pendingReleases == 0 && s.outstandingFiles == 0;
+}
+
+// Poll until RetentionSettled or the deadline; returns the last verdict.
+bool WaitRetentionSettled(const DiskIoDriver& drv, int ms) {
+    for (int i = 0; i < ms; ++i) {
+        if (RetentionSettled(drv)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return RetentionSettled(drv);
+}
+
+// AC-06: releaseFile with ops still outstanding must NOT clean anything immediately — it only
+// registers a deferred release, and the cleanup runs automatically once the LAST outstanding
+// completion is delivered. This deferred accounting is the hard-constraint-1 guarantee that an
+// in-flight completion is never dropped ahead of its delivery.
+void TestReleaseFileDelayedUntilOutstandingSettles() {
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    auto mock = std::make_unique<MockBackend>(cfg);
+    MockBackend* raw = mock.get();
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    const uint64_t fid = drv.openFile("rel_delay.bin", OpKind::Read, true, 4096);
+    Require(fid != 0, "release-delay: open succeeds");
+    raw->setReadData(fid, RandomBytes(4096, 77u));
+
+    raw->pause(true);  // withhold completions: the ops stay outstanding
+    std::vector<IoRequest> batch;
+    for (uint32_t k = 0; k < 4; ++k) {
+        IoRequest r;
+        r.kind = OpKind::Read;
+        r.fileId = fid;
+        r.offset = static_cast<uint64_t>(k) * 1024;
+        r.length = 1024;
+        r.prio = Prio::Small;
+        r.userTag = k;
+        batch.push_back(std::move(r));
+    }
+    Require(SubmitBounded(drv, batch, 2000), "release-delay: 4 ops submitted");
+
+    drv.releaseFile(fid);  // ops outstanding -> deferred, nothing deleted yet
+
+    const auto snap1 = drv.retentionSnapshot();
+    Require(snap1.pendingReleases == 1, "release-delay: release registered as pending");
+    Require(snap1.outstandingFiles == 1, "release-delay: outstanding accounting sees the file");
+    Require(snap1.trackedFiles == 0 && snap1.completionOrder == 0 && snap1.retainedBytes == 0,
+            "release-delay: deferred release deleted nothing while ops are in flight");
+
+    raw->pause(false);  // deliver the 4 completions; the last one must trigger the cleanup
+    Require(WaitRetentionSettled(drv, 5000),
+            "release-delay: deferred release fired after the last completion, all clean");
+
+    drv.closeFile(fid);
+}
+
+// AC-05: a waiter blocked in waitForFile while another thread releases the file must leave the
+// wait promptly (the release marks the wait state dead), and — the hard-constraint-1 red line —
+// completions that arrive AFTER a release must still be enqueued and deliverable: no
+// "already released, skip the push" shortcut and no rejection flag for the fileId.
+void TestReleaseFileRacesWithWaiter() {
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 8;
+    auto mock = std::make_unique<MockBackend>(cfg);
+    MockBackend* raw = mock.get();
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    const uint64_t fid = drv.openFile("rel_race.bin", OpKind::Read, true, 4096);
+    Require(fid != 0, "release-race: open succeeds");
+    raw->setReadData(fid, RandomBytes(4096, 88u));
+
+    raw->pause(true);
+    std::vector<IoRequest> batch;
+    for (uint32_t k = 0; k < 4; ++k) {
+        IoRequest r;
+        r.kind = OpKind::Read;
+        r.fileId = fid;
+        r.offset = static_cast<uint64_t>(k) * 1024;
+        r.length = 1024;
+        r.prio = Prio::Small;
+        r.userTag = k;
+        batch.push_back(std::move(r));
+    }
+    Require(SubmitBounded(drv, batch, 2000), "release-race: 4 ops submitted");
+
+    std::atomic<bool> waiterDone{false};
+    std::thread waiter([&]() {
+        drv.waitForFile(fid, 300);
+        waiterDone.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));  // let the waiter block
+    const auto t0 = std::chrono::steady_clock::now();
+    drv.releaseFile(fid);  // races with the blocked waiter
+    waiter.join();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+    Require(waiterDone.load(), "release-race: waiter returned");
+    // If the waiter was already blocked, the dead flag wakes it immediately; if it had not
+    // entered waitForFile yet, its own 300 ms timeout bounds the wait. Either way <= 500 ms.
+    Require(elapsedMs <= 500, "release-race: waiter left within timeoutMs + 200 ms");
+
+    raw->pause(false);  // the outstanding completions now land into a released file
+    Require(WaitRetentionSettled(drv, 5000),
+            "release-race: deferred release settled, driver fully clean");
+
+    // Red line probe: a post-release op on the same fileId must still be ACCEPTED and its
+    // completion enqueued + deliverable (release is not a rejection flag; the push is never
+    // suppressed — a dropped enqueue is what would deadlock a live SequentialReader).
+    std::vector<IoRequest> after;
+    IoRequest r2;
+    r2.kind = OpKind::Read;
+    r2.fileId = fid;
+    r2.offset = 0;
+    r2.length = 1024;
+    r2.prio = Prio::Small;
+    r2.userTag = 99;
+    after.push_back(std::move(r2));
+    Require(SubmitBounded(drv, after, 2000), "release-race: post-release op accepted");
+    std::vector<IoCompletion> out;
+    for (int i = 0; i < 3000 && out.empty(); ++i) {
+        drv.drainCompletionsForFile(fid, out);
+        if (out.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    Require(out.size() == 1 && out[0].fileId == fid && out[0].userTag == 99,
+            "release-race: post-release completion still delivered (never dropped at enqueue)");
+
+    drv.closeFile(fid);
+}
+
+// AC-12: requestCancel (flushing queued ops as Cancelled completions) racing releaseFile on
+// many files must stay deadlock-free and converge to a fully clean driver — the cancel-flush
+// deliveries, the deferred releases and the outstanding accounting all run under the same two
+// lock disciplines as production.
+void TestCancelAndReleaseConcurrency() {
+    IoDriverConfig cfg;
+    cfg.maxInFlight = 16;
+    auto mock = std::make_unique<MockBackend>(cfg);
+    MockBackend* raw = mock.get();
+    DiskIoDriver drv(cfg, std::move(mock));
+
+    constexpr int kThreads = 4;
+    constexpr int kFilesPerThread = 25;
+    raw->pause(true);  // keep accepted ops outstanding so releases take the deferred path
+
+    std::atomic<bool> cancelFired{false};
+    std::thread canceller([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        drv.requestCancel();
+        cancelFired.store(true);
+    });
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t]() {
+            for (int i = 0; i < kFilesPerThread; ++i) {
+                const uint64_t fid =
+                    drv.openFile("rel_cancel_" + std::to_string(t) + "_" + std::to_string(i),
+                                 OpKind::Read, true, 4096);
+                if (fid == 0) {
+                    continue;  // open failed: nothing to release
+                }
+                raw->setReadData(fid, RandomBytes(4096, 90u + static_cast<uint32_t>(t)));
+                std::vector<IoRequest> batch;
+                for (uint32_t k = 0; k < 4; ++k) {
+                    IoRequest r;
+                    r.kind = OpKind::Read;
+                    r.fileId = fid;
+                    r.offset = static_cast<uint64_t>(k) * 1024;
+                    r.length = 1024;
+                    r.prio = Prio::Small;
+                    r.userTag = k;
+                    batch.push_back(std::move(r));
+                }
+                drv.submit(batch);  // accept whatever fits (0 after cancel / backpressure)
+                drv.releaseFile(fid);
+            }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+    canceller.join();
+    Require(cancelFired.load(), "cancel+release: cancel fired");
+
+    raw->pause(false);  // held ops now complete; every deferred release must settle
+    Require(WaitRetentionSettled(drv, 5000),
+            "cancel+release: concurrent cancel/release converges to a clean driver (no deadlock)");
+}
+
 }  // namespace
 
 void RunDiskIoDriverTests() {
@@ -1960,6 +2335,10 @@ void RunDiskIoDriverTests() {
     TestReadOpenExpectedSizeMismatch();
     TestConcurrentQueryAlignAndReadIntegration();
     TestNonAsciiPathIoRoundTrip();
+    TestDriverRetentionAcrossAbandonedSessions();
+    TestReleaseFileDelayedUntilOutstandingSettles();
+    TestReleaseFileRacesWithWaiter();
+    TestCancelAndReleaseConcurrency();
 #if defined(__linux__)
     TestPosixPoolAlignedDirectIo();
     TestUringFallbackCounter();

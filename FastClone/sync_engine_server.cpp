@@ -791,6 +791,21 @@ BlockSigMemCache& GetBlockSigMemCache() {
     return cache;
 }
 
+// Minimal RAII scope guard (server-memory-retention C1): runs `fn` exactly once on scope exit,
+// INCLUDING during exception unwinding. No repository-wide guard utility exists, so this stays
+// local and deliberately tiny; copy/move are disabled so the guard cannot fire twice.
+struct ScopeGuard {
+    std::function<void()> fn;
+    explicit ScopeGuard(std::function<void()> f) : fn(std::move(f)) {}
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+    ~ScopeGuard() {
+        if (fn) {
+            fn();
+        }
+    }
+};
+
 // Per-connection session server. The FC6 handshake + session merge has already been
 // performed by the caller (HandshakeAndResolveSession); this body is unchanged from the
 // single-connection model and runs independently per connection (D-02).
@@ -834,6 +849,75 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
     // FileRangeData/FileRangeEnd/FileRangeError frame family.
     std::unordered_map<uint32_t, ServerRangeStream> activeFileRangeStreams;  // main-loop private
     std::vector<std::pair<uint32_t, ServerRangeStream>> pendingNewFileRangeStreams;
+
+    // server-memory-retention C1: RAII guard so this session's driver file bookkeeping is
+    // released on EVERY exit path — normal return and the failure throw at the end of this
+    // function (whose stack unwinding runs this destructor). Declared after every container it
+    // references, so reverse destruction order guarantees they are all still alive here, and
+    // the destructor necessarily runs AFTER the hash-drain wait near the end of the function:
+    // no hash job can still be using a SequentialReader when the release happens (release only
+    // after the drain). sessionFileIds is filled by the C10 closeFile sweep below; the guard
+    // itself additionally covers the C2 hand-off queues that the C10 sweep never visits — all
+    // four pendingNew* containers (B-01 added pendingNewStreams / pendingNewBatchStreams to
+    // the two pendingNew*RangeStreams containers covered by C2).
+    std::vector<uint64_t> sessionFileIds;
+    ScopeGuard releaseDriverFiles([&]() {
+        try {
+            // C2 + B-01: all four pendingNew* containers are receiver -> main-loop hand-off
+            // queues; a session aborted right after openFile leaves entries never adopted, so
+            // their fileIds were never closeFile'd. Snapshot under mu (mu must not cover file
+            // I/O), then do the IO outside the lock.
+            std::vector<uint64_t> pendingIds;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                for (const auto& p : pendingNewStreams) {
+                    if (p.second.fileId != 0) {
+                        pendingIds.push_back(p.second.fileId);
+                    }
+                }
+                for (const auto& p : pendingNewBatchStreams) {
+                    if (p.second.fileId != 0) {
+                        pendingIds.push_back(p.second.fileId);
+                    }
+                }
+                for (const auto& p : pendingNewRangeStreams) {
+                    if (p.second.fileId != 0) {
+                        pendingIds.push_back(p.second.fileId);
+                    }
+                }
+                for (const auto& p : pendingNewFileRangeStreams) {
+                    if (p.second.fileId != 0) {
+                        pendingIds.push_back(p.second.fileId);
+                    }
+                }
+            }
+            // Order matters: closeFile FIRST (after this no new op can be submitted for these
+            // ids — releaseFile contract (a)), then releaseFile (drop the bookkeeping).
+            for (const uint64_t fid : pendingIds) {
+                GetServerDiskIoDriver().closeFile(fid);
+            }
+            GetServerDiskIoDriver().releaseFiles(sessionFileIds);
+            GetServerDiskIoDriver().releaseFiles(pendingIds);
+            if (debugEnabled) {
+                const fc::io::DiskIoDriver::RetentionSnapshot ret =
+                    GetServerDiskIoDriver().retentionSnapshot();
+                std::cerr << "[debug][server][sid=" << sessionId
+                          << "] driver_retention_after_release"
+                          << " tracked_files=" << ret.trackedFiles
+                          << " wait_states=" << ret.waitStates
+                          << " completion_order=" << ret.completionOrder
+                          << " retained_bytes=" << ret.retainedBytes
+                          << " pending_releases=" << ret.pendingReleases
+                          << " outstanding_files=" << ret.outstandingFiles
+                          << std::endl;
+            }
+        } catch (...) {
+            // This destructor can run during stack unwinding (the failure throw at the end of
+            // RunSessionServer); a new exception escaping here would std::terminate the whole
+            // server process. Release failure must never take the process down — swallow.
+        }
+    });
+
     // Sized so all enumeration workers can each have a full flush chunk in flight without
     // serialising on backpressure (workers * kFrameFlushThreshold, rounded up). RAM is
     // cheap relative to the throughput win; the sender drains this continuously.
@@ -1869,29 +1953,54 @@ void RunSessionServer(const SocketHandle& client, const CliOptions& options,
     // C10: release any driver file handles still held by in-flight streams. The send loop
     // closes each on completion/error, but a session that tore down mid-stream leaves some open;
     // the process-global driver would otherwise leak these handles across sessions.
+    // server-memory-retention C1: record each fileId BEFORE zeroing it so the release guard
+    // declared above can also drop the driver's per-file completion bookkeeping (closeFile only
+    // releases the OS handle — the driver's completionsByFile_/order/wait entries would
+    // otherwise stay until the process exits).
+    sessionFileIds.reserve(activeStreams.size() + activeBatchStreams.size() +
+                           activeRangeStreams.size() + activeFileRangeStreams.size());
     for (auto& kv : activeStreams) {
         if (kv.second.fileId != 0) {
+            sessionFileIds.push_back(kv.second.fileId);
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
             kv.second.fileId = 0;
         }
     }
     for (auto& kv : activeBatchStreams) {
         if (kv.second.fileId != 0) {
+            sessionFileIds.push_back(kv.second.fileId);
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
             kv.second.fileId = 0;
         }
     }
     for (auto& kv : activeRangeStreams) {
         if (kv.second.fileId != 0) {
+            sessionFileIds.push_back(kv.second.fileId);
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
             kv.second.fileId = 0;
         }
     }
     for (auto& kv : activeFileRangeStreams) {
         if (kv.second.fileId != 0) {
+            sessionFileIds.push_back(kv.second.fileId);
             GetServerDiskIoDriver().closeFile(kv.second.fileId);
             kv.second.fileId = 0;
         }
+    }
+
+    if (debugEnabled) {
+        // server-memory-retention (diag): the disk IO driver is a process-wide singleton shared
+        // by every session, so anything it keeps after this session is kept until the process
+        // exits. Printed once per session (after the closeFile sweep above) so retention across
+        // sessions is observable in the field without attaching a debugger.
+        const fc::io::DiskIoDriver::RetentionSnapshot ret =
+            GetServerDiskIoDriver().retentionSnapshot();
+        std::cerr << "[debug][server][sid=" << sessionId << "] driver_retention"
+                  << " tracked_files=" << ret.trackedFiles
+                  << " wait_states=" << ret.waitStates
+                  << " completion_order=" << ret.completionOrder
+                  << " retained_bytes=" << ret.retainedBytes
+                  << std::endl;
     }
 
     if (debugEnabled && failed.load()) {

@@ -33,12 +33,19 @@ DiskIoDriver::~DiskIoDriver() {
 
 size_t DiskIoDriver::submit(std::vector<IoRequest>& batch) {
     size_t accepted = 0;
+    // C1: batch the per-file outstanding deltas and merge them in ONE countMu_ critical
+    // section below (same qmu_ -> countMu_ direction as the PickAndSubmit counter update) —
+    // one lock pair per batch instead of one per op. The merge must complete before qmu_ is
+    // released: only then can the scheduler see (and later settle) these ops, so the increment
+    // always precedes the matching EnqueueCompletion decrement.
+    std::unordered_map<uint64_t, uint32_t> outstandingDelta;
     {
         std::lock_guard<std::mutex> lk(qmu_);
         if (cancelled_ || stop_) {
             return 0;
         }
         for (auto& req : batch) {
+            const uint64_t fid = req.fileId;  // capture before the move below
             if (req.kind == OpKind::Read) {
                 if (readQ_.size() >= cfg_.maxReadQueue) {
                     break;  // backpressure on the read queue (FR-27)
@@ -51,6 +58,13 @@ size_t DiskIoDriver::submit(std::vector<IoRequest>& batch) {
                 writeQ_.push_back(std::move(req));
             }
             ++accepted;
+            ++outstandingDelta[fid];
+        }
+        if (!outstandingDelta.empty()) {
+            std::lock_guard<std::mutex> clk(countMu_);
+            for (const auto& kv : outstandingDelta) {
+                fileOutstanding_[kv.first] += kv.second;
+            }
         }
     }
     if (accepted > 0) {
@@ -81,9 +95,72 @@ static IoRequest PopPreferSmall(std::deque<IoRequest>& q) {
 void DiskIoDriver::EnqueueCompletion(IoCompletion completion) {
     std::lock_guard<std::mutex> lk(cmu_);
     const uint64_t fileId = completion.fileId;
-    completionOrder_.push_back(fileId);
-    completionsByFile_[fileId].push_back(std::move(completion));
-    fileWait_[fileId].cv.notify_one();
+    auto& q = completionsByFile_[fileId];  // list<PendingCompletion> (stable node addresses)
+    q.push_back(PendingCompletion{std::move(completion), nullptr, nullptr});
+    OrderLink(&q.back());  // B2: 1:1 order slot with the node; unlinked on delivery
+    // B3: notify only when someone is actually waiting. The previous operator[] created a
+    // permanent fileWait_ entry for EVERY file that ever completed anything, waiters or not —
+    // one of the two unbounded growth paths (the other was waitForFile).
+    auto wit = fileWait_.find(fileId);
+    if (wit != fileWait_.end()) {
+        wit->second->cv.notify_one();
+    }
+    // C1 delayed-release settlement — runs strictly AFTER the push above, so this completion
+    // was always enqueued first (the push is unconditional; a release never suppresses it).
+    // Exactly one decrement per delivered completion, which pairs with the one increment in
+    // submit() — this covers normal reap, requestCancel's flush and PickAndSubmit's
+    // hard-failure synthesis alike, since all three deliver through this function.
+    // Lock order cmu_ -> countMu_ is the allowed direction; countMu_ is released before
+    // ReleaseFileLocked touches the cmu_ containers again.
+    bool doRelease = false;
+    {
+        std::lock_guard<std::mutex> clk(countMu_);
+        auto oit = fileOutstanding_.find(fileId);
+        if (oit != fileOutstanding_.end() && --oit->second == 0) {
+            fileOutstanding_.erase(oit);
+        }
+        if (fileOutstanding_.find(fileId) == fileOutstanding_.end()) {
+            doRelease = pendingRelease_.erase(fileId) > 0;
+        }
+    }
+    if (doRelease) {
+        ReleaseFileLocked(fileId);  // cmu_ still held; countMu_ already released
+    }
+}
+
+// Both run under cmu_ (caller holds it). O(1), zero heap allocation.
+void DiskIoDriver::OrderLink(PendingCompletion* pc) {
+    pc->orderPrev = orderTail_;
+    pc->orderNext = nullptr;
+    if (orderTail_ != nullptr) {
+        orderTail_->orderNext = pc;
+    } else {
+        orderHead_ = pc;
+    }
+    orderTail_ = pc;
+    ++orderCount_;
+}
+
+void DiskIoDriver::OrderUnlink(PendingCompletion* pc) {
+    // Idempotent guard: an already-unlinked node (all links null and not the head) must not
+    // decrement orderCount_ a second time. Under invariant I every node in a per-file list is
+    // linked exactly once, so the guard is defensive only.
+    if (pc->orderPrev == nullptr && pc->orderNext == nullptr && orderHead_ != pc) {
+        return;
+    }
+    if (pc->orderPrev != nullptr) {
+        pc->orderPrev->orderNext = pc->orderNext;
+    } else if (orderHead_ == pc) {
+        orderHead_ = pc->orderNext;
+    }
+    if (pc->orderNext != nullptr) {
+        pc->orderNext->orderPrev = pc->orderPrev;
+    } else if (orderTail_ == pc) {
+        orderTail_ = pc->orderPrev;
+    }
+    pc->orderPrev = nullptr;
+    pc->orderNext = nullptr;
+    --orderCount_;
 }
 
 bool DiskIoDriver::PickAndSubmit() {
@@ -233,15 +310,21 @@ void DiskIoDriver::SchedulerLoop() {
 size_t DiskIoDriver::drainCompletions(std::vector<IoCompletion>& out) {
     std::lock_guard<std::mutex> lk(cmu_);
     size_t n = 0;
-    while (!completionOrder_.empty()) {
-        const uint64_t fid = completionOrder_.front();
-        completionOrder_.pop_front();
+    while (orderHead_ != nullptr) {
+        PendingCompletion* pc = orderHead_;
+        OrderUnlink(pc);  // equivalent of the old completionOrder_.pop_front()
+        const uint64_t fid = pc->completion.fileId;
         auto it = completionsByFile_.find(fid);
         if (it == completionsByFile_.end() || it->second.empty()) {
-            continue;  // already drained via drainCompletionsForFile
+            continue;  // defensive: unreachable under invariant I (kept from the old code)
         }
-        out.push_back(std::move(it->second.front()));
+        // Invariant I: the order-list head is the head of its file queue (same enqueue order),
+        // so global drain delivers in EnqueueCompletion order — byte-for-byte the old behavior.
+        out.push_back(std::move(it->second.front().completion));
         it->second.pop_front();
+        if (it->second.empty()) {
+            completionsByFile_.erase(it);  // same rule as drainCompletionsForFile (B1)
+        }
         ++n;
     }
     return n;
@@ -251,24 +334,58 @@ size_t DiskIoDriver::drainCompletionsForFile(uint64_t fileId, std::vector<IoComp
     std::lock_guard<std::mutex> lk(cmu_);
     auto it = completionsByFile_.find(fileId);
     if (it == completionsByFile_.end()) {
-        return 0;
+        return 0;  // never seen / already reclaimed: same visible result as an empty queue
     }
     size_t n = 0;
     while (!it->second.empty()) {
-        out.push_back(std::move(it->second.front()));
-        it->second.pop_front();
+        PendingCompletion& pc = it->second.front();
+        OrderUnlink(&pc);  // B2: O(1) removal of the global order slot
+        out.push_back(std::move(pc.completion));
+        it->second.pop_front();  // destroys the PendingCompletion, freeing the payload
         ++n;
     }
+    // B1: the queue is now empty, so this fileId has NO arrived-but-undelivered completion left.
+    // Drop the bookkeeping entry immediately; a later completion just recreates it in
+    // EnqueueCompletion — erasing an EMPTY entry can never lose an in-flight completion (only
+    // non-empty entries hold data, and this one holds none).
+    completionsByFile_.erase(it);
     return n;
 }
 
 void DiskIoDriver::waitForFile(uint64_t fileId, int timeoutMs) {
+    const auto ms = std::chrono::milliseconds(timeoutMs < 0 ? 1000 : timeoutMs);
     std::unique_lock<std::mutex> lk(cmu_);
-    auto& waitState = fileWait_[fileId];
-    waitState.cv.wait_for(lk, std::chrono::milliseconds(timeoutMs < 0 ? 1000 : timeoutMs), [&] {
+    // Fast path: a completion is already deliverable -> return without creating any wait state
+    // (keeps fileWait_ empty at rest; steady-state waitStates == 0).
+    auto fit = completionsByFile_.find(fileId);
+    if (fit != completionsByFile_.end() && !fit->second.empty()) {
+        return;
+    }
+    auto& slot = fileWait_[fileId];
+    if (!slot) {
+        slot = std::make_shared<FileWaitState>();
+    }
+    // The waiter keeps its own reference: even if the map entry is erased while we are blocked
+    // in wait_for (cmu_ released inside), the FileWaitState and its cv stay alive, so the
+    // wake-up and destruction are always well-defined (B3 — correctness comes from the value
+    // semantics of shared_ptr, not from the waiters count).
+    std::shared_ptr<FileWaitState> ws = slot;
+    ++ws->waiters;
+    ws->cv.wait_for(lk, ms, [&] {
+        if (ws->dead) {
+            return true;  // release requested: leave promptly; the next drain reports nothing
+        }
         auto it = completionsByFile_.find(fileId);
         return it != completionsByFile_.end() && !it->second.empty();
     });
+    --ws->waiters;
+    if (ws->waiters == 0) {
+        // Last waiter out: reclaim the entry now so wait states never outlive the wait.
+        auto it = fileWait_.find(fileId);
+        if (it != fileWait_.end() && it->second.get() == ws.get()) {
+            fileWait_.erase(it);  // *ws stays alive via the local shared_ptr until return
+        }
+    }
 }
 
 void DiskIoDriver::requestCancel() {
@@ -305,6 +422,55 @@ void DiskIoDriver::requestCancel() {
     qcv_.notify_all();
 }
 
+void DiskIoDriver::releaseFile(uint64_t fileId) {
+    // Two SEPARATE critical sections (countMu_ first and released, then cmu_): never nested,
+    // so the lock order stays acyclic (design §4.1-4). If ops are still outstanding the cleanup
+    // is only REGISTERED here and runs in EnqueueCompletion's settlement after the LAST
+    // completion is delivered — a file with ops in flight does not lose a single byte of
+    // bookkeeping before that, which is what keeps in-flight completions undroppable.
+    bool immediate = false;
+    {
+        std::lock_guard<std::mutex> lk(countMu_);
+        if (fileOutstanding_.find(fileId) == fileOutstanding_.end()) {
+            immediate = true;  // nothing outstanding -> clean up right now
+        } else {
+            pendingRelease_.insert(fileId);  // ops in flight -> defer to the last delivery
+        }
+    }
+    if (immediate) {
+        std::lock_guard<std::mutex> lk(cmu_);
+        ReleaseFileLocked(fileId);
+    }
+}
+
+void DiskIoDriver::releaseFiles(const std::vector<uint64_t>& fileIds) {
+    for (const uint64_t fid : fileIds) {
+        releaseFile(fid);
+    }
+}
+
+void DiskIoDriver::ReleaseFileLocked(uint64_t fileId) {
+    // cmu_ held by the caller. The ONLY place besides the drain paths that drops per-file
+    // bookkeeping; it is gated by the releaseFile contract (no further submits, no live
+    // reader) and by the outstanding-op accounting, so a live SequentialReader can never
+    // lose a completion it is still waiting for (hard constraint 1).
+    auto it = completionsByFile_.find(fileId);
+    if (it != completionsByFile_.end()) {
+        for (auto& pc : it->second) {
+            OrderUnlink(&pc);  // drop every global order slot of this file
+        }
+        completionsByFile_.erase(it);  // frees all undelivered payload memory
+    }
+    auto wit = fileWait_.find(fileId);
+    if (wit != fileWait_.end()) {
+        wit->second->dead = true;
+        wit->second->cv.notify_all();  // wake blocked waiters; they observe dead and leave
+        if (wit->second->waiters == 0) {
+            fileWait_.erase(wit);  // no waiter: drop now; else the last waiter erases it
+        }
+    }
+}
+
 IoCounters DiskIoDriver::counters() const {
     IoCounters c;
     {
@@ -323,6 +489,27 @@ IoCounters DiskIoDriver::counters() const {
     c.smallFileFallback = bc.smallFileFallback;
     c.tailZeroFallback = bc.tailZeroFallback;
     return c;
+}
+
+DiskIoDriver::RetentionSnapshot DiskIoDriver::retentionSnapshot() const {
+    RetentionSnapshot snap;
+    std::lock_guard<std::mutex> lk(cmu_);
+    snap.trackedFiles = completionsByFile_.size();
+    snap.waitStates = fileWait_.size();
+    snap.completionOrder = orderCount_;  // new semantics: instantaneous undelivered backlog
+    for (const auto& kv : completionsByFile_) {
+        for (const auto& pc : kv.second) {
+            snap.retainedBytes += pc.completion.data.size();
+        }
+    }
+    {
+        // cmu_ -> countMu_ is the allowed direction (design §4.1-5); countMu_ is innermost
+        // and released immediately, matching the releaseFile/settlement discipline.
+        std::lock_guard<std::mutex> clk(countMu_);
+        snap.pendingReleases = pendingRelease_.size();
+        snap.outstandingFiles = fileOutstanding_.size();
+    }
+    return snap;
 }
 
 std::vector<OpKind> DiskIoDriver::scheduleLog() const {
