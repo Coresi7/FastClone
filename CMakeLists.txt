@@ -58,11 +58,29 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         endif()
     else()
         # Plain clang (Linux/macOS): -O3 + native ISA + ThinLTO.
-        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-        add_compile_options(
-            $<$<NOT:$<CONFIG:Debug>>:-O3 -march=native -mtune=native -flto=thin>)
-        add_link_options(
-            $<$<NOT:$<CONFIG:Debug>>:-fuse-ld=lld -flto=thin>)
+        #
+        # Scoped with a plain if(), NOT with $<NOT:$<CONFIG:Debug>>: this branch
+        # only runs under single-config generators (Unix Makefiles / Ninja), where
+        # CMAKE_BUILD_TYPE is authoritative — the same form the clang-cl branch
+        # above already uses. Pipeline #46 proved the generator-expression form is
+        # unsafe here: with CMAKE_INTERPROCEDURAL_OPTIMIZATION ON, the Unix
+        # Makefiles generator emitted the half-evaluated expression into flags.make
+        # and clang++ received the literal tokens '$<1:-O3' and '-flto=thin>'.
+        if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+            # ThinLTO is supplied by IPO below; passing -flto=thin by hand
+            # duplicated it and was the token that carried the leaked '>'.
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+            add_compile_options(-O3 -march=native -mtune=native)
+            # -fuse-ld=lld: keep only when a bitcode-capable lld is actually
+            # installed. This flag has never linked successfully (it shipped in
+            # 47607af, the same commit that broke #46, which failed before the
+            # first link), so don't hard-fail runners without lld — Apple ld64
+            # links ThinLTO natively.
+            find_program(FASTCLONE_LTO_LINKER NAMES ld64.lld ld.lld lld)
+            if(FASTCLONE_LTO_LINKER)
+                add_link_options(-fuse-ld=lld)
+            endif()
+        endif()
     endif()
     # PGO (two-phase) — enable after collecting a profdata from a real run:
     #   configure -DFASTCLONE_PGO=gen, run a representative workload, then
