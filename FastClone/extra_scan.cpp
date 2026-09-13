@@ -159,7 +159,9 @@ ExtraScanResult ScanExtrasImpl(const fs::path& root,
             if (ec) {
                 ec.clear();
             }
-            const std::string name = absPath.filename().string();
+            // UTF-8 (PathToUtf8), not path::string(): the latter goes through CP_ACP on
+            // Windows, which would emit a non-UTF-8 relPath for non-ASCII names.
+            const std::string name = fc::PathToUtf8(absPath.filename());
             std::string relPath = BuildRelPath(current.relDir, name);
             if (relPath.empty()) {
                 continue;   // B-04

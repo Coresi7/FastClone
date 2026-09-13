@@ -47,7 +47,11 @@ void EnumerateDirFileEntries(const fs::path& absDir,
         mt.LowPart = fd.ftLastWriteTime.dwLowDateTime;
         mt.HighPart = fd.ftLastWriteTime.dwHighDateTime;
         entry.mtimeNs = static_cast<int64_t>(mt.QuadPart);
-        std::string fileName = fs::path(fd.cFileName).string();
+        // UTF-8, not path::string(): the latter converts wide -> narrow through the
+        // process ANSI code page (CP_ACP), so on a non-UTF-8/CJK code page the cache
+        // key would not match the UTF-8 relative path the caller looks up, and every
+        // non-ASCII filename would be reported as missing.
+        std::string fileName = fc::PathToUtf8(fs::path(fd.cFileName));
         out.emplace(std::move(fileName), std::move(entry));
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
@@ -78,7 +82,7 @@ void EnumerateDirFileEntries(const fs::path& absDir,
         entry.isDirectory = false;
         entry.fileSize = static_cast<uint64_t>(sz);
         entry.mtimeNs = ToUnixNs(lwt);
-        out.emplace(it->path().filename().string(), std::move(entry));
+        out.emplace(fc::PathToUtf8(it->path().filename()), std::move(entry));
     }
 #endif
 }

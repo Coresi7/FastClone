@@ -499,7 +499,9 @@ void EnumerateManifestEntriesFast(
                 ec.clear();
             }
 
-            const std::string name = absPath.filename().string();
+            // UTF-8 (PathToUtf8), not path::string(): CP_ACP would corrupt/alter
+            // non-ASCII names on a non-UTF-8 code page.
+            const std::string name = fc::PathToUtf8(absPath.filename());
             std::string relPath = BuildRelPath(current.relDir, name);
             if (relPath.empty()) {
                 continue;

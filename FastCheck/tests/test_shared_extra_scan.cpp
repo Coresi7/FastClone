@@ -49,7 +49,7 @@ ScanFixture MakeScanFixture() {
     fc::test::WriteBinaryFile(fx.root / "zero.bin", 0);
     fc::test::WriteBinaryFile(fx.root / "nested/x2.txt", 40);
     fc::test::WriteBinaryFile(fx.root / "nested/deep/x3.dat", 50);
-    fc::test::WriteBinaryFile(fx.root / "\xe4\xb8\xad\xe6\x96\x87 \xce\xa9.txt", 7);
+    fc::test::WriteBinaryFile(fx.root / fc::test::FixturePathFromUtf8("\xe4\xb8\xad\xe6\x96\x87 \xce\xa9.txt"), 7);
     fs::create_directories(fx.root / "nested/empty");
     fc::test::WriteBinaryFile(fx.outsideFile, 99);
 #ifndef _WIN32
