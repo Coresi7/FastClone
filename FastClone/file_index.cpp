@@ -113,6 +113,16 @@ fs::file_time_type::duration FileToSystemEpochDelta() {
     return sysNow - fileNow;
 }
 
+// Single shared epoch delta so ToUnixNs/FromUnixNs round-trip exactly.
+// FileToSystemEpochDelta() measures two separate clock reads, so the result
+// carries a non-constant call latency; two independent statics (one per
+// function) made the add/subtract not cancel (observed constant 7 ns skew on
+// mtimeNs round-trips). Sharing one static keeps the pair exactly inverse.
+const fs::file_time_type::duration& SharedFileToSystemEpochDelta() {
+    static const fs::file_time_type::duration kDelta = FileToSystemEpochDelta();
+    return kDelta;
+}
+
 }  // namespace
 
 std::string NormalizeRelativePath(const fs::path& relativePath) {
@@ -131,14 +141,14 @@ std::string NormalizeRelativePath(const fs::path& relativePath) {
 
 int64_t ToUnixNs(const fs::file_time_type& value) {
     using namespace std::chrono;
-    static const fs::file_time_type::duration kFileToSystemDelta = FileToSystemEpochDelta();
+    const auto& kFileToSystemDelta = SharedFileToSystemEpochDelta();
     const auto sysDur = value.time_since_epoch() + kFileToSystemDelta;
     return duration_cast<nanoseconds>(sysDur).count();
 }
 
 fs::file_time_type FromUnixNs(int64_t valueNs) {
     using namespace std::chrono;
-    static const fs::file_time_type::duration kFileToSystemDelta = FileToSystemEpochDelta();
+    const auto& kFileToSystemDelta = SharedFileToSystemEpochDelta();
     const auto sysDur = duration_cast<fs::file_time_type::duration>(nanoseconds(valueNs));
     return fs::file_time_type(sysDur - kFileToSystemDelta);
 }

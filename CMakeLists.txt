@@ -57,7 +57,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
             add_link_options(-flto=thin)
         endif()
     else()
-        # Plain clang (Linux/macOS): -O3 + native ISA + ThinLTO.
+        # Plain clang (Linux/macOS): -O3 + ThinLTO.
         #
         # Scoped with a plain if(), NOT with $<NOT:$<CONFIG:Debug>>: this branch
         # only runs under single-config generators (Unix Makefiles / Ninja), where
@@ -70,7 +70,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
             # ThinLTO is supplied by IPO below; passing -flto=thin by hand
             # duplicated it and was the token that carried the leaked '>'.
             set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-            add_compile_options(-O3 -march=native -mtune=native)
+            # No -march/-mtune=native: it bakes the BUILD machine's CPU into the
+            # artifacts we ship, and on the darwin runner (amd64 under Rosetta on
+            # Apple Silicon) `native` resolves to 'apple-m3', which this
+            # x86-targeting clang rejects: error: unknown target CPU 'apple-m3'.
+            add_compile_options(-O3)
         endif()
     endif()
     # PGO (two-phase) — enable after collecting a profdata from a real run:

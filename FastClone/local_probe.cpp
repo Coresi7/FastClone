@@ -10,6 +10,7 @@
 #include "sync_util.h"  // fc::JoinRel (FR-05: the only path-joining primitive)
 
 #include <cstdint>
+#include <mutex>
 #include <system_error>
 #include <utility>
 
