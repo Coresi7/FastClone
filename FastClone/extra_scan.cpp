@@ -70,8 +70,22 @@ ExtraScanResult ScanExtrasImpl(const fs::path& root,
         std::wstring absDir;
         std::string relDir;
     };
+    // Canonicalize the exclude path with the SAME normalization applied to the walk
+    // root below. ToExtendedLengthPath only prepends "\\?\" and never normalizes, so
+    // an exclude path spelled differently from the walk path (8.3 short name such as
+    // RUNNER~1, or a reparse point) used to silently fail the _wcsicmp test in
+    // processDir and was never excluded. Done once here, so the per-entry hot path
+    // stays a single O(1) string compare.
+    fs::path excludeCanonical;
+    if (options.excludeAbsPath.has_value()) {
+        std::error_code canonEc;
+        excludeCanonical = fs::weakly_canonical(*options.excludeAbsPath, canonEc);
+        if (canonEc) {
+            excludeCanonical = *options.excludeAbsPath;  // fall back to the raw path
+        }
+    }
     const std::wstring excludeW =
-        options.excludeAbsPath.has_value() ? ToExtendedLengthPath(*options.excludeAbsPath) : L"";
+        options.excludeAbsPath.has_value() ? ToExtendedLengthPath(excludeCanonical) : L"";
     auto processDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs, ScanCtx& ctx) {
         WIN32_FIND_DATAW fd{};
         HANDLE hFind = OpenDirFind(current.absDir, fd);
@@ -113,7 +127,11 @@ ExtraScanResult ScanExtrasImpl(const fs::path& root,
         } while (FindNextFileW(hFind, &fd) != 0);
         FindClose(hFind);
     };
-    ParallelDirWalk(PendingDir{ToExtendedLengthPath(root), std::string()},
+    // Same normalization as excludeW above, so both sides of the _wcsicmp exclude
+    // test are spelled identically.
+    std::error_code rootCanonEc;
+    const fs::path rootCanonical = fs::weakly_canonical(root, rootCanonEc);
+    ParallelDirWalk(PendingDir{ToExtendedLengthPath(rootCanonEc ? root : rootCanonical), std::string()},
                     numWorkers, kDeleteDirPopBatch, noCancel, "extra-scan-walk",
                     ScanCtx{}, processDir, finishWorker);
 #else
