@@ -80,6 +80,21 @@ inline void WriteBinaryFile(const std::filesystem::path& path, size_t size) {
     }
 }
 
+// Build an fs::path from UTF-8 bytes WITHOUT going through the platform's default
+// narrow->wide conversion. On Windows, an std::filesystem::path built from a narrow
+// string is converted using the process ANSI code page, which cannot represent the
+// fixture's non-ASCII name on a runner whose CP_ACP is neither UTF-8 nor CJK -
+// observed there as std::system_error code 1113 (ERROR_NO_UNICODE_TRANSLATION).
+// Production fc::JoinRel already widens with CP_UTF8 via fc::Utf8ToWide, so the
+// fixture must do the same to stay codepage-independent. Test-only code.
+inline std::filesystem::path FixturePathFromUtf8(const std::string& utf8) {
+#ifdef _WIN32
+    return std::filesystem::path(fc::Utf8ToWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
+
 inline ProbeFixture MakeProbeFixture() {
     using clock = std::chrono::steady_clock;
     const auto stamp = clock::now().time_since_epoch().count();
@@ -103,7 +118,7 @@ inline ProbeFixture MakeProbeFixture() {
     };
     int mtimeIndex = 0;
     for (const Spec& s : specs) {
-        const std::filesystem::path abs = fx.root / s.rel;
+        const std::filesystem::path abs = fx.root / FixturePathFromUtf8(s.rel);
         WriteBinaryFile(abs, s.size);
         SetFileModifyTime(abs, FixtureMtimeNs(mtimeIndex++));
         fx.relPaths.push_back(s.rel);
