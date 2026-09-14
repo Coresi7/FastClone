@@ -390,8 +390,25 @@ void EnumerateManifestEntriesFast(
     // Extended-length ("\\?\") root so deep source trees (root + relpath > 260) enumerate
     // instead of FindFirstFile silently failing and dropping whole subtrees from the
     // manifest. selfW is prefixed too so the self-exclude comparison stays consistent.
-    const std::wstring rootW = ToExtendedLengthPath(root);
-    const std::wstring selfW = selfPath.has_value() ? ToExtendedLengthPath(*selfPath) : L"";
+    //
+    // Both sides are canonicalized with the SAME normalization first:
+    // ToExtendedLengthPath only prepends "\\?\" and never normalizes, so a selfPath
+    // spelled differently from the walk (8.3 short name such as RUNNER~1, or a
+    // reparse point) would silently fail the _wcsicmp self-exclude test below and be
+    // sent to the peer. Same defect and same fix as extra_scan.cpp's exclude test.
+    // Done once here, so the per-entry hot path stays a single O(1) string compare.
+    std::error_code rootCanonEc;
+    const fs::path rootCanonical = fs::weakly_canonical(root, rootCanonEc);
+    const std::wstring rootW = ToExtendedLengthPath(rootCanonEc ? root : rootCanonical);
+    fs::path selfCanonical;
+    if (selfPath.has_value()) {
+        std::error_code selfEc;
+        selfCanonical = fs::weakly_canonical(*selfPath, selfEc);
+        if (selfEc) {
+            selfCanonical = *selfPath;  // fall back to the raw path
+        }
+    }
+    const std::wstring selfW = selfPath.has_value() ? ToExtendedLengthPath(selfCanonical) : L"";
 
     auto listOneDir = [&](const PendingDir& current, std::vector<PendingDir>& subdirs,
                           std::vector<Frame>& out) {
