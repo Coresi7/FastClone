@@ -17,6 +17,14 @@
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
 
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -53,6 +61,19 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -65,14 +86,27 @@
     <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
-    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)'=='Debug' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
-    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
 
   <PropertyGroup Label="UserMacros" />
+
+  <!-- Windows on ARM64 (WoA): the two ARM64 configurations above inherit every setting from
+       x64 (same v145 toolset, same warnings, same /GL + /LTCG Release) — see the
+       Or '$(Platform)'=='ARM64' conditions on the ImportGroups / ItemDefinitionGroups below.
+       The source tree is arch-neutral: the only arch-specialised code is Mul64() in
+       delta.cpp, which falls back to its portable 32x32 path when _M_X64 is absent.
+       xxhash comes from vcpkg, whose triplet follows $(Platform) (ARM64 -> arm64-windows);
+       pinned explicitly so the ARM64 link can never pick up the x64 xxhash (LNK1112).
+       Prerequisites: vcpkg install xxhash:arm64-windows
+                      + the "MSVC v145 ... ARM64 build tools" VS component. -->
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'">
+    <VcpkgTriplet>arm64-windows</VcpkgTriplet>
+  </PropertyGroup>
 
   <!-- /MP: compile multiple .cpp in parallel within this project (uses all logical CPUs).
        On HDD, if you see thrashing, cap it by switching this off and adding /MP4 to
@@ -117,7 +151,7 @@
        <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
@@ -133,7 +167,7 @@
        <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>

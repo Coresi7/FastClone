@@ -17,6 +17,14 @@
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
 
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -53,6 +61,19 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -65,14 +86,34 @@
     <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
-    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)'=='Debug' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
-    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ImportGroup Label="PropertySheets" Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
       <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
     </ImportGroup>
 
   <PropertyGroup Label="UserMacros" />
+
+  <!-- Windows on ARM64 (WoA): the two ARM64 configurations above inherit every setting from
+       x64 (same v145 toolset, same warnings, same /GL + /LTCG Release) — see the
+       Or '$(Platform)'=='ARM64' conditions on the ImportGroups / ItemDefinitionGroups below.
+       IntDir already varies by $(Platform), so ARM64 objects never collide with x64's.
+       xxhash comes from vcpkg, whose triplet follows $(Platform) (ARM64 -> arm64-windows);
+       pinned explicitly so the ARM64 link can never pick up the x64 xxhash (LNK1112).
+       Prerequisites: vcpkg install xxhash:arm64-windows
+                      + the "MSVC v145 ... ARM64 build tools" VS component. -->
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'">
+    <VcpkgTriplet>arm64-windows</VcpkgTriplet>
+  </PropertyGroup>
+
+  <!-- Cross-compile guard: an ARM64 exe cannot be executed by an x64/x86 host
+       ("This app can't run on your PC"), so the post-build test targets below are
+       skipped unless the building host is itself ARM64 (PROCESSOR_ARCHITECTURE). -->
+  <PropertyGroup>
+    <FcCanRunBuiltBinary Condition="'$(Platform)'!='ARM64'">true</FcCanRunBuiltBinary>
+    <FcCanRunBuiltBinary Condition="'$(Platform)'=='ARM64' And '$(PROCESSOR_ARCHITECTURE)'=='ARM64'">true</FcCanRunBuiltBinary>
+  </PropertyGroup>
 
   <!-- /MP: compile multiple .cpp in parallel within this project (uses all logical CPUs).
        On HDD, if you see thrashing, cap it by switching this off and adding /MP4 to
@@ -133,7 +174,7 @@
        <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
@@ -150,7 +191,7 @@
        <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64')">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -252,19 +293,42 @@
        (0 = all pass, 1 = failure). IgnoreStandardErrorWarningFormat=true stops MSBuild
        scanning the test's stdout/stderr for "error" lines: the tests deliberately emit
        "error : ..." diagnostics while exercising error paths, which would otherwise be
-       misclassified as build errors (MSB3077) even when the suite returns 0. -->
-  <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false'">
-    <Message Text="Running FastClone unit tests..." Importance="high" />
+       misclassified as build errors (MSB3077) even when the suite returns 0.
+
+       FcTestsStamp is durable proof that the suite really executed for THIS configuration:
+       it is deleted before the run and only written after BOTH the unit suite and the
+       data-integrity integration script below have returned 0. A green build without this
+       file means the tests did not run (see ReportTestsSkipped). -->
+  <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' == 'true'">
+    <Message Text="Running FastClone unit tests ($(Configuration)|$(Platform))..." Importance="high" />
+    <Delete Files="$(TargetDir)$(ProjectName).testsran.txt" />
     <Exec Command='"$(TargetPath)"' IgnoreStandardErrorWarningFormat="true" />
+    <Message Text="FastClone unit tests PASSED ($(Configuration)|$(Platform))." Importance="high" />
   </Target>
 
   <!-- Run data-integrity integration test (requires FastClone.exe built in the same
        configuration; the script auto-resolves the exe path). Covers the C2 byte-for-byte
        transfer guarantee that unit tests cannot reach (sync_engine_server.cpp is excluded
        from this project). Windows-only: uses PowerShell + Get-FileHash. -->
-  <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false'">
-    <Message Text="Running data-integrity integration test..." Importance="high" />
+  <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' == 'true'">
+    <Message Text="Running data-integrity integration test ($(Configuration)|$(Platform))..." Importance="high" />
     <Exec Command='powershell -ExecutionPolicy Bypass -File "$(ProjectDir)..\tests\data_integrity_integration.ps1"'
           IgnoreStandardErrorWarningFormat="true" />
+    <Message Text="data-integrity integration test PASSED ($(Configuration)|$(Platform))." Importance="high" />
+    <WriteLinesToFile File="$(TargetDir)$(ProjectName).testsran.txt"
+                      Lines="FastCloneTests: unit + data-integrity integration PASSED;Configuration=$(Configuration);Platform=$(Platform);HostArch=$(PROCESSOR_ARCHITECTURE);At=$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))"
+                      Overwrite="true" WriteOnlyWhenDifferent="false" />
+  </Target>
+
+  <!-- Cross-compilation must never look like a passing test run: say so loudly. -->
+  <Target Name="ReportTestsSkipped" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' != 'true'">
+    <Message Importance="high"
+             Text="TESTS SKIPPED: a $(Platform) binary cannot execute on this $(PROCESSOR_ARCHITECTURE) host (cross-compilation). FastClone unit + data-integrity integration did NOT run for $(Configuration)|$(Platform). Run on an ARM64 host, or pass -p:FCTestsRequired=true to turn this into an error." />
+  </Target>
+
+  <!-- Opt-in gate: -p:FCTestsRequired=true turns a skipped run into a hard error so CI (or a
+       release build) can assert "the tests really ran" instead of trusting a green build. -->
+  <Target Name="RequireTestsRan" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCTestsRequired)' == 'true' And '$(FcCanRunBuiltBinary)' != 'true'">
+    <Error Text="FCTestsRequired=true, but tests cannot run: $(Platform) binaries cannot execute on this $(PROCESSOR_ARCHITECTURE) host." />
   </Target>
 </Project>
