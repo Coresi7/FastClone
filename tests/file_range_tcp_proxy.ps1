@@ -85,5 +85,29 @@ public static class TcpProxy {
 }
 '@
 
-Add-Type -TypeDefinition $proxyCs -ReferencedAssemblies @("System", "System.Core")
+# Add-Type compiles C# in-process and inherits the caller's environment. Under MSBuild the
+# LIB/LIBPATH/INCLUDE of the VS 2026 toolset contain a NON-EXISTENT entry
+# ("...\MSVC\14.51.36231\atlmfc\lib\x64"); the C# compiler treats it as
+# "Warning as Error: Invalid search path" and Add-Type throws -> MSB3073. Drop the three
+# variables for the duration of the compile ONLY, then restore them (a variable that was
+# unset stays unset). Mirrors tests/data_integrity_integration.ps1:113-133.
+# -ReferencedAssemblies is KEPT (FR-12): the C# compiler still needs LIB to resolve the
+# reference assemblies; the isolation is exactly what makes that work under a dirty LIB.
+$fcSavedBuildEnv = @{}
+foreach ($fcEnvVar in 'LIB', 'LIBPATH', 'INCLUDE') {
+    $fcSavedBuildEnv[$fcEnvVar] = [Environment]::GetEnvironmentVariable($fcEnvVar)
+    Remove-Item "Env:\$fcEnvVar" -ErrorAction SilentlyContinue
+}
+try {
+    Add-Type -TypeDefinition $proxyCs -ReferencedAssemblies @("System", "System.Core")
+}
+finally {
+    foreach ($fcEnvVar in @($fcSavedBuildEnv.Keys)) {
+        if ($null -ne $fcSavedBuildEnv[$fcEnvVar]) {
+            [Environment]::SetEnvironmentVariable($fcEnvVar, $fcSavedBuildEnv[$fcEnvVar])
+        }
+    }
+}
+# [TcpProxy]::Run blocks forever (resident proxy): keep it AFTER the finally so the env
+# restoration above is not deferred for the lifetime of the proxy.
 [TcpProxy]::Run($ListenPort, $TargetPort, $DownlinkBytesPerSec)

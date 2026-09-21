@@ -289,16 +289,46 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 
+  <!-- R-5/R-6: one unified "can the tests execute?" verdict = cross-compilation guard AND
+       dependency exes. Every candidate is the CURRENT $(Configuration)|$(Platform) only:
+       no hard-coded config/platform, no "newest exe" search, no cross-config fallback. -->
+  <Target Name="FcResolveTestDeps" BeforeTargets="Build">
+    <PropertyGroup>
+      <!-- $(ProjectDir).. = repo root (FastClone.slnx). Unlike $(SolutionDir) it never
+           collapses to $(ProjectDir) when a single vcxproj is built directly (E-1). -->
+      <FcSolutionOutDir>$(ProjectDir)..\$(Platform)\$(Configuration)\</FcSolutionOutDir>
+      <FcCloneDir>$(ProjectDir)$(Platform)\$(Configuration)\</FcCloneDir>
+      <FcCheckDir>$(ProjectDir)..\FastCheck\$(Platform)\$(Configuration)\</FcCheckDir>
+
+      <!-- Candidate order is FIXED (R-6②): solution OutDir first, project-local OutDir second. -->
+      <FcCloneExe>$(FcSolutionOutDir)FastClone.exe</FcCloneExe>
+      <FcCloneExe Condition="!Exists('$(FcCloneExe)')">$(FcCloneDir)FastClone.exe</FcCloneExe>
+      <FcCheckExe>$(FcSolutionOutDir)FastCheck.exe</FcCheckExe>
+      <FcCheckExe Condition="!Exists('$(FcCheckExe)')">$(FcCheckDir)FastCheck.exe</FcCheckExe>
+
+      <FcDepsReady Condition="Exists('$(FcCloneExe)') And Exists('$(FcCheckExe)')">true</FcDepsReady>
+      <!-- Unified verdict (R-5): guard AND deps. -->
+      <FcTestsCanRun Condition="'$(FcCanRunBuiltBinary)' == 'true' And '$(FcDepsReady)' == 'true'">true</FcTestsCanRun>
+      <!-- Distinguishable reasons (R-1②); cross-compilation wins when both hold. -->
+      <FcSkipReason Condition="'$(FcCanRunBuiltBinary)' != 'true'">cross-compilation</FcSkipReason>
+      <FcSkipReason Condition="'$(FcCanRunBuiltBinary)' == 'true' And '$(FcDepsReady)' != 'true'">missing dependency exe</FcSkipReason>
+    </PropertyGroup>
+    <Message Condition="'$(FcTestsCanRun)' != 'true' And '$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false'"
+             Importance="normal"
+             Text="FcResolveTestDeps: tests cannot run for $(Configuration)|$(Platform); reason: $(FcSkipReason); FastClone.exe='$(FcCloneExe)'; FastCheck.exe='$(FcCheckExe)'" />
+  </Target>
+
   <!-- Run unit tests after build, relying solely on the test exe's exit code
        (0 = all pass, 1 = failure). IgnoreStandardErrorWarningFormat=true stops MSBuild
        scanning the test's stdout/stderr for "error" lines: the tests deliberately emit
        "error : ..." diagnostics while exercising error paths, which would otherwise be
        misclassified as build errors (MSB3077) even when the suite returns 0.
 
-       FcTestsStamp is durable proof that the suite really executed for THIS configuration:
-       it is deleted before the run and only written after BOTH the unit suite and the
-       data-integrity integration script below have returned 0. A green build without this
-       file means the tests did not run (see ReportTestsSkipped). -->
+       The testsran stamp is durable proof that the suite really executed for THIS
+       configuration: it is deleted before the run and only written after the unit suite,
+       the data-integrity integration script AND the clone_check_consistency script below
+       have ALL returned 0. A green build without this file means the tests did not run
+       (see ReportTestsSkipped). -->
   <Target Name="RunUnitTests" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' == 'true'">
     <Message Text="Running FastClone unit tests ($(Configuration)|$(Platform))..." Importance="high" />
     <Delete Files="$(TargetDir)$(ProjectName).testsran.txt" />
@@ -309,26 +339,49 @@
   <!-- Run data-integrity integration test (requires FastClone.exe built in the same
        configuration; the script auto-resolves the exe path). Covers the C2 byte-for-byte
        transfer guarantee that unit tests cannot reach (sync_engine_server.cpp is excluded
-       from this project). Windows-only: uses PowerShell + Get-FileHash. -->
+       from this project). Windows-only: uses PowerShell + Get-FileHash. The evidence file
+       is NOT written here: it moves to the tail of the clone_check_consistency target
+       below, so its existence proves ALL THREE suites (unit + data-integrity +
+       clone_check) returned 0 (INV-01b: no half-green evidence). -->
   <Target Name="RunDataIntegrityIntegration" AfterTargets="RunUnitTests" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' == 'true'">
     <Message Text="Running data-integrity integration test ($(Configuration)|$(Platform))..." Importance="high" />
     <Exec Command='powershell -ExecutionPolicy Bypass -File "$(ProjectDir)..\tests\data_integrity_integration.ps1"'
           IgnoreStandardErrorWarningFormat="true" />
     <Message Text="data-integrity integration test PASSED ($(Configuration)|$(Platform))." Importance="high" />
+  </Target>
+
+  <!-- Run clone_check_consistency integration test (FastClone/FastCheck end-to-end
+       invariant). Chained strictly AFTER RunDataIntegrityIntegration (FR-01/AC-C).
+       The evidence file is written ONLY here, at the tail of the whole chain: any
+       non-zero Exec above breaks the chain and leaves the stamp absent (INV-01).
+       Condition carries the unified FcTestsCanRun verdict (R-5) plus a literal
+       Exists() double-check (R-1①): never enter the script without both exes.
+       Timeout = 30 min (2x the CMake 900s cap): a hang fails loudly, never passes. -->
+  <Target Name="RunCloneCheckConsistency" AfterTargets="RunDataIntegrityIntegration"
+          Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcTestsCanRun)' == 'true' And Exists('$(FcCloneExe)') And Exists('$(FcCheckExe)')">
+    <Message Text="Running clone_check_consistency integration test ($(Configuration)|$(Platform))..." Importance="high" />
+    <Exec Command='powershell -ExecutionPolicy Bypass -File "$(ProjectDir)..\tests\clone_check_consistency.ps1" -ExePath "$(FcCloneExe)" -CheckExePath "$(FcCheckExe)"'
+          IgnoreStandardErrorWarningFormat="true" Timeout="1800000" />
+    <Message Text="clone_check_consistency integration test PASSED ($(Configuration)|$(Platform))." Importance="high" />
     <WriteLinesToFile File="$(TargetDir)$(ProjectName).testsran.txt"
-                      Lines="FastCloneTests: unit + data-integrity integration PASSED;Configuration=$(Configuration);Platform=$(Platform);HostArch=$(PROCESSOR_ARCHITECTURE);At=$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))"
+                      Lines="FastCloneTests: unit + data-integrity integration + clone_check_consistency PASSED;Configuration=$(Configuration);Platform=$(Platform);HostArch=$(PROCESSOR_ARCHITECTURE);At=$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))"
                       Overwrite="true" WriteOnlyWhenDifferent="false" />
   </Target>
 
-  <!-- Cross-compilation must never look like a passing test run: say so loudly. -->
-  <Target Name="ReportTestsSkipped" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcCanRunBuiltBinary)' != 'true'">
+  <!-- A skipped run (whatever the reason) must never look like a passing test run: say
+       so loudly. The reason string is carried ONLY by $(FcSkipReason) (R-1②): the Text
+       below deliberately contains no literal reason phrase so the two skip causes stay
+       grep-distinguishable in the build log. -->
+  <Target Name="ReportTestsSkipped" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCRunTests)' != 'false' And '$(FcTestsCanRun)' != 'true'">
     <Message Importance="high"
-             Text="TESTS SKIPPED: a $(Platform) binary cannot execute on this $(PROCESSOR_ARCHITECTURE) host (cross-compilation). FastClone unit + data-integrity integration did NOT run for $(Configuration)|$(Platform). Run on an ARM64 host, or pass -p:FCTestsRequired=true to turn this into an error." />
+             Text="TESTS SKIPPED: FastClone unit + data-integrity integration + clone_check_consistency did NOT run for $(Configuration)|$(Platform); reason: $(FcSkipReason). FastClone.exe='$(FcCloneExe)'; FastCheck.exe='$(FcCheckExe)'. Fix the reported reason (host architecture => run on an ARM64 host; missing binary => build the dependency project first), or pass -p:FCTestsRequired=true to turn this into an error." />
   </Target>
 
   <!-- Opt-in gate: -p:FCTestsRequired=true turns a skipped run into a hard error so CI (or a
-       release build) can assert "the tests really ran" instead of trusting a green build. -->
-  <Target Name="RequireTestsRan" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCTestsRequired)' == 'true' And '$(FcCanRunBuiltBinary)' != 'true'">
-    <Error Text="FCTestsRequired=true, but tests cannot run: $(Platform) binaries cannot execute on this $(PROCESSOR_ARCHITECTURE) host." />
+       release build) can assert "the tests really ran" instead of trusting a green build.
+       Driven by the unified FcTestsCanRun verdict (R-5): covers BOTH the cross-compilation
+       guard and missing dependency exes with one condition. -->
+  <Target Name="RequireTestsRan" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' And '$(FCTestsRequired)' == 'true' And '$(FcTestsCanRun)' != 'true'">
+    <Error Text="FCTestsRequired=true, but tests cannot run: reason=$(FcSkipReason) ($(Configuration)|$(Platform) on a $(PROCESSOR_ARCHITECTURE) host). FastClone.exe='$(FcCloneExe)'; FastCheck.exe='$(FcCheckExe)'." />
   </Target>
 </Project>

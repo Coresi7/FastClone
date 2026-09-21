@@ -113,7 +113,27 @@ $longPathSig = @'
 [DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)]
 public static extern int GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, int cchBuffer);
 '@
-$longPathUtil = Add-Type -MemberDefinition $longPathSig -Name 'LongPathUtilFR' -Namespace 'FcDiag' -PassThru
+# Add-Type compiles C# in-process and inherits the caller's environment. Under MSBuild the
+# LIB/LIBPATH/INCLUDE of the VS 2026 toolset contain a NON-EXISTENT entry
+# ("...\MSVC\14.51.36231\atlmfc\lib\x64"); the C# compiler treats it as
+# "Warning as Error: Invalid search path" and Add-Type throws -> MSB3073. Drop the three
+# variables for the duration of the compile ONLY, then restore them (a variable that was
+# unset stays unset). Mirrors tests/data_integrity_integration.ps1:113-133.
+$fcSavedBuildEnv = @{}
+foreach ($fcEnvVar in 'LIB', 'LIBPATH', 'INCLUDE') {
+    $fcSavedBuildEnv[$fcEnvVar] = [Environment]::GetEnvironmentVariable($fcEnvVar)
+    Remove-Item "Env:\$fcEnvVar" -ErrorAction SilentlyContinue
+}
+try {
+    $longPathUtil = Add-Type -MemberDefinition $longPathSig -Name 'LongPathUtilFR' -Namespace 'FcDiag' -PassThru
+}
+finally {
+    foreach ($fcEnvVar in @($fcSavedBuildEnv.Keys)) {
+        if ($null -ne $fcSavedBuildEnv[$fcEnvVar]) {
+            [Environment]::SetEnvironmentVariable($fcEnvVar, $fcSavedBuildEnv[$fcEnvVar])
+        }
+    }
+}
 function Get-LongPath {
     param([string]$Path)
     $sb = New-Object System.Text.StringBuilder 4096

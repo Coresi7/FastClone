@@ -2,8 +2,11 @@
 # Task unify-probe-extra-shared (design §8.3, FR-13): after a successful FastClone sync
 # (exit 0), FastCheck must report diff=0 missing=0 extra_local=0 total=<source file
 # count> in BOTH --mode fast (AC-06) and --mode strict (AC-07). Scenarios S1..S6.
-# Preconditions missing (exes not built / port unavailable / temp unwritable) => SKIP,
-# not FAIL (design §8.3). Strict failure triggers one automatic retry with [RETRY] tag.
+# Preconditions missing (exes not built / port unavailable / temp unwritable) => FAIL
+# with a non-zero exit (task vs-build-test-parity, R-2/P1): a missing dependency must
+# never produce a "passed" signal. CTest always passes explicit -ExePath/-CheckExePath,
+# so this branch is unreachable from CI. Strict failure triggers one automatic retry
+# with [RETRY] tag.
 
 param(
     [string]$ExePath = "",
@@ -143,12 +146,14 @@ function Count-Files {
     return (Get-ChildItem -Path $Root -Recurse -File | Measure-Object).Count
 }
 
-# ---- preconditions: missing => SKIP (not FAIL) ----------------------------------------
+# ---- preconditions: missing => FAIL (exit 2), never a silent pass -----------------------
 $exe = Resolve-Tool -Hint $ExePath -Name "FastClone.exe"
 $check = Resolve-Tool -Hint $CheckExePath -Name "FastCheck.exe"
 if (-not $exe -or -not $check) {
-    Write-Output "SKIP: FastClone.exe / FastCheck.exe not built (pass -ExePath / -CheckExePath)."
-    exit 0
+    Write-Output "ERROR: clone_check_consistency preconditions not met (this is a FAILURE, not a skip)."
+    Write-Output "  -ExePath='$ExePath'      -> resolved FastClone.exe='$exe'"
+    Write-Output "  -CheckExePath='$CheckExePath' -> resolved FastCheck.exe='$check'"
+    exit 2
 }
 $pw = "cc-invariant-pw"
 

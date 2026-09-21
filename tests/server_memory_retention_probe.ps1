@@ -73,10 +73,30 @@ function Get-Sample {
     }
 }
 
-Add-Type -Namespace FcProbe -Name Psapi -MemberDefinition @'
+# Add-Type compiles C# in-process and inherits the caller's environment. Under MSBuild the
+# LIB/LIBPATH/INCLUDE of the VS 2026 toolset contain a NON-EXISTENT entry
+# ("...\MSVC\14.51.36231\atlmfc\lib\x64"); the C# compiler treats it as
+# "Warning as Error: Invalid search path" and Add-Type throws -> MSB3073. Drop the three
+# variables for the duration of the compile ONLY, then restore them (a variable that was
+# unset stays unset). Mirrors tests/data_integrity_integration.ps1:113-133.
+$fcSavedBuildEnv = @{}
+foreach ($fcEnvVar in 'LIB', 'LIBPATH', 'INCLUDE') {
+    $fcSavedBuildEnv[$fcEnvVar] = [Environment]::GetEnvironmentVariable($fcEnvVar)
+    Remove-Item "Env:\$fcEnvVar" -ErrorAction SilentlyContinue
+}
+try {
+    Add-Type -Namespace FcProbe -Name Psapi -MemberDefinition @'
 [DllImport("psapi.dll", SetLastError = true)]
 public static extern bool EmptyWorkingSet(System.IntPtr hProcess);
 '@
+}
+finally {
+    foreach ($fcEnvVar in @($fcSavedBuildEnv.Keys)) {
+        if ($null -ne $fcSavedBuildEnv[$fcEnvVar]) {
+            [Environment]::SetEnvironmentVariable($fcEnvVar, $fcSavedBuildEnv[$fcEnvVar])
+        }
+    }
+}
 
 # --- setup ---------------------------------------------------------------------------------------
 $exe = Resolve-FastCloneExe -Hint $ExePath
