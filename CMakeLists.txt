@@ -78,39 +78,41 @@ if(EXISTS "${FC_VERSION_COUNTER_FILE}")
     # Persist the incremented counter; base stays unchanged.
     file(WRITE "${FC_VERSION_COUNTER_FILE}" "base=${_fc_base}\ncounter=${FC_COUNTER}\n")
 else()
-    # ---- CI / clean checkout: base from committed version.h, offset from git. No .fcversion. ----
-    file(STRINGS "${FC_VERSION_HEADER}" _fc_version_line
-         REGEX "kFastCloneVersion[ \t]*=[ \t]*\"[^\"]+\"")
-    if(_fc_version_line)
-        string(REGEX MATCH "\"([^\"]+)\"" _fc_version_match "${_fc_version_line}")
-        set(_fc_base "${CMAKE_MATCH_1}")
-    else()
-        message(FATAL_ERROR "Cannot parse FastClone/version.h: kFastCloneVersion not found.")
-    endif()
-    fc_split_version("${_fc_base}" FC_VERSION_MAJOR FC_VERSION_MINOR FC_BASE_PATCH)
-    set(FC_COUNTER 0)
-    set(FC_COUNTER_SOURCE "fallback")
+    # ---- No .fcversion (CI / clean checkout): base MUST come from the COMMITTED version.h,
+    #      never from the working-tree header (which a previous configure may have rewritten).
+    #      This is the P0-2 fix: reading the possibly-rewritten working-tree version.h as base
+    #      made two clean configures double-accumulate (1.0.0 -> 1.0.180 -> 1.0.360). Reading
+    #      `git show HEAD:...version.h` is immune to working-tree rewrites (design §2 S1). ----
     find_program(FC_GIT_EXE NAMES git)
+    set(_fc_base "")
     if(FC_GIT_EXE)
-        # Commit-count-to-head is a monotonic offset from the committed base; no tag-name coupling
-        # (repo tags use a rel_* prefix, there is no v* tag). Falls back to 0 + WARNING.
         execute_process(
-            COMMAND ${FC_GIT_EXE} rev-list --count HEAD
+            COMMAND ${FC_GIT_EXE} show HEAD:FastClone/version.h
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            OUTPUT_VARIABLE _fc_git_count
+            OUTPUT_VARIABLE _fc_head_content
             ERROR_QUIET
             RESULT_VARIABLE _fc_git_rc
             OUTPUT_STRIP_TRAILING_WHITESPACE
         )
-        if(_fc_git_rc EQUAL 0 AND _fc_git_count MATCHES "^[0-9]+$")
-            set(FC_COUNTER ${_fc_git_count})
-            set(FC_COUNTER_SOURCE "git:rev-list")
-        else()
-            message(WARNING "Auto-version: 'git rev-list --count' unavailable; using counter=0.")
+        if(_fc_git_rc EQUAL 0 AND _fc_head_content MATCHES "kFastCloneVersion[ \t]*=[ \t]*\"([^\"]+)\"")
+            set(_fc_base "${CMAKE_MATCH_1}")
         endif()
-    else()
-        message(WARNING "Auto-version: git not found and no .fcversion; using counter=0.")
     endif()
+    if(NOT _fc_base MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+        # Fallback: git unavailable / not a git checkout / parse failed. Degrade to 1.0.0 base
+        # (do NOT FATAL) so a non-git tarball still configures, albeit without auto-increment
+        # fidelity. counter stays 0 for this one-shot path.
+        set(_fc_base "1.0.0")
+        message(WARNING "Auto-version: cannot read committed version.h from git; falling back to base=1.0.0.")
+    endif()
+    fc_split_version("${_fc_base}" FC_VERSION_MAJOR FC_VERSION_MINOR FC_BASE_PATCH)
+    # First clean configure: start the local counter at 1 and persist .fcversion so every
+    # subsequent configure takes the monotonic local branch (counter+1) -> 1.0.1, 1.0.2, ...
+    # Without persisting, each clean configure would repeat the same git-derived value and could
+    # not satisfy AC-01's per-configure +1 cadence (design §2 S1 step 2).
+    set(FC_COUNTER 1)
+    set(FC_COUNTER_SOURCE "git-base-init")
+    file(WRITE "${FC_VERSION_COUNTER_FILE}" "base=${_fc_base}\ncounter=${FC_COUNTER}\n")
 endif()
 
 # 2) Compute the new patch = base_patch + counter (monotonic, never resets).
@@ -252,6 +254,18 @@ else()
 endif()
 message(STATUS "FastClone: xxhash include=${FC_XXHASH_INCLUDE_DIRS} lib=${FC_XXHASH_LIBRARIES}")
 
+# P0-1 fix helper: apply the resolved xxhash header path to library targets. Library
+# sources (fc_core/delta.cpp, fc_core/file_index.cpp) #include "xxhash.h", but previously
+# only executable targets received the include directory. On a clean environment (vcvars
+# reset INCLUDE, no cl.exe fallback) that left library TUs with a fatal C1083; the old
+# builds only passed because cl.exe fell back to the INCLUDE env var. Libraries need the
+# header path only — they do not link xxhash (the symbol is pulled in by the exe).
+# Defined HERE, before the library targets below, because CMake requires a function to be
+# defined before it is called.
+function(fc_apply_xxhash_includes tgt)
+    target_include_directories(${tgt} PRIVATE ${FC_XXHASH_INCLUDE_DIRS})
+endfunction()
+
 # fc_core: all shared implementations (no main()). Every consumer links this.
 add_library(fc_core STATIC
     FastClone/file_index.cpp
@@ -275,6 +289,9 @@ add_library(fc_core STATIC
 # fc_core sources live under FastClone/ and reference each other's headers by bare
 # name (e.g. file_index.h, version.h); the library target must carry the include path.
 target_include_directories(fc_core PRIVATE FastClone)
+# P0-1: fc_core sources (delta.cpp, file_index.cpp) #include "xxhash.h"; give the library
+# target the xxhash header path so a clean environment (no INCLUDE fallback) compiles it.
+fc_apply_xxhash_includes(fc_core)
 
 # fc_sync: FastClone transfer engine only.
 add_library(fc_sync STATIC
@@ -283,6 +300,9 @@ add_library(fc_sync STATIC
     FastClone/sync_engine_client.cpp
 )
 target_include_directories(fc_sync PRIVATE FastClone)
+# P0-1: keep the xxhash header path consistent across library targets (defensive; fc_sync
+# sources may transitively include headers that reference xxhash).
+fc_apply_xxhash_includes(fc_sync)
 
 # fc_check: FastCheck check engine only. Its sources reference FastClone/ headers
 # (version.h, compare_phase.h, ...), so it needs both FastClone and FastCheck paths.
@@ -292,6 +312,9 @@ add_library(fc_check STATIC
     FastCheck/check_report.cpp
 )
 target_include_directories(fc_check PRIVATE FastClone FastCheck)
+# P0-1: fc_check sources reference FastClone/ headers that pull in xxhash.h; give the library
+# target the xxhash header path so a clean environment compiles it.
+fc_apply_xxhash_includes(fc_check)
 
 # Single configure entry point for every final target (design §4.3). Consumes the
 # already-resolved xxhash result; applies include dirs, Threads, platform macros and

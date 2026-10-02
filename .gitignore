@@ -32,6 +32,15 @@ build_verify/
 # 07-security-scan.log). *.log under build*/ and out/ still ignored.
 build*/*.log
 out/*.log
+
+# Runtime logs dropped by local manual runs of FastClone/FastCheck. These are
+# incidental debug output, not part of the source tree.
+/FastClone/FastClone.log
+/build_cli.log
+/fc_client.log
+/fc_server.log
+/transfer_client.log
+
 *.user
 *.suo
 *.VC.db
