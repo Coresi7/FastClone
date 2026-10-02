@@ -1,47 +1,53 @@
+# Build directories (rule-based; no longer enumerate build_xxx one by one).
+build*/
+out/
+_bl_*/
+build_verify/
+
+# Editor / IDE scratch.
 .vs/
-x64/
-tmp/
-FastClone/x64/
-FastClone/FastClone/x64/
-*.user
-*.VC.db
-*.VC.opendb
-*.suo
-*.pdb
+.idea/
+.cursor/
+
+# MSVC / VS product directories.
+**/x64/
+**/ARM64/
+**/Win32/
+**/Release/
+**/Debug/
+
+# Single-file build products (kept as a safety net).
 *.obj
+*.pdb
 *.ilk
-*.ipch
 *.tlog
 *.lastbuildstate
 *.recipe
-*.log
-docs/
-.cursor/
-HARNESS_VERSION
-build/
-build_tests/
-build_tests_cli/
-build_delta/
-Release/
-Win32/
 *.iobj
 *.ipdb
-*.exe
-
-# Local CMake scratch build directories (verification builds, not for the repo)
-_bl_win32/
-_bl_x64/
-build_verify/
-
-# MSVC incremental-link / debug scratch
-Debug/
 *.idb
+*.exe
+# Log files: restricted to build output directories only (avoid swallowing
+# legitimate repo-tracked logs such as docs/tasks/*/baseline.log, post.log,
+# 07-security-scan.log). *.log under build*/ and out/ still ignored.
+build*/*.log
+out/*.log
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.ipch
 
-# Local-only release build helper scripts (kept out of the repo)
-temp/buildWin.ps1
-temp/buildLinux.sh
-temp/buildMac.sh
-
-# Local dev notes / scratch map (not for the repo)
+# Local temp / scratch.
+tmp/
+temp/
+HARNESS_VERSION
 dev-map.md
 
+# Auto-version persistent counter (cmake-auto-version). Local state only; the version
+# is reproducible on a clean checkout via git (rev-list --count), so this never ships.
+.fcversion
+
+# Documentation working area (user decision: docs/ stays ignored; stage
+# artifacts live only in the local workspace and do not enter version control).
+docs/

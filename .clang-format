@@ -1,0 +1,17 @@
+---
+# FastClone code style (cmake-only-migration, design §6).
+# LLVM base, column 100, 4-space indent. First landing applies only to changed lines
+# so we do not mass-reformat the existing tree in this task.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+BreakBeforeBraces: Allman
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: true
+IncludeBlocks: Regroup
+SpacesBeforeTrailingComments: 2

@@ -5,9 +5,11 @@ name: release
 # is derived from the tag (minus the leading `v`). For manual runs without a tag, the
 # version falls back to `0.0.0-dev`.
 #
-# A drift guard asserts that FastClone/version.h (the single source of truth consumed
-# by both the VS solution and CMake) matches the release version, so the zip name, the
-# git tag, and the binaries' `--version` output can never disagree.
+# A drift guard asserts that the built version's MAJOR.MINOR aligns with the release tag
+# (the PATCH field is auto-incremented at configure time and may legitimately differ), so
+# the zip name, the git tag, and the binaries' `--version` output can never disagree on
+# major/minor. FastClone/version.h remains the single source of truth consumed by the
+# CMake build and this workflow.
 #
 # The release zip URL
 # (https://github.com/Coresi7/FastClone/releases/download/v<x>/FastClone-<x>-x64.zip)
@@ -58,10 +60,15 @@ jobs:
           Write-Host "Resolved version: $v"
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Verify version.h matches release version
-        # Drift guard: the committed kFastCloneVersion in FastClone/version.h must equal
-        # the release version (from the git tag). Fails fast so a forgotten version.h
-        # bump never ships a zip whose --version disagrees with its tag/zip name.
+      - name: Verify version.h major.minor matches release tag
+        # Drift guard (cmake-auto-version, Q2=refined): the built kFastCloneVersion is
+        # auto-incremented at configure time, so its PATCH field legitimately drifts from
+        # the tag. We therefore assert semantic alignment instead of literal equality:
+        #   - MAJOR.MINOR of the built version MUST equal MAJOR.MINOR of the release tag;
+        #   - the PATCH field is allowed to differ (auto-incremented), but must still be a
+        #     valid numeric level (>= the tag's patch, since builds only ever advance it).
+        # This keeps the "forgot to bump major/minor before tagging" safety net while
+        # tolerating automatic patch increments.
         shell: pwsh
         run: |
           $expected = '${{ steps.ver.outputs.version }}'
@@ -69,10 +76,22 @@ jobs:
           if (-not $m) { Write-Error "kFastCloneVersion not found in FastClone/version.h"; exit 1 }
           $hv = $m.Matches.Groups[1].Value
           Write-Host "version.h=$hv  release=$expected"
-          if ($hv -ne $expected) {
-            Write-Error "version.h ($hv) != release version ($expected). Bump FastClone/version.h to match the tag."
+          $hParts = $hv.Split('.')
+          $eParts = $expected.Split('.')
+          if ($hParts.Count -lt 3 -or $eParts.Count -lt 2) {
+            Write-Error "Cannot parse version levels: version.h='$hv' release='$expected'"; exit 1
+          }
+          if ($hParts[0] -ne $eParts[0] -or $hParts[1] -ne $eParts[1]) {
+            Write-Error "MAJOR.MINOR mismatch: version.h='$hv' vs release tag='$expected'. Bump FastClone/version.h major/minor to match the tag before tagging a release."
             exit 1
           }
+          $hvPatch = [int]$hParts[2]
+          $ePatch = [int]$eParts[1]
+          if ($hvPatch -lt $ePatch) {
+            Write-Error "Built patch ($hvPatch) is below the tag's patch base ($ePatch); the auto-increment must never move backwards. version.h='$hv' release='$expected'"
+            exit 1
+          }
+          Write-Host "OK: major.minor aligned ($($hParts[0]).$($hParts[1])), built patch=$hvPatch >= tag patch base=$ePatch"
 
       - name: Build xxHash (static, /MT)
         shell: pwsh
@@ -103,17 +122,30 @@ jobs:
         run: cmake --install build --config Release --prefix staging
 
       - name: Smoke test --version
-        # Both exes must print "FastClone <ver>" / "FastCheck <ver>" and exit 0.
+        # Both exes must print "FastClone <ver>" / "FastCheck <ver>" and exit 0. The built
+        # patch is auto-incremented, so we assert MAJOR.MINOR alignment with the tag (the
+        # same semantic the drift guard uses), not a literal full-string equality.
         shell: pwsh
         run: |
           $expected = '${{ steps.ver.outputs.version }}'
+          $eParts = $expected.Split('.')
           $fc = & staging/bin/FastClone.exe --version
           if ($LASTEXITCODE -ne 0) { Write-Error "FastClone --version exit $LASTEXITCODE"; exit 1 }
-          if ($fc -ne "FastClone $expected") { Write-Error "FastClone --version='$fc' != 'FastClone $expected'"; exit 1 }
           $fck = & staging/bin/FastCheck.exe --version
           if ($LASTEXITCODE -ne 0) { Write-Error "FastCheck --version exit $LASTEXITCODE"; exit 1 }
-          if ($fck -ne "FastCheck $expected") { Write-Error "FastCheck --version='$fck' != 'FastCheck $expected'"; exit 1 }
-          Write-Host "$fc / $fck"
+          foreach ($pair in @(@("FastClone", $fc), @("FastCheck", $fck))) {
+            $name = $pair[0]; $out = $pair[1]
+            if ($out -notmatch '^(\S+) (\d+)\.(\d+)\.(\d+)$') { Write-Error "$name --version='$out' is not '<name> X.Y.Z'"; exit 1 }
+            $bMaj = $Matches[2]; $bMin = $Matches[3]
+            if ($bMaj -ne $eParts[0] -or $bMin -ne $eParts[1]) {
+              Write-Error "$name --version='$out' major.minor ($bMaj.$bMin) != tag ($($eParts[0]).$($eParts[1]))"; exit 1
+            }
+          }
+          # Both binaries must report the SAME fully-resolved version (single source of truth).
+          $fcVer = ($fc -split ' ',2)[1]
+          $fckVer = ($fck -split ' ',2)[1]
+          if ($fcVer -ne $fckVer) { Write-Error "FastClone ($fcVer) and FastCheck ($fckVer) disagree"; exit 1 }
+          Write-Host "$fc / $fck (major.minor aligned to tag $expected)"
 
       - name: Stage portable package
         id: pkg

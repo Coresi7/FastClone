@@ -1,0 +1,90 @@
+name: ci
+
+# cmake-only-migration (design §6): PR/push build+test gate across three platforms.
+# Fills the gap that deleting the VS solution left: the VS test-evidence gate is now
+# reproduced by ctest, and every platform configures/builds/tests on each push/PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup xxHash (static)
+        # Build xxHash from source so the binaries are self-contained (no DLL to ship).
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v0.8.3 https://github.com/Cyan4973/xxHash.git /tmp/xxHash
+          cmake -S /tmp/xxHash/cmake_unofficial -B /tmp/xxHash/build \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=/tmp/xxHash-install
+          cmake --build /tmp/xxHash/build --config Release --parallel
+          cmake --install /tmp/xxHash/build --config Release
+          echo "CMAKE_PREFIX_PATH=/tmp/xxHash-install" >> "$GITHUB_ENV"
+
+      - name: Configure FastClone
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (ctest)
+        shell: bash
+        run: ctest --test-dir build --output-on-failure -C Release
+
+  # Linux sanitizer job (design §6): independent Debug + ASan/UBSan build.
+  sanitizers:
+    name: ${{ matrix.san }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, undefined]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup xxHash (static)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v0.8.3 https://github.com/Cyan4973/xxHash.git /tmp/xxHash
+          cmake -S /tmp/xxHash/cmake_unofficial -B /tmp/xxHash/build \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=/tmp/xxHash-install
+          cmake --build /tmp/xxHash/build --config Release --parallel
+          cmake --install /tmp/xxHash/build --config Release
+          echo "CMAKE_PREFIX_PATH=/tmp/xxHash-install" >> "$GITHUB_ENV"
+
+      - name: Configure (Debug + ${{ matrix.san }})
+        shell: bash
+        run: |
+          cmake -S . -B build-san \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.san }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.san }}"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build-san --parallel
+
+      - name: Test (ctest)
+        shell: bash
+        run: ctest --test-dir build-san --output-on-failure -C Debug

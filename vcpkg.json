@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "fastclone",
+  "version": "0.0.0",
+  "description": "FastClone: portable high-speed directory sync + read-only comparison tool.",
+  "dependencies": [
+    {
+      "name": "xxhash",
+      "version>=": "0.8.3"
+    }
+  ]
+}

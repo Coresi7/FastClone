@@ -1,0 +1,17 @@
+# FastClone line-ending / text handling (cmake-only-migration, design §6).
+* text=auto eol=lf
+
+# Shell / PowerShell scripts: keep LF, mark as text
+*.sh  text eol=lf
+*.ps1 text eol=lf
+
+# Windows batch files must stay CRLF
+*.bat text eol=crlt
+*.cmd text eol=crlf
+
+# Binaries / archives: do not touch
+*.exe binary
+*.lib binary
+*.obj binary
+*.pdb binary
+*.zip binary
