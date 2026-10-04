@@ -402,6 +402,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass -File
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/data_integrity_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27894
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()
@@ -486,6 +487,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/file_range_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27910
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(file_range_integration PROPERTIES TIMEOUT 600)
 
@@ -493,6 +495,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/once_multi_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27896
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(once_multi_integration PROPERTIES TIMEOUT 600)
 
@@ -500,6 +503,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/once_server_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27893
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(once_server_integration PROPERTIES TIMEOUT 600)
 
@@ -507,6 +511,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/reconnect_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27892
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(reconnect_integration PROPERTIES TIMEOUT 600)
 
@@ -514,6 +519,7 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/wait_connect_timeout_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27895
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(wait_connect_timeout_integration PROPERTIES TIMEOUT 600)
 

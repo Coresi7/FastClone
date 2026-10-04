@@ -2200,6 +2200,61 @@ std::atomic<bool> g_omAnyFailure{false};
 // connections close quickly, drop the count back to 0, and let the timeout fire (AC-08).
 std::atomic<uint64_t> g_inFlightHandshakes{0};
 
+// B-01 fix (WCT-6/WCT-7 0xC0000409): the raw handle of the connection whose handshake thread is
+// currently blocked in recv (the "held-open, never-completing handshake" case). The dispatching
+// main thread registers it right before spawning the detach handshake thread and the thread clears
+// it on its single exit; while a wait-connect timeout tears down the process, the main thread can
+// therefore force-close exactly that socket to unblock the thread, so it exits cleanly instead of
+// being killed mid-flight against already-torn-down process-global state (which raised
+// STATUS_STACK_BUFFER_OVERRUN). kInvalidSocket when no such connection exists.
+std::atomic<SocketNative> g_heldOpenHandshakeSock{kInvalidSocket};
+
+// B-01 fix: the socket that the wait-connect timeout path force-closed (closesocket) to unblock a
+// stuck handshake thread. The detach handshake thread still owns a SocketHandle for that same fd;
+// when it observes this value == its own socket it must Release() (not close) to avoid a double
+// close. kInvalidSocket when no drain-close is pending. Single-writer on x64 (main thread sets,
+// handshake thread clears), so a plain lock-free atomic suffices.
+std::atomic<SocketNative> g_drainedHandshakeSock{kInvalidSocket};
+
+// B-01 fix: force-close a still-blocked held-open handshake socket and wait (bounded) for every
+// in-flight handshake thread to reach its single exit. Called ONLY on the wait-connect timeout
+// return path (--once / --once-multi), i.e. when the main thread is about to return and the
+// process will exit. Two guarantees make this safe and non-blocking:
+//   1. On Windows closesocket() (SHUT_RDWR/shutdown() on POSIX) makes the blocked recv() return
+//      immediately with an error, so the handshake thread unwinds to its fetch_sub/single-exit
+//      instead of parking forever. (shutdown(SD_BOTH) was insufficient on the Windows IOCP backend
+//      for an accept socket; closesocket() reliably unblocks it.)
+//   2. The wait is bounded (kInFlightDrainTimeoutMs): a genuinely slow peer can never stall
+//      shutdown, and any thread still alive past the cap is abandoned (process is exiting anyway);
+//      the socket close reclaims its fd. This keeps WCT-6/7 deterministic (~deadline + small slack).
+constexpr int kInFlightDrainTimeoutMs = 2000;
+
+void DrainInFlightHandshakes() {
+    // Interrupt the blocked recv first so the thread can observe the failure and unwind.
+    const SocketNative s = g_heldOpenHandshakeSock.load(std::memory_order_acquire);
+    if (s != kInvalidSocket) {
+#ifdef _WIN32
+        // Force-close the held-open socket so the blocked recv() returns immediately. shutdown()
+        // proved insufficient to interrupt a recv on an accept socket under the Windows IOCP
+        // backend; closesocket() reliably unblocks it. The detach handshake thread still holds a
+        // SocketHandle for this fd, so we publish it in g_drainedHandshakeSock and that thread
+        // Release()s its handle (rather than closing) to avoid a double-close.
+        closesocket(s);
+        g_drainedHandshakeSock.store(s, std::memory_order_release);
+#else
+        shutdown(s, SHUT_RDWR);
+#endif
+    }
+    // Wait (bounded) for the count to drop to zero. Poll modestly; the drain is normally O(ms)
+    // because closesocket unblocks recv immediately.
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::milliseconds(kInFlightDrainTimeoutMs);
+    while (g_inFlightHandshakes.load(std::memory_order_acquire) > 0 &&
+           clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 // Fire the once-multi terminal verdict from the main thread once idle-grace has elapsed. Mirrors
 // FireOnceTerminal's publish order (exitCode relaxed, then shouldExit release) so the accept-loop
 // top bail returns the final code. WakeAcceptLoop is redundant here (the main thread itself fires
@@ -2424,6 +2479,10 @@ int RunServer(const CliOptions& options) {
                     EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
                                         *waitConnectDeadline)) {
                     listener.Release();
+                    // B-01 fix (WCT-7): unblock any held-open handshake thread before returning so
+                    // the process exits without a detach thread still parked in recv against
+                    // process-global state that teardown is about to free.
+                    DrainInFlightHandshakes();
                     return kExitWaitConnectTimeout;  // FR-08
                 }
                 // Timeout tick: evaluate idle-grace ONLY when nothing was accepted this tick,
@@ -2452,6 +2511,11 @@ int RunServer(const CliOptions& options) {
                 if (EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
                                         *waitConnectDeadline)) {
                     listener.Release();
+                    // B-01 fix (WCT-6): unblock the held-open handshake thread (blocked in recv)
+                    // and wait for it to unwind before returning, so the process exits cleanly
+                    // instead of tearing down global state out from under a live detach thread
+                    // (which raised STATUS_STACK_BUFFER_OVERRUN / 0xC0000409).
+                    DrainInFlightHandshakes();
                     return kExitWaitConnectTimeout;  // FR-08
                 }
                 continue;
@@ -2477,6 +2541,12 @@ int RunServer(const CliOptions& options) {
         // wait-connect in-flight guard (section 3.7): mark this connection's handshake as pending before
         // dispatch; the thread's single exit drops it. Inert when wait-connect is not armed.
         g_inFlightHandshakes.fetch_add(1, std::memory_order_acq_rel);
+        // B-01 fix: publish THIS connection's raw handle so the wait-connect timeout path can
+        // shutdown() it (unblocking recv) if the process tears down before the handshake completes.
+        // Overwrites any prior value; that is safe because only one handshake is ever in flight
+        // blocked-on-recv at a time under --once (single session), and under --once-multi the
+        // drain still unblocks whichever is current. The thread clears it on exit.
+        g_heldOpenHandshakeSock.store(client.Get(), std::memory_order_release);
         std::thread([connSeq, debugEnabled, &activeSessions, options, serverAddrs,
                      client = std::move(client)]() mutable {
             // Surface who connected: the peer's numeric IP via getpeername + NI_NUMERICHOST
@@ -2573,6 +2643,19 @@ int RunServer(const CliOptions& options) {
             // wait-connect in-flight guard (section 3.7): single exit for every dispatched connection,
             // covering the clean, error, and pre-handshake-close paths (R-03: no leak -> no stall).
             g_inFlightHandshakes.fetch_sub(1, std::memory_order_acq_rel);
+            // B-01 fix: clear this connection's held-open registration iff it still points at THIS
+            // socket. A later connection may have overwritten the slot meanwhile; never clobber it.
+            const SocketNative selfSock = client.Get();
+            if (g_heldOpenHandshakeSock.load(std::memory_order_acquire) == selfSock) {
+                g_heldOpenHandshakeSock.store(kInvalidSocket, std::memory_order_release);
+            }
+            // B-01 fix: if the wait-connect timeout path already force-closed THIS socket to unblock
+            // us, release our handle without closing it (it is gone) to avoid a double-close. We
+            // compare-and-clear so a reused fd value is never mistaken for the drained one.
+            if (g_drainedHandshakeSock.load(std::memory_order_acquire) == selfSock) {
+                client.Release();  // drop ownership; do NOT close (main thread already closed it)
+                g_drainedHandshakeSock.store(kInvalidSocket, std::memory_order_release);
+            }
         }).detach();
     }
     return 0;
