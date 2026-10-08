@@ -36,10 +36,15 @@
 
 param(
     [string]$ExePath = "",
-    [int]$Port = 27910
+    [int]$Port = 27910,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -60,6 +65,13 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free (~3s) so the next scenario avoids a stale
+    # listener / TIME_WAIT residue (root cause of file_range bind WSA=10048).
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 500
 }
@@ -86,6 +98,8 @@ function Start-FastCloneProcess {
         [string]$OutLog,
         [string]$ErrLog
     )
+    # Drop null/empty fragments (the optional "--bind-loopback" slot is "" when off).
+    $CliArgs = @($CliArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
     $env:FASTCLONE_DEBUG = "1"
     $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$CliArgs) `
         -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
@@ -241,7 +255,7 @@ try {
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-a-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\A-server.out" -ErrLog "$logDir\A-server.err"
     Start-Sleep -Seconds 1
     # NOTE: build the client arg array FIRST — a compound "@(...) + $x" expression as a
@@ -276,7 +290,7 @@ try {
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-b-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\B-server.out" -ErrLog "$logDir\B-server.err"
     Start-Sleep -Seconds 1
     $clientArgsB = @("client", "--server", $serverAddr, "--target", $tgt,
@@ -303,7 +317,7 @@ try {
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-c-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\C-server.out" -ErrLog "$logDir\C-server.err"
     Start-Sleep -Seconds 1
     $clientArgsC = @("client", "--server", $serverAddr, "--target", $tgt,
@@ -331,7 +345,7 @@ try {
     $tgt = Join-Path $env:TEMP "fc-fr-tgt-e-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\E-server.out" -ErrLog "$logDir\E-server.err"
     Start-Sleep -Seconds 1
     # No-value form: `--large-file-block` with no size -> AUTO with the default 32 MiB
@@ -389,7 +403,7 @@ try {
     # Resident server (no --once): a killed lane marks the session hadError by design
     # (FR-07), so the --once verdict is intentionally not asserted here.
     $srv = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg
     ) -OutLog "$logDir\D-server.out" -ErrLog "$logDir\D-server.err"
     Start-Sleep -Seconds 1
     $killLinks = @("--link", "127.0.0.1=127.0.0.1:$Port",
@@ -455,7 +469,7 @@ try {
     $tgtF = Join-Path $env:TEMP "fc-fr-tgt-f-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgtF | Out-Null
     $srvF1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\F-server1.out" -ErrLog "$logDir\F-server1.err"
     Start-Sleep -Seconds 1
     $clientArgsF1 = @("client", "--server", $serverAddr, "--target", $tgtF,
@@ -490,7 +504,7 @@ try {
 
     # (c) Second sync with delta + block, same target (local old present, differs).
     $srvF2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\F-server2.out" -ErrLog "$logDir\F-server2.err"
     Start-Sleep -Seconds 1
     $clientArgsF2 = @("client", "--server", $serverAddr, "--target", $tgtF,
@@ -545,7 +559,7 @@ try {
     $tgtG = Join-Path $env:TEMP "fc-fr-tgt-g-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgtG | Out-Null
     $srvG = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcG, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $srcG, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\G-server.out" -ErrLog "$logDir\G-server.err"
     Start-Sleep -Seconds 1
     # --streams 16 pins the LAN default so the reserved band is deterministic (2/lane);
@@ -614,7 +628,7 @@ try {
     $tgtH = Join-Path $env:TEMP "fc-fr-tgt-h-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgtH | Out-Null
     $srvH = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcH, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $srcH, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\H-server.out" -ErrLog "$logDir\H-server.err"
     Start-Sleep -Seconds 1
     # No --large-file-block at all: the default auto gate must activate block mode.
@@ -662,7 +676,7 @@ try {
     $tgtI = Join-Path $env:TEMP "fc-fr-tgt-i-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $tgtI | Out-Null
     $srvI = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcI, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $srcI, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\I-server.out" -ErrLog "$logDir\I-server.err"
     Start-Sleep -Seconds 1
     $clientArgsI = @("client", "--server", $serverAddr, "--target", $tgtI,

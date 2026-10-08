@@ -12,10 +12,15 @@
 
 param(
     [string]$ExePath = "",
-    [int]$Port = 27893
+    [int]$Port = 27893,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -34,6 +39,13 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free (~3s) so the next sub-test avoids a stale
+    # listener / TIME_WAIT residue (root cause of file_range bind WSA=10048).
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 500
 }
@@ -60,6 +72,8 @@ function Start-FastCloneProcess {
         [string]$OutLog,
         [string]$ErrLog
     )
+    # Drop null/empty fragments (the optional "--bind-loopback" slot is "" when off).
+    $CliArgs = @($CliArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
     foreach ($a in $CliArgs) {
         if ($null -eq $a -or $a -eq "") {
             throw "Start-FastCloneProcess: null/empty argument in: $($CliArgs -join ' | ')"
@@ -127,7 +141,7 @@ try {
 
     Write-Host "[OS-1] success path -> server --once auto-exits 0"
     $srv1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os1-server.out" -ErrLog "$logDir\os1-server.err"
     Start-Sleep -Seconds 1
     $code1c = Invoke-FastCloneSync -Exe $exe -CliArgs @(
@@ -155,7 +169,7 @@ try {
 
     Write-Host "[OS-5b] AC-10: while target session is active, second Auth is rejected"
     $srv5b = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os5b-server.out" -ErrLog "$logDir\os5b-server.err"
     Start-Sleep -Seconds 1
     $tgt5b1 = Join-Path $root "tgt5b1"
@@ -190,7 +204,7 @@ try {
 
     Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 5"
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os2-server.out" -ErrLog "$logDir\os2-server.err"
     Start-Sleep -Seconds 1
     $tgt2 = Join-Path $root "tgt2"
@@ -223,7 +237,7 @@ try {
     $tgt4 = Join-Path $root "tgt4"
     New-Item -ItemType Directory -Force -Path $tgt4 | Out-Null
     $srv4 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port", "--once"
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os4-server.out" -ErrLog "$logDir\os4-server.err"
     Start-Sleep -Seconds 1
     # Probe: connect then immediately close without sending any bytes (session == null).

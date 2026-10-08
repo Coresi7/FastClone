@@ -97,7 +97,14 @@ std::string LocalAddressOf(const SocketHandle& socket);
 // getpeername + NI_NUMERICHOST only format the already-known socket address, no DNS lookup. The
 // result is a numeric address literal (no C0/C1 control characters), safe to splice into logs.
 std::string PeerAddressOf(const SocketHandle& socket);
-SocketHandle CreateServer(uint16_t port);
+// Bind/listen a server socket on the given port.
+// bindLoopback=false (default): bind :: (in6addr_any), all interfaces — production behavior,
+//   unchanged from the original implementation (serves external clients).
+// bindLoopback=true: bind ::1 (in6addr_loopback), loopback only — test-only; keeps the dual-stack
+//   IPV6_V6ONLY=0 socket so IPv4-mapped 127.0.0.1 test clients still connect (as ::ffff:127.0.0.1).
+//   Isolates short-lived test server ports from LAN/WAN traffic (root cause of OM-4 flaky: an
+//   exposed :: listener was flooded by external hosts, filling the once-server's single session).
+SocketHandle CreateServer(uint16_t port, bool bindLoopback = false);
 SocketHandle AcceptClient(const SocketHandle& listener);
 // Like AcceptClient but waits at most timeoutMs for an incoming connection. Returns nullopt
 // when the wait elapses with no pending connection (used by --once-multi so the accept loop

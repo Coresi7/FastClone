@@ -2359,7 +2359,10 @@ int RunServer(const CliOptions& options) {
     // port surfaces as a bind failure here rather than a silent overlapping listen.
     SocketHandle listener;
     try {
-        listener = CreateServer(options.port);
+        // bindLoopback: default false (production binds ::, unchanged). Test-only true binds ::1
+        // to isolate the once/once-multi server from LAN/WAN traffic that flooded the :: listener
+        // and filled its single session (OM-4 flaky root cause, see 07-blocking-forensics.md).
+        listener = CreateServer(options.port, options.bindLoopback);
     } catch (const std::exception& e) {
         std::cerr << "FastClone: cannot listen on port " << options.port
                   << " (" << e.what() << ")."

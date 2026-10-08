@@ -342,38 +342,74 @@ std::string PeerAddressOf(const SocketHandle& socket) {
     return std::string(host);
 }
 
-SocketHandle CreateServer(uint16_t port) {
-    SocketHandle listener(socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP));
+SocketHandle CreateServer(uint16_t port, bool bindLoopback) {
+    // Production (default, bindLoopback=false): AF_INET6 + in6addr_any (::). This branch is
+    // byte-for-byte identical to the original implementation — dual-stack listener exposed on
+    // all interfaces. Test-only loopback mode (bindLoopback=true) instead binds an IPv4
+    // 127.0.0.1 socket to isolate the listener from LAN/WAN traffic; see below.
+    if (!bindLoopback) {
+        SocketHandle listener(socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP));
+        if (!listener.Valid()) {
+            throw std::runtime_error(LastSocketError("socket failed"));
+        }
+
+        int no = 0;
+#ifdef _WIN32
+        setsockopt(listener.Get(), IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&no), sizeof(no));
+#else
+        setsockopt(listener.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &no, static_cast<socklen_t>(sizeof(no)));
+#endif
+
+#ifdef _WIN32
+        // SO_EXCLUSIVEADDRUSE: bind fails with WSAEADDRINUSE if another socket already holds
+        // the port. The previous SO_REUSEADDR let a second fastclone server silently bind over
+        // an in-use port, making it appear to listen while actually conflicting with the holder
+        // (two listeners on one port). Exclusive use makes port-in-use a hard, visible error.
+        int exclusive = 1;
+        setsockopt(listener.Get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+#else
+        // POSIX SO_REUSEADDR only allows reusing a port in TIME_WAIT; bind still fails with
+        // EADDRINUSE against a live listener, so it is safe and standard for server restart.
+        int reuse = 1;
+        setsockopt(listener.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse, static_cast<socklen_t>(sizeof(reuse)));
+#endif
+
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;   // :: — production behavior, unchanged
+        addr.sin6_port = htons(port);
+        if (bind(listener.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            throw std::runtime_error(LastSocketError("bind failed"));
+        }
+        if (listen(listener.Get(), SOMAXCONN) != 0) {
+            throw std::runtime_error(LastSocketError("listen failed"));
+        }
+        return listener;
+    }
+
+    // Test-only loopback: AF_INET + INADDR_LOOPBACK (127.0.0.1). An IPv4 listener here lets
+    // existing test clients (which hard-code 127.0.0.1:<port>) connect reliably on Windows.
+    // (A ::1 dual-stack socket does NOT accept IPv4 127.0.0.1 connections on this platform —
+    // see 04-implementation-v2.md §3.) No IPV6_V6ONLY option applies to an AF_INET socket.
+    SocketHandle listener(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
     if (!listener.Valid()) {
         throw std::runtime_error(LastSocketError("socket failed"));
     }
 
-    int no = 0;
 #ifdef _WIN32
-    setsockopt(listener.Get(), IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&no), sizeof(no));
-#else
-    setsockopt(listener.Get(), IPPROTO_IPV6, IPV6_V6ONLY, &no, static_cast<socklen_t>(sizeof(no)));
-#endif
-
-#ifdef _WIN32
-    // SO_EXCLUSIVEADDRUSE: bind fails with WSAEADDRINUSE if another socket already holds
-    // the port. The previous SO_REUSEADDR let a second fastclone server silently bind over
-    // an in-use port, making it appear to listen while actually conflicting with the holder
-    // (two listeners on one port). Exclusive use makes port-in-use a hard, visible error.
     int exclusive = 1;
     setsockopt(listener.Get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
 #else
-    // POSIX SO_REUSEADDR only allows reusing a port in TIME_WAIT; bind still fails with
-    // EADDRINUSE against a live listener, so it is safe and standard for server restart.
     int reuse = 1;
     setsockopt(listener.Get(), SOL_SOCKET, SO_REUSEADDR, &reuse, static_cast<socklen_t>(sizeof(reuse)));
 #endif
 
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr = in6addr_any;
-    addr.sin6_port = htons(port);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // 127.0.0.1
+    addr.sin_port = htons(port);
     if (bind(listener.Get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         throw std::runtime_error(LastSocketError("bind failed"));
     }

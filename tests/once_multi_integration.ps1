@@ -14,10 +14,17 @@
 
 param(
     [string]$ExePath = "",
-    [int]$Port = 27894
+    [int]$Port = 27894,
+    # Test-only: when set (ctest passes -BindLoopback on), the server binds ::1 instead of ::
+    # so external LAN/WAN traffic cannot flood its single session (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Precomputed server arg fragment: empty in production, "--bind-loopback" in test mode.
+# Spliced into every Start-FastCloneProcess/Invoke-FastCloneSync server CliArgs below.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -37,6 +44,14 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free so the next case/sub-test does not hit a
+    # stale listener or TIME_WAIT residue (root cause of file_range bind WSA=10048). Bounded
+    # to ~3s to avoid hanging the suite if the port never releases.
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 500
 }
@@ -63,6 +78,8 @@ function Start-FastCloneProcess {
         [string]$OutLog,
         [string]$ErrLog
     )
+    # Drop null/empty fragments (e.g. the optional "--bind-loopback" slot is "" when off).
+    $CliArgs = @($CliArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
     foreach ($a in $CliArgs) {
         if ($null -eq $a -or $a -eq "") {
             throw "Start-FastCloneProcess: null/empty argument in: $($CliArgs -join ' | ')"
@@ -137,7 +154,7 @@ try {
 
     Write-Host "[OM-1] sequential: server survives between two real sessions, exits 0 after grace"
     $srv1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $grace
     ) -OutLog "$logDir\om1-server.out" -ErrLog "$logDir\om1-server.err"
     Start-Sleep -Seconds 1
@@ -160,7 +177,7 @@ try {
 
     Write-Host "[OM-2] concurrent: two real sessions served at once, exit 0 after both finish"
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port",
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $grace
     ) -OutLog "$logDir\om2-server.out" -ErrLog "$logDir\om2-server.err"
     Start-Sleep -Seconds 1
@@ -188,7 +205,7 @@ try {
     Write-Host "[OM-3] grace race: a new real session before grace expiry resets the timer"
     $longGrace = "5s"
     $srv3 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port",
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $longGrace
     ) -OutLog "$logDir\om3-server.out" -ErrLog "$logDir\om3-server.err"
     Start-Sleep -Seconds 1
@@ -227,7 +244,7 @@ try {
 
     Write-Host "[OM-4] failure aggregation: aborted session -> sticky exit 5 (clean later session does not mask it)"
     $srv4 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port",
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $grace
     ) -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
     Start-Sleep -Seconds 1
@@ -251,7 +268,7 @@ try {
 
     Write-Host "[OM-5a] probes during grace do not reset it; server exits on schedule"
     $srv5 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", "4s"
     ) -OutLog "$logDir\om5a-server.out" -ErrLog "$logDir\om5a-server.err"
     Start-Sleep -Seconds 1
@@ -272,7 +289,7 @@ try {
 
     Write-Host "[OM-5b] probe-only (no real session): server never idle-exits"
     $srv6 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", "2s"
     ) -OutLog "$logDir\om5b-server.out" -ErrLog "$logDir\om5b-server.err"
     Start-Sleep -Seconds 1

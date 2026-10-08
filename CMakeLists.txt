@@ -403,6 +403,7 @@ if(WIN32)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/data_integrity_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27894
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()
@@ -472,6 +473,8 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/clone_check_consistency.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -CheckExePath $<TARGET_FILE:FastCheck>
+                -Port 27941
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     set_tests_properties(clone_check_consistency PROPERTIES
@@ -488,6 +491,7 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/file_range_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27910
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(file_range_integration PROPERTIES TIMEOUT 600)
 
@@ -496,6 +500,7 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/once_multi_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27896
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(once_multi_integration PROPERTIES TIMEOUT 600)
 
@@ -504,6 +509,7 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/once_server_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27893
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(once_server_integration PROPERTIES TIMEOUT 600)
 
@@ -512,6 +518,7 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/reconnect_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27892
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(reconnect_integration PROPERTIES TIMEOUT 600)
 
@@ -520,6 +527,7 @@ if(WIN32)
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/wait_connect_timeout_integration.ps1
                 -ExePath $<TARGET_FILE:FastClone>
                 -Port 27895
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(wait_connect_timeout_integration PROPERTIES TIMEOUT 600)
 
@@ -527,6 +535,8 @@ if(WIN32)
         COMMAND powershell -ExecutionPolicy Bypass
                 -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/server_memory_retention_probe.ps1
                 -ExePath $<TARGET_FILE:FastClone>
+                -Port 27931
+                -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(server_memory_retention_probe PROPERTIES TIMEOUT 600)
 endif()

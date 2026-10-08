@@ -58,6 +58,12 @@ struct CliOptions {
     bool exitAfterSync = false;
     // Server-only: multiple real sessions plus graceful exit after idle grace (mutually exclusive with --once). Maps --once-multi (FR-01).
     bool onceMulti = false;
+    // Server-only: bind the listener to loopback (::1) instead of all interfaces (::). Default
+    // false = production behavior unchanged (still binds :: and serves external clients).
+    // Test-only: ctest passes --bind-loopback so short-lived test server ports are not reached
+    // by LAN/WAN traffic (root cause of OM-4 flaky under ctest: an exposed :: listener was
+    // flooded by external hosts, filling the once-server's single session). See win_socket CreateServer.
+    bool bindLoopback = false;
     // Idle grace in milliseconds, default 5s; only effective under onceMulti (FR-04). --once-idle-grace.
     uint64_t onceIdleGraceMs = 5000;
     // First-connect wait timeout in milliseconds, default 300s; only effective under --once / --once-multi. --wait-connect-timeout.

@@ -19,10 +19,15 @@
 
 param(
     [string]$ExePath = "",
-    [int]$Port = 27895
+    [int]$Port = 27895,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -42,6 +47,13 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free (~3s) so the next sub-test avoids a stale
+    # listener / TIME_WAIT residue (root cause of file_range bind WSA=10048).
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 500
 }
@@ -68,6 +80,8 @@ function Start-FastCloneProcess {
         [string]$OutLog,
         [string]$ErrLog
     )
+    # Drop null/empty fragments (the optional "--bind-loopback" slot is "" when off).
+    $CliArgs = @($CliArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
     foreach ($a in $CliArgs) {
         if ($null -eq $a -or $a -eq "") {
             throw "Start-FastCloneProcess: null/empty argument in: $($CliArgs -join ' | ')"
@@ -148,7 +162,7 @@ try {
 
     Write-Host "[WCT-1] --once, no client at all -> exit 6 with timeout log (AC-07/AC-13)"
     $srv1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once", "--wait-connect-timeout", "3s"
     ) -OutLog "$logDir\wct1-server.out" -ErrLog "$logDir\wct1-server.err"
     $code1 = Wait-ExitCode -Proc $srv1 -TimeoutSec 30
@@ -161,7 +175,7 @@ try {
 
     Write-Host "[WCT-2] --once, only TCP probes -> exit 6 (AC-08)"
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once", "--wait-connect-timeout", "3s"
     ) -OutLog "$logDir\wct2-server.out" -ErrLog "$logDir\wct2-server.err"
     Start-Sleep -Milliseconds 500
@@ -174,7 +188,7 @@ try {
 
     Write-Host "[WCT-3] --once, real client connects in time -> wait-connect disabled, exit 0 (AC-09/AC-10a)"
     $srv3 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once", "--wait-connect-timeout", "30s"
     ) -OutLog "$logDir\wct3-server.out" -ErrLog "$logDir\wct3-server.err"
     Start-Sleep -Seconds 1
@@ -193,7 +207,7 @@ try {
 
     Write-Host "[WCT-3c] --once, real session aborted mid-transfer -> exit 5 (AC-10b)"
     $srv3c = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port",
+        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once", "--wait-connect-timeout", "30s"
     ) -OutLog "$logDir\wct3c-server.out" -ErrLog "$logDir\wct3c-server.err"
     Start-Sleep -Seconds 1
@@ -213,7 +227,7 @@ try {
 
     Write-Host "[WCT-4] --once-multi: after first conn, exit decided by idle-grace, never 6 (AC-11)"
     $srv4 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--wait-connect-timeout", "30s", "--once-idle-grace", "5s"
     ) -OutLog "$logDir\wct4-server.out" -ErrLog "$logDir\wct4-server.err"
     Start-Sleep -Seconds 1
@@ -233,7 +247,7 @@ try {
 
     Write-Host "[WCT-5] --once-multi, only probes -> exit 6 (V-17)"
     $srv5 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--wait-connect-timeout", "3s", "--once-idle-grace", "5s"
     ) -OutLog "$logDir\wct5-server.out" -ErrLog "$logDir\wct5-server.err"
     Start-Sleep -Milliseconds 500
@@ -244,7 +258,7 @@ try {
 
     Write-Host "[WCT-6] --once, accepted TCP connection held open w/o handshake -> still exit 6 (B-01)"
     $srv6 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once", "--wait-connect-timeout", "3s"
     ) -OutLog "$logDir\wct6-server.out" -ErrLog "$logDir\wct6-server.err"
     Start-Sleep -Milliseconds 700
@@ -272,7 +286,7 @@ try {
 
     Write-Host "[WCT-7] --once-multi, accepted TCP connection held open w/o handshake -> still exit 6 (B-01)"
     $srv7 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $src, "--password", $password, "--port", "$Port",
+        "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--wait-connect-timeout", "3s", "--once-idle-grace", "5s"
     ) -OutLog "$logDir\wct7-server.out" -ErrLog "$logDir\wct7-server.err"
     Start-Sleep -Milliseconds 700

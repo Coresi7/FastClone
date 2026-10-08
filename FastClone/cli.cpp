@@ -401,6 +401,11 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
             options.exitAfterSync = true;
         } else if (arg == "--once-multi") {
             options.onceMulti = true;
+        } else if (arg == "--bind-loopback") {
+            // Server-only test switch (presence flag, no value). Default false keeps production
+            // behavior (binds ::); true binds ::1 to isolate test servers from LAN/WAN traffic.
+            // Rejection on client is enforced in the validation block below (server-only).
+            options.bindLoopback = true;
         } else if (arg == "--once-idle-grace") {
             options.onceIdleGraceMs = ParseDurationMsStrict(ArgAt(args, ++i), "--once-idle-grace");
             if (options.onceIdleGraceMs == 0) {
@@ -453,6 +458,11 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
     if (options.mode == Mode::Client && options.onceMulti) {
         throw std::runtime_error("--once-multi is server-only");
     }
+    // --bind-loopback is server-only (test-only switch; a client never listens). Kept in the
+    // server-only validation group so `client --bind-loopback` reports a consistent category.
+    if (options.mode == Mode::Client && options.bindLoopback) {
+        throw std::runtime_error("--bind-loopback is server-only");
+    }
     // #6: --once and --once-multi are mutually exclusive (FR-02 / AC-02).
     if (options.exitAfterSync && options.onceMulti) {
         throw std::runtime_error("--once and --once-multi are mutually exclusive");
@@ -494,7 +504,7 @@ CliOptions ParseCliArgs(const std::vector<std::string>& args) {
 std::string BuildUsageText() {
     return
         "Usage:\n"
-        "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] --password <pwd>\n"
+        "  fastclone server [--dir <path>] [--port <n>] [--server-hash-workers <n>] [--enable-hash-memcache] [--once] [--once-multi] [--once-idle-grace <duration>] [--wait-connect-timeout <duration>] [--bind-loopback] --password <pwd>\n"
         "  fastclone client --server <host:port>[,host:port...] --target <path> --password <pwd>\n"
         "      [--streams <n>] [--chunk-kb <n>] [--queued-file-size <size>]\n"
         "      [--large-file-threshold <size>] [--aux-weight <float>] [--large-file-lane <primary|aux|auto>]\n"

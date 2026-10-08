@@ -27,10 +27,16 @@
 
 param(
     [string]$ExePath = "",
-    [int]$Port = 27894
+    [int]$Port = 27894,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+# Read inside Invoke-DataIntegrityVariant via PowerShell dynamic scoping (parent scope).
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -49,6 +55,13 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free (~3s) so the next variant avoids a stale
+    # listener / TIME_WAIT residue (root cause of file_range bind WSA=10048).
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 500
 }
@@ -75,6 +88,8 @@ function Start-FastCloneProcess {
         [string]$OutLog,
         [string]$ErrLog
     )
+    # Drop null/empty fragments (the optional "--bind-loopback" slot is "" when off).
+    $CliArgs = @($CliArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
     $env:FASTCLONE_DEBUG = "1"
     $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$CliArgs) `
         -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
@@ -260,8 +275,10 @@ function Invoke-DataIntegrityVariant {
     New-Item -ItemType Directory -Force -Path $tgt | Out-Null
 
     # Start server (--once so it auto-exits after the single session).
+    # $bindLoopbackArg comes from the parent script scope (empty in production, "--bind-loopback"
+    # when ctest passes -BindLoopback on); Start-FastCloneProcess drops it when empty.
     $srv = Start-FastCloneProcess -Exe $Exe -CliArgs @(
-        "server", "--dir", $Src, "--password", $Password, "--port", "$PortNum", "--once"
+        "server", "--dir", $Src, "--password", $Password, "--port", "$PortNum", $bindLoopbackArg, "--once"
     ) -OutLog "$LogDir\$Label-server.out" -ErrLog "$LogDir\$Label-server.err"
     Start-Sleep -Seconds 1
 

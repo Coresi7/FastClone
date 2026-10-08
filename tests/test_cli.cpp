@@ -131,6 +131,43 @@ void RunCliTests() {
         Require(opt.exitAfterSync, "Expected exitAfterSync set by --once");
     }
 
+    // BL-CLI-1 (OM-4 v2): server --bind-loopback parses into bindLoopback=true.
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone",
+            "server",
+            "--password",
+            "pw",
+            "--bind-loopback",
+        });
+        Require(opt.bindLoopback, "Expected bindLoopback set by --bind-loopback");
+    }
+
+    // BL-CLI-2 (OM-4 v2): default bindLoopback is false (production behavior unchanged).
+    {
+        const fc::CliOptions opt = Parse({
+            "FastClone",
+            "server",
+            "--password",
+            "pw",
+        });
+        Require(!opt.bindLoopback, "Expected bindLoopback false by default (production)");
+    }
+
+    // BL-CLI-3 (OM-4 v2): --bind-loopback is server-only; a client must be rejected.
+    ExpectThrowWith({
+                        "FastClone",
+                        "client",
+                        "--server",
+                        "127.0.0.1:27842",
+                        "--target",
+                        ".",
+                        "--password",
+                        "pw",
+                        "--bind-loopback",
+                    },
+                    "server-only");
+
     // V-02 (AC-02/AC-11.2): --once is server-only; a client must be rejected.
     ExpectThrowWith({
                         "FastClone",

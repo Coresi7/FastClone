@@ -11,10 +11,15 @@
 param(
     [string]$ExePath = "",
     [string]$CheckExePath = "",
-    [int]$Port = 27941
+    [int]$Port = 27941,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-Tool {
     param([string]$Hint, [string]$Name)
@@ -68,7 +73,11 @@ function Write-Binary {
 function Start-Server {
     param([string]$Exe, [string]$SrcDir, [string]$Pw, [string]$LogTag)
     $out = "$LogTag.out"; $err = "$LogTag.err"
-    $proc = Start-Process -FilePath $Exe -ArgumentList @("server", "--dir", $SrcDir, "--password", $Pw, "--port", "$Port", "--once") `
+    # $bindLoopbackArg from parent scope (empty in production, "--bind-loopback" in test mode);
+    # filter empties so Start-Process never sees a stray blank argument.
+    $srvArgs = @("server", "--dir", $SrcDir, "--password", $Pw, "--port", "$Port", $bindLoopbackArg, "--once") |
+        Where-Object { $null -ne $_ -and $_ -ne "" }
+    $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$srvArgs) `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
     $null = $proc.Handle
     Start-Sleep -Milliseconds 1500   # allow bind before the client connects

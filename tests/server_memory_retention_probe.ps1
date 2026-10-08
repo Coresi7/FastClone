@@ -30,10 +30,15 @@ param(
     [int]$SmallFiles = 800,
     [int]$SmallSizeKb = 64,
     [int]$BigFiles = 2,
-    [int]$BigSizeMb = 300
+    [int]$BigSizeMb = 300,
+    # Test-only: bind server to ::1 (loopback) to isolate from LAN/WAN traffic (OM-4 flaky root cause).
+    [switch]$BindLoopback
 )
 
 $ErrorActionPreference = "Stop"
+
+# Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
+$bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 function Resolve-FastCloneExe {
     param([string]$Hint)
@@ -52,6 +57,13 @@ function Resolve-FastCloneExe {
 function Stop-AllFastClone {
     Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    # D-04: poll until this script's port is free (~3s) so a re-run avoids a stale listener /
+    # TIME_WAIT residue (root cause of file_range bind WSA=10048).
+    for ($i = 0; $i -lt 12; $i++) {
+        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
+        if (-not $busy) { break }
+        Start-Sleep -Milliseconds 250
     }
     Start-Sleep -Milliseconds 700
 }
@@ -133,8 +145,12 @@ try {
     }
 
     $env:FASTCLONE_DEBUG = "1"
+    # $bindLoopbackArg from parent scope (empty in production, "--bind-loopback" in test mode);
+    # filter empties so Start-Process never sees a stray blank argument.
+    $srvArgs = @("server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg) |
+        Where-Object { $null -ne $_ -and $_ -ne "" }
     $srv = Start-Process -FilePath $exe `
-        -ArgumentList @("server", "--dir", $src, "--password", $password, "--port", "$Port") `
+        -ArgumentList ([string[]]$srvArgs) `
         -RedirectStandardOutput (Join-Path $logs "server.out") `
         -RedirectStandardError  (Join-Path $logs "server.err") `
         -PassThru -NoNewWindow
