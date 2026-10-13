@@ -5,8 +5,7 @@
   "description": "FastClone: portable high-speed directory sync + read-only comparison tool.",
   "dependencies": [
     {
-      "name": "xxhash",
-      "version>=": "0.8.3"
+      "name": "xxhash"
     }
   ]
 }
