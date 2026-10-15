@@ -218,6 +218,13 @@ std::shared_ptr<ServerSession> HandshakeAndResolveSession(const SocketHandle& so
                                                           const std::string& password,
                                                           const std::vector<AdvertisedEndpoint>& serverAddrs,
                                                           bool isOnce) {
+    // Wrap site 5/5 (task ci-integration-test-timeout, gate H-10): server side shares the
+    // client_handshake.h guard definition (include chain verified by gate G17). Bounds the
+    // Hello (NegotiateHelloAsServer) AND the claim recv below, so a TCP peer that connects
+    // but never speaks releases this thread (and g_inFlightHandshakes) in 30s instead of
+    // parking forever (RC-5b/RC-5c forensics; WCT-2/WCT-5 probe connections are closed
+    // earlier, which only helps the B-01 wait-connect path).
+    HandshakeRecvGuard guard(socket);
     NegotiateHelloAsServer(socket);
     const Frame claim = RecvFrame(socket);
     if (claim.type == MsgType::Auth) {
@@ -2445,6 +2452,11 @@ int RunServer(const CliOptions& options) {
         std::cout << "[wc] wait_connect_armed timeout_ms=" << options.waitConnectTimeoutMs
                   << std::endl;
     }
+    // Task ci-integration-test-timeout (RC-5c/RC-5d, design section 3.11): 5s-throttled
+    // accept-loop heartbeat, so a stall can be attributed to "server never accepted"
+    // (accepted_total stays flat while the client logged connect_ok) vs "accepted but the
+    // handshake never completed" (in_flight_handshakes stuck > 0). Diagnostic-only: stderr.
+    auto lastSrvTickPrint = std::chrono::steady_clock::now();
     while (true) {
         // --once: a terminal verdict may have fired while we were dispatching; bail before
         // blocking again so we never serve a second session (FR-10) and return cleanly (FR-09).
@@ -2478,6 +2490,27 @@ int RunServer(const CliOptions& options) {
                 // is side-effect free; after it, wait-connect is permanently disabled.
                 // onceMulti implies waitConnectActive (waitConnectActive = exitAfterSync || onceMulti),
                 // so waitConnectDeadline is guaranteed to have_value here; the deref is safe.
+                if (debugEnabled) {
+                    // [RC-5c/5d] (task ci-integration-test-timeout, design section 3.11): 5s-throttled
+                    // heartbeat distinguishing "server never accepted" from "handshake never completed".
+                    const auto nowTick = std::chrono::steady_clock::now();
+                    if (nowTick - lastSrvTickPrint >= std::chrono::seconds(5)) {
+                        lastSrvTickPrint = nowTick;
+                        const long long wcRemainingMs =
+                            waitConnectDeadline
+                                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      *waitConnectDeadline - nowTick).count()
+                                : -1;
+                        const SessionRegistry::IdleSnapshot snap =
+                            GetSessionRegistry().SnapshotIdle();
+                        std::cerr << "[srv][tick] accepted_total=" << connIdCounter.load()
+                                  << " in_flight_handshakes=" << g_inFlightHandshakes.load()
+                                  << " sessions=" << GetSessionRegistry().SessionCount()
+                                  << " active_real=" << snap.activeRealSessions
+                                  << " created_total=" << snap.createdTotal
+                                  << " wc_remaining_ms=" << wcRemainingMs << std::endl;
+                    }
+                }
                 if (!firstConnSeen &&
                     EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
                                         *waitConnectDeadline)) {
@@ -2511,6 +2544,27 @@ int RunServer(const CliOptions& options) {
                 throw;
             }
             if (!maybe) {
+                if (debugEnabled) {
+                    // [RC-5c/5d] (task ci-integration-test-timeout, design section 3.11): same
+                    // 5s-throttled heartbeat on the --once first-connect-wait tick.
+                    const auto nowTick = std::chrono::steady_clock::now();
+                    if (nowTick - lastSrvTickPrint >= std::chrono::seconds(5)) {
+                        lastSrvTickPrint = nowTick;
+                        const long long wcRemainingMs =
+                            waitConnectDeadline
+                                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      *waitConnectDeadline - nowTick).count()
+                                : -1;
+                        const SessionRegistry::IdleSnapshot snap =
+                            GetSessionRegistry().SnapshotIdle();
+                        std::cerr << "[srv][tick] accepted_total=" << connIdCounter.load()
+                                  << " in_flight_handshakes=" << g_inFlightHandshakes.load()
+                                  << " sessions=" << GetSessionRegistry().SessionCount()
+                                  << " active_real=" << snap.activeRealSessions
+                                  << " created_total=" << snap.createdTotal
+                                  << " wc_remaining_ms=" << wcRemainingMs << std::endl;
+                    }
+                }
                 if (EvaluateWaitConnect(options.waitConnectTimeoutMs, firstConnSeen,
                                         *waitConnectDeadline)) {
                     listener.Release();
@@ -2563,8 +2617,13 @@ int RunServer(const CliOptions& options) {
                       << " ip=" << (clientIp.empty() ? "(unknown)" : clientIp) << std::endl;
             std::shared_ptr<ServerSession> session;
             try {
+                // Task ci-integration-test-timeout (RC-5c, design section 3.11): handshake phase
+                // markers. Paired with [srv][tick], "handshake_begin without handshake_end"
+                // pinpoints a handshake thread stuck in recv (now bounded at 30s by the guard).
+                std::cerr << "[srv] handshake_begin conn=" << connSeq << std::endl;
                 session = HandshakeAndResolveSession(client, options.password, serverAddrs,
                                                      options.exitAfterSync);
+                std::cerr << "[srv] handshake_end conn=" << connSeq << " ok=1" << std::endl;
                 std::cout << "[mp] conn_accept conn=" << connSeq
                           << " sessionId=" << session->sessionId
                           << " live_conns=" << session->liveConns.load() << std::endl;

@@ -36,27 +36,185 @@ function Resolve-FastCloneExe {
     throw "FastClone.exe not found; pass -ExePath"
 }
 
-function Stop-AllFastClone {
-    Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+# ---------------------------------------------------------------------------
+# Task ci-integration-test-timeout: global bounded-execution skeleton (design sections
+# 3.4/3.5/3.12/3.13). Canonical implementation; the same block is copied into every
+# integration script (N3: no shared dot-source module).
+# NOTE (gate H-1): this script's Wait-ExitCode is the 7th clamp site the design v2
+# missed (E-1); its budget chain (30+20+10+180+180+30+30 = 480s) does not close I-2
+# without the clamp below.
+# ---------------------------------------------------------------------------
+
+# [I-2] Global wall-clock budget. ctest hard-kills at 600s, and a hard-kill means neither the
+# catch block nor any diagnostic ever runs -- which is exactly why #2/#6/#9 produced nothing
+# but "(Timeout)" on build #58. Aborting at 480s leaves 120s for the diagnostic dump + cleanup.
+$script:FcDeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds(480)
+
+function Get-FcRemainingSec {
+    param([int]$ReserveSec = 30)
+    $r = ($script:FcDeadlineUtc - (Get-Date).ToUniversalTime()).TotalSeconds - $ReserveSec
+    if ($r -lt 0) { $r = 0 }
+    return [int][Math]::Floor($r)
+}
+
+function Assert-FcDeadline {
+    param([string]$Stage)
+    if ((Get-FcRemainingSec) -le 0) {
+        throw "GLOBAL-DEADLINE exceeded at stage='$Stage' (480s budget, 30s reserve)"
     }
-    # D-04: poll until this script's port is free (~3s) so the next sub-test avoids a stale
-    # listener / TIME_WAIT residue (root cause of file_range bind WSA=10048).
-    for ($i = 0; $i -lt 12; $i++) {
-        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
-        if (-not $busy) { break }
+}
+
+# [FR-03] PID registry: only processes THIS script started.
+$script:FcOwnedPids = @{}
+
+function Register-OwnedProcess {
+    param([System.Diagnostics.Process]$Proc, [string]$Tag)
+    $script:FcOwnedPids[[int]$Proc.Id] = $Tag
+    return $Proc
+}
+
+function Stop-OwnedFastClone {
+    foreach ($pidKey in @($script:FcOwnedPids.Keys)) {
+        $p = Get-Process -Id $pidKey -ErrorAction SilentlyContinue
+        # [FR-03] PID-reuse guard: a recycled PID may now belong to an unrelated process.
+        # Only kill it if it is still FastClone.
+        if ($p -and $p.ProcessName -eq 'FastClone') {
+            Stop-Process -Id $pidKey -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $script:FcOwnedPids = @{}
+}
+
+# [FR-02] Bounded port helpers. Replaces the fixed `Start-Sleep -Seconds 1` readiness
+# assumption with a bounded poll on real OS state.
+function Get-PortHolders {
+    param([int]$PortNum)
+    $rows = @()
+    foreach ($l in (netstat -ano | Select-String -Pattern ":$PortNum " -SimpleMatch)) {
+        $f = ($l.Line -split '\s+') | Where-Object { $_ -ne '' }
+        if ($f.Count -ge 5) {
+            $rows += [pscustomobject]@{
+                Proto = $f[0]; Local = $f[1]; Remote = $f[2]; State = $f[3]; Pid = [int]$f[4]
+            }
+        }
+    }
+    return $rows
+}
+
+function Wait-PortFree {
+    param([int]$PortNum, [int]$TimeoutSec = 15)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        # Only a LISTENING socket on the local port actually blocks the next bind.
+        # TIME_WAIT entries (usually the CLIENT side of a previous connection, whose REMOTE
+        # column matches ":port") do NOT block bind -- waiting for them to clear would cost
+        # the full 15s per sub-case on the healthy path (observed +130s on file_range).
+        $blocking = @(Get-PortHolders -PortNum $PortNum | Where-Object { $_.State -eq 'LISTENING' })
+        if ($blocking.Count -eq 0) { return $true }
+        # A non-FastClone LISTENING holder will not go away by waiting (F-2 observed
+        # 3x15s of dead waiting on a foreign holder): bail out immediately with the
+        # caller's warning instead of burning the budget. Only a FastClone holder
+        # (e.g. just killed by the port-scoped cleanup) can be expected to release.
+        $fcHeld = $false
+        foreach ($b in $blocking) {
+            $bp = Get-Process -Id $b.Pid -ErrorAction SilentlyContinue
+            if ($bp -and $bp.ProcessName -eq 'FastClone') { $fcHeld = $true; break }
+        }
+        if (-not $fcHeld) { return $false }
         Start-Sleep -Milliseconds 250
     }
-    Start-Sleep -Milliseconds 500
+    return $false
+}
+
+function Wait-PortListening {
+    param([int]$PortNum, [System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 15)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Proc.HasExited) { return $false }
+        $hit = Get-PortHolders -PortNum $PortNum |
+               Where-Object { $_.State -eq 'LISTENING' -and $_.Pid -eq $Proc.Id }
+        if ($hit) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+# [NFR-03] Timeout diagnostic block: stuck PID + port netstat + client/server log tails +
+# last [phase]/[hb]/[wd] marker, so a failure is attributable instead of "(Timeout)".
+# Reads $Port / $logDir via PowerShell dynamic scoping.
+function Write-FcDiag {
+    param([string]$StageTag, [string]$Reason, [int]$TimeoutSec,
+          [System.Diagnostics.Process]$Proc, [string]$OutLog, [string]$ErrLog)
+    Write-Host "===== TIMEOUT-DIAG begin stage=$StageTag reason=$Reason timeout=${TimeoutSec}s ====="
+    if ($Proc) {
+        $p = Get-Process -Id $Proc.Id -ErrorAction SilentlyContinue
+        Write-Host "  stuck_pid=$($Proc.Id) name=$(if ($p) { $p.ProcessName } else { '<exited>' })"
+    }
+    Write-Host "  port=$Port netstat:"
+    (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    foreach ($f in @($OutLog, $ErrLog)) {
+        if ($f -and (Test-Path $f)) {
+            Write-Host "  ----- tail $f -----"
+            Get-Content -Path $f -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+        }
+    }
+    if ($ErrLog -and (Test-Path $ErrLog)) {
+        $ph = Get-Content $ErrLog -ErrorAction SilentlyContinue |
+              Select-String -Pattern '\[phase\]|\[hb\]|\[wd\]'
+        if ($ph) { Write-Host "  client_phase_last=$($ph[-1].Line)" }
+        else     { Write-Host "  client_phase_last=<none>" }
+    }
+    if (Test-Path $logDir) {
+        Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'server' } | ForEach-Object {
+                $t = Get-Content $_.FullName -Tail 20 -ErrorAction SilentlyContinue
+                if ($t) {
+                    Write-Host "  ----- tail $($_.Name) -----"
+                    $t | ForEach-Object { Write-Host "    $_" }
+                }
+            }
+    }
+    Write-Host "===== TIMEOUT-DIAG end ====="
+}
+
+function Stop-AllFastClone {
+    # [FR-03] Only processes THIS script started. The old implementation
+    # (`Get-Process FastClone | Stop-Process -Force`) was a name-global kill that can
+    # terminate unrelated FastClone processes on a shared build agent (RC-3).
+    Stop-OwnedFastClone
+    # Defensive, PORT-SCOPED fallback: a process we do not own but that holds OUR port would
+    # break the next bind. Kill only that PID and log it (never a name-global sweep).
+    foreach ($h in (Get-PortHolders -PortNum $Port)) {
+        $p = Get-Process -Id $h.Pid -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -eq 'FastClone') {
+            Write-Host "[CLEANUP] killing non-owned FastClone pid=$($h.Pid) state=$($h.State) holding port $Port"
+            Stop-Process -Id $h.Pid -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[CLEANUP][warn] port $Port still not free after 15s:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
 }
 
 function Wait-ExitCode {
-    param([System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 30)
+    param([System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 30, [string]$StageTag = "wait")
+    # [I-2] v2 (R-06 / gate H-1, clamp site 7/7): the design v2 "6 clamp sites" enumeration
+    # missed this script (E-1); its worst budget chain sums to exactly 480s, so without the
+    # clamp I-2 does not close on ctest #7.
+    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
+    if ($eff -le 0) {
+        # NOTE: WaitForExit(0) returns immediately regardless of state, so we must NOT fall
+        # through with 0 -- that would silently kill a healthy process and look like a stall.
+        throw "GLOBAL-DEADLINE exceeded waiting for pid=$($Proc.Id) stage=$StageTag (budget=${TimeoutSec}s)"
+    }
     if ($Proc.HasExited) {
         $Proc.Refresh()
-    } elseif (-not $Proc.WaitForExit($TimeoutSec * 1000)) {
-        Stop-Process -Id $Proc.Id -Force
-        throw "Process $($Proc.Id) did not exit within ${TimeoutSec}s"
+    } elseif (-not $Proc.WaitForExit($eff * 1000)) {
+        Write-FcDiag -StageTag $StageTag -Reason "wait-exitcode-timeout" -TimeoutSec $eff `
+            -Proc $Proc -OutLog $null -ErrLog $null
+        Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+        throw "TIMEOUT ${StageTag}: pid=$($Proc.Id) did not exit within ${eff}s (budget ${TimeoutSec}s)"
     }
     $Proc.Refresh()
     if ($null -eq $Proc.ExitCode) {
@@ -86,27 +244,58 @@ function Start-FastCloneProcess {
     # Touch .Handle to cache the native handle now; otherwise .ExitCode is "unavailable"
     # after a self-exiting process (e.g. server --once) terminates (classic PowerShell quirk).
     $null = $proc.Handle
+    $null = Register-OwnedProcess -Proc $proc -Tag "server"
     return $proc
 }
 
+# [FR-01] Bounded synchronous client invocation.
+# Replaces the unbounded `cmd /c` (RC-1): Start-Process gives us the child PID directly, so a
+# timeout can kill exactly that process (cmd /c would leave FastClone.exe as an orphan).
 function Invoke-FastCloneSync {
     param(
         [string]$Exe,
         [string[]]$CliArgs,
         [string]$OutLog,
-        [string]$ErrLog
+        [string]$ErrLog,
+        [int]$TimeoutSec = 150,          # tier T0, see design section 3.2
+        [string]$StageTag = "client"     # NFR-03: goes into the diagnostic block
     )
     foreach ($a in $CliArgs) {
         if ($null -eq $a -or $a -eq "") {
             throw "Invoke-FastCloneSync: null/empty argument"
         }
     }
+    Assert-FcDeadline -Stage "$StageTag/pre"
+
+    # Local fault-injection hooks (AC-02, design section 3.14). Never set on CI; inert by
+    # default: the branch is only entered when the environment variable exists. NOTE: the
+    # timeout override must run BEFORE the $eff clamp below, otherwise it never takes effect.
+    if ($env:FASTCLONE_TEST_HANG_CLIENT -eq '1') {
+        $hangSec = 900
+        if ($env:FASTCLONE_TEST_HANG_SEC) { $hangSec = [int]$env:FASTCLONE_TEST_HANG_SEC }
+        $Exe = "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $CliArgs = @("-NoProfile", "-Command", "Start-Sleep -Seconds $hangSec")
+        Write-Host "[INJECT] hanging child substituted for stage=$StageTag"
+    }
+    if ($env:FASTCLONE_TEST_CLIENT_TIMEOUT_SEC) { $TimeoutSec = [int]$env:FASTCLONE_TEST_CLIENT_TIMEOUT_SEC }
+
+    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
+    if ($eff -le 0) { throw "GLOBAL-DEADLINE exceeded before stage='$StageTag'" }
+
     $env:FASTCLONE_DEBUG = "1"
-    $argLine = ($CliArgs | ForEach-Object {
-        if ($_ -match '\s') { "`"$_`"" } else { $_ }
-    }) -join " "
-    cmd /c "`"$Exe`" $argLine 1>`"$OutLog`" 2>`"$ErrLog`""
-    return [int]$LASTEXITCODE
+    $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$CliArgs) `
+        -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
+        -PassThru -NoNewWindow
+    $null = $proc.Handle            # cache the handle so .ExitCode is readable
+    $null = Register-OwnedProcess -Proc $proc -Tag $StageTag
+
+    if (-not $proc.WaitForExit($eff * 1000)) {
+        Write-FcDiag -StageTag $StageTag -Reason "client-timeout" -TimeoutSec $eff `
+            -Proc $proc -OutLog $OutLog -ErrLog $ErrLog
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        throw "TIMEOUT ${StageTag}: FastClone client pid=$($proc.Id) did not exit within ${eff}s"
+    }
+    return [int]$proc.ExitCode
 }
 
 $exe = Resolve-FastCloneExe -Hint $ExePath
@@ -140,19 +329,29 @@ try {
     Stop-AllFastClone
 
     Write-Host "[OS-1] success path -> server --once auto-exits 0"
+    Assert-FcDeadline -Stage "OS-1"
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[PORT-BUSY] port $Port still held before OS-1 server start:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     $srv1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os1-server.out" -ErrLog "$logDir\os1-server.err"
-    Start-Sleep -Seconds 1
+    if (-not (Wait-PortListening -PortNum $Port -Proc $srv1 -TimeoutSec 15)) {
+        Write-FcDiag -StageTag "OS-1/server-not-listening" -Reason "server-bind" -TimeoutSec 15 `
+            -Proc $srv1 -OutLog "$logDir\os1-server.out" -ErrLog "$logDir\os1-server.err"
+        throw "OS-1: server pid=$($srv1.Id) never reached LISTENING on port $Port within 15s"
+    }
     $code1c = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt, "--password", $password
-    ) -OutLog "$logDir\os1-client.out" -ErrLog "$logDir\os1-client.err"
+    ) -OutLog "$logDir\os1-client.out" -ErrLog "$logDir\os1-client.err" -TimeoutSec 150 -StageTag "OS-1"
     if ($code1c -ne 0) { throw "OS-1: client sync expected exit 0, got $code1c" }
     $code1 = Wait-ExitCode -Proc $srv1 -TimeoutSec 30
     if ($code1 -ne 0) { throw "OS-1: server --once expected exit 0, got $code1" }
     Write-Host "  OK server exit=$code1 (auto-exited, no kill)"
 
     Write-Host "[OS-5] AC-10: after first session terminal, a second client is refused"
+    Assert-FcDeadline -Stage "OS-5"
     # The OS-1 server already auto-exited after its single real session (FR-10/FR-11): it is
     # not kept alive for a second session. A new client must therefore fail to connect rather
     # than be served (exit != 0). OS-5b below covers the in-flight rejection path.
@@ -168,10 +367,19 @@ try {
     Write-Host "  OK second client refused (no server listening); client exit=$code5"
 
     Write-Host "[OS-5b] AC-10: while target session is active, second Auth is rejected"
+    Assert-FcDeadline -Stage "OS-5b"
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[PORT-BUSY] port $Port still held before OS-5b server start:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     $srv5b = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os5b-server.out" -ErrLog "$logDir\os5b-server.err"
-    Start-Sleep -Seconds 1
+    if (-not (Wait-PortListening -PortNum $Port -Proc $srv5b -TimeoutSec 15)) {
+        Write-FcDiag -StageTag "OS-5b/server-not-listening" -Reason "server-bind" -TimeoutSec 15 `
+            -Proc $srv5b -OutLog "$logDir\os5b-server.out" -ErrLog "$logDir\os5b-server.err"
+        throw "OS-5b: server pid=$($srv5b.Id) never reached LISTENING on port $Port within 15s"
+    }
     $tgt5b1 = Join-Path $root "tgt5b1"
     New-Item -ItemType Directory -Force -Path $tgt5b1 | Out-Null
     $cli5b1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
@@ -203,10 +411,19 @@ try {
     Write-Host "  OK second Auth rejected; first session completed; server exit=$code5b"
 
     Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 5"
+    Assert-FcDeadline -Stage "OS-2"
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[PORT-BUSY] port $Port still held before OS-2 server start:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os2-server.out" -ErrLog "$logDir\os2-server.err"
-    Start-Sleep -Seconds 1
+    if (-not (Wait-PortListening -PortNum $Port -Proc $srv2 -TimeoutSec 15)) {
+        Write-FcDiag -StageTag "OS-2/server-not-listening" -Reason "server-bind" -TimeoutSec 15 `
+            -Proc $srv2 -OutLog "$logDir\os2-server.out" -ErrLog "$logDir\os2-server.err"
+        throw "OS-2: server pid=$($srv2.Id) never reached LISTENING on port $Port within 15s"
+    }
     $tgt2 = Join-Path $root "tgt2"
     New-Item -ItemType Directory -Force -Path $tgt2 | Out-Null
     $cli2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
@@ -223,33 +440,50 @@ try {
     Write-Host "  OK server exit=$code2"
 
     Write-Host "[OS-3] usage errors -> exit 1"
+    Assert-FcDeadline -Stage "OS-3"
     $code3a = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt, "--password", $password, "--once"
-    ) -OutLog "$logDir\os3a.out" -ErrLog "$logDir\os3a.err"
+    ) -OutLog "$logDir\os3a.out" -ErrLog "$logDir\os3a.err" -TimeoutSec 150 -StageTag "OS-3a"
     if ($code3a -ne 1) { throw "OS-3: client --once expected exit 1, got $code3a" }
     $code3b = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "server", "--dir", $src, "--password", $password, "--once", "--enable-hash-memcache"
-    ) -OutLog "$logDir\os3b.out" -ErrLog "$logDir\os3b.err"
+    ) -OutLog "$logDir\os3b.out" -ErrLog "$logDir\os3b.err" -TimeoutSec 150 -StageTag "OS-3b"
     if ($code3b -ne 1) { throw "OS-3: --once + --enable-hash-memcache expected exit 1, got $code3b" }
     Write-Host "  OK client--once=$code3a  mutually-exclusive=$code3b"
 
     Write-Host "[OS-4] pre-handshake probe does not exit the server, real client still completes 0"
+    Assert-FcDeadline -Stage "OS-4"
     $tgt4 = Join-Path $root "tgt4"
     New-Item -ItemType Directory -Force -Path $tgt4 | Out-Null
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[PORT-BUSY] port $Port still held before OS-4 server start:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     $srv4 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg, "--once"
     ) -OutLog "$logDir\os4-server.out" -ErrLog "$logDir\os4-server.err"
-    Start-Sleep -Seconds 1
+    if (-not (Wait-PortListening -PortNum $Port -Proc $srv4 -TimeoutSec 15)) {
+        Write-FcDiag -StageTag "OS-4/server-not-listening" -Reason "server-bind" -TimeoutSec 15 `
+            -Proc $srv4 -OutLog "$logDir\os4-server.out" -ErrLog "$logDir\os4-server.err"
+        throw "OS-4: server pid=$($srv4.Id) never reached LISTENING on port $Port within 15s"
+    }
     # Probe: connect then immediately close without sending any bytes (session == null).
     $probe = New-Object System.Net.Sockets.TcpClient
     $probe.Connect("127.0.0.1", $Port)
     Start-Sleep -Milliseconds 200
     $probe.Close()
-    Start-Sleep -Seconds 1
+    # Bounded wait (was `Start-Sleep -Seconds 1`): give the server up to 1s to wrongly react
+    # to the probe close; polling makes the failure surface earlier without weakening the
+    # "server must survive the full window" semantics.
+    $probeGrace = [DateTime]::UtcNow.AddSeconds(1)
+    while ([DateTime]::UtcNow -lt $probeGrace) {
+        if ($srv4.HasExited) { break }
+        Start-Sleep -Milliseconds 100
+    }
     if ($srv4.HasExited) { throw "OS-4: server exited on a pre-handshake probe (should stay up)" }
     $code4c = Invoke-FastCloneSync -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt4, "--password", $password
-    ) -OutLog "$logDir\os4-client.out" -ErrLog "$logDir\os4-client.err"
+    ) -OutLog "$logDir\os4-client.out" -ErrLog "$logDir\os4-client.err" -TimeoutSec 150 -StageTag "OS-4"
     if ($code4c -ne 0) { throw "OS-4: client sync expected exit 0, got $code4c" }
     $code4 = Wait-ExitCode -Proc $srv4 -TimeoutSec 30
     if ($code4 -ne 0) { throw "OS-4: server --once expected exit 0 after real session, got $code4" }

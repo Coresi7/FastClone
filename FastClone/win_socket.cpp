@@ -101,6 +101,39 @@ void SetSocketBufferOverrides(int sndBufBytes, int rcvBufBytes) {
     g_rcvBufOverride.store(rcvBufBytes > 0 ? rcvBufBytes : 0, std::memory_order_relaxed);
 }
 
+// Task ci-integration-test-timeout (RC-5b, design section 3.9.1): bounded recv for the
+// handshake phase. Windows takes a DWORD milliseconds value; POSIX takes a timeval.
+bool SetRecvTimeout(SocketNative s, int timeoutMs) {
+    if (s == kInvalidSocket) { return false; }
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(timeoutMs);
+    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                      reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#else
+    timeval tv{};
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                      static_cast<socklen_t>(sizeof(tv))) == 0;
+#endif
+}
+
+bool GetRecvTimeout(SocketNative s, int& timeoutMsOut) {
+    if (s == kInvalidSocket) { return false; }
+#ifdef _WIN32
+    DWORD tv = 0; int len = sizeof(tv);
+    if (getsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char*>(&tv), &len) != 0) { return false; }
+    timeoutMsOut = static_cast<int>(tv);
+    return true;
+#else
+    timeval tv{}; socklen_t len = sizeof(tv);
+    if (getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, &len) != 0) { return false; }
+    timeoutMsOut = static_cast<int>(tv.tv_sec) * 1000 + static_cast<int>(tv.tv_usec) / 1000;
+    return true;
+#endif
+}
+
 TcpDiag QueryTcpDiag(SocketNative s) {
     TcpDiag d;
     if (s == kInvalidSocket) {

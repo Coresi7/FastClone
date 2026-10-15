@@ -4,6 +4,8 @@
 #include "protocol_codec.h"
 #include "win_socket.h"
 
+#include <cstdlib>
+#include <iostream>
 #include <string>
 
 namespace fc {
@@ -25,6 +27,68 @@ inline constexpr uint8_t kCapFileRange = 0x02;
 
 // Send a simple frame carrying only a text payload (streamId=0).
 void SendSimple(const SocketHandle& socket, MsgType type, const std::string& text = {});
+
+// --- Task ci-integration-test-timeout: bounded handshake recv (RC-5b, design section 3.9) ---
+// A handshake is a strict single request/response with no disk, hash or enumeration work on
+// either side: a healthy reply arrives in milliseconds. Bound the recv so a peer that completed
+// the TCP connect but never speaks cannot park this thread forever (RC-5b). The default (30s) is
+// ~1e3x the healthy latency, so the healthy path is bit-for-bit unchanged.
+// Env override is forensic-only; 0 disables (restores unbounded behavior).
+inline int HandshakeRecvTimeoutMs() {
+    if (const char* v = std::getenv("FASTCLONE_HANDSHAKE_RECV_TIMEOUT_MS")) {
+        if (v[0]) {
+            const int ms = std::atoi(v);
+            if (ms > 0) { return ms; }
+            // Explicit "0" disables the bound (restores unbounded behavior, R-4 rollback);
+            // garbage that does not parse to a number falls back to the default.
+            if (ms == 0 && v[0] == '0') { return 0; }
+        }
+    }
+    return 30000;
+}
+
+// v2 (R-01 / gate H-2): SAVE/RESTORE, not "reset to 0". v1's destructor unconditionally
+// restored 0, which silently cancelled an ENCLOSING guard: HandshakeClientNew installs 30s,
+// the nested NegotiateHelloAsClient guard then restores 0 on its way out, leaving the AuthOk
+// recv (JoinAck / CheckAuth reply) completely unbounded -- i.e. 2 of the 3 wrap sites were
+// effectively dead and the one stall shape we care about most was uncovered.
+// Save/restore is value-based, therefore composable at any nesting depth: the innermost
+// restores what the outer installed, and only the outermost restores the real default (0).
+// NOTE (gate H-2): the full class definition lives in THIS header (namespace fc) so the
+// server TU (sync_engine_server.cpp -> sync_engine_internal.h -> client_handshake.h) shares
+// the single definition; putting it in an anonymous namespace of the .cpp would leave the
+// server wrap site without a complete type.
+class HandshakeRecvGuard {
+public:
+    explicit HandshakeRecvGuard(const SocketHandle& h) {
+        if (!h.Valid()) { return; }
+        s_ = h.Get();
+        int prev = 0;
+        // If we cannot READ the current value we must not WRITE one we cannot undo: degrade to
+        // a no-op and say so. Writing blind is exactly what cancelled the outer bound in v1.
+        if (!GetRecvTimeout(s_, prev)) {
+            std::cerr << "[warn][hs] get SO_RCVTIMEO failed; handshake recv left unbounded"
+                      << std::endl;
+            return;
+        }
+        savedMs_ = prev;
+        installed_ = SetRecvTimeout(s_, HandshakeRecvTimeoutMs());
+        if (!installed_) {
+            std::cerr << "[warn][hs] set SO_RCVTIMEO failed; handshake recv left unbounded"
+                      << std::endl;
+        }
+    }
+    ~HandshakeRecvGuard() {
+        if (s_ == kInvalidSocket || !installed_) { return; }
+        SetRecvTimeout(s_, savedMs_);   // restore exactly what was there before
+    }
+    HandshakeRecvGuard(const HandshakeRecvGuard&) = delete;
+    HandshakeRecvGuard& operator=(const HandshakeRecvGuard&) = delete;
+private:
+    SocketNative s_ = kInvalidSocket;
+    int savedMs_ = 0;
+    bool installed_ = false;
+};
 
 // Client-side Hello negotiation (throws std::runtime_error on failure/version mismatch).
 void NegotiateHelloAsClient(const SocketHandle& socket);

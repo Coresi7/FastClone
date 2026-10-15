@@ -72,6 +72,18 @@ struct ConnectBinding {
 // startup before any socket is tuned; applies to every subsequently connected/accepted socket.
 void SetSocketBufferOverrides(int sndBufBytes, int rcvBufBytes);
 
+// Task ci-integration-test-timeout (RC-5b): install / clear an idle recv timeout. With the
+// timeout armed, recv() fails with WSAETIMEDOUT (10060) / EAGAIN instead of blocking forever
+// when the peer completed the TCP handshake but never speaks. timeoutMs == 0 restores the
+// default blocking behavior. Returns false if the socket is invalid or setsockopt failed
+// (v2: v1 ignored the return value entirely, so a silently failing setsockopt would have
+// looked exactly like a working fix).
+bool SetRecvTimeout(SocketNative s, int timeoutMs);
+// Read back the current SO_RCVTIMEO in milliseconds. Returns false if the socket is invalid
+// or getsockopt failed. Used by HandshakeRecvGuard to SAVE the previous value so it can be
+// RESTORED later (value-based nesting, design section 3.9.2 / R-01).
+bool GetRecvTimeout(SocketNative s, int& timeoutMsOut);
+
 // Snapshot of kernel TCP state for one connection (diagnostics only, design wan-single-tcp section 3.2).
 // retrans unit differs by platform (Linux: retransmitted segments; Windows: retransmitted bytes);
 // the trend, not the absolute unit, is what diagnoses loss-driven cwnd sawtooth. valid=false when

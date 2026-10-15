@@ -21,6 +21,105 @@ $ErrorActionPreference = "Stop"
 # Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
 $bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
+# ---------------------------------------------------------------------------
+# Task ci-integration-test-timeout: global bounded-execution skeleton (design sections
+# 3.4/3.5/3.12/3.13). Canonical implementation, with this script's specifics: a 450s
+# deadline (its CMake TIMEOUT is 900, design section 3.6) and $logDir pointing at the
+# working directory (this script writes its logs to the CWD via relative tag paths).
+# ---------------------------------------------------------------------------
+
+# [I-2] Global wall-clock budget: 450s here (CMake TIMEOUT 900; abort with 30s reserve,
+# leaving ample room for the diagnostic dump + cleanup well before the hard kill).
+$script:FcDeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds(450)
+$logDir = (Get-Location).Path
+
+function Get-FcRemainingSec {
+    param([int]$ReserveSec = 30)
+    $r = ($script:FcDeadlineUtc - (Get-Date).ToUniversalTime()).TotalSeconds - $ReserveSec
+    if ($r -lt 0) { $r = 0 }
+    return [int][Math]::Floor($r)
+}
+
+function Assert-FcDeadline {
+    param([string]$Stage)
+    if ((Get-FcRemainingSec) -le 0) {
+        throw "GLOBAL-DEADLINE exceeded at stage='$Stage' (450s budget, 30s reserve)"
+    }
+}
+
+# [FR-03] PID registry: only processes THIS script started.
+$script:FcOwnedPids = @{}
+
+function Register-OwnedProcess {
+    param([System.Diagnostics.Process]$Proc, [string]$Tag)
+    $script:FcOwnedPids[[int]$Proc.Id] = $Tag
+    return $Proc
+}
+
+# [FR-02] Bounded port helpers (design section 3.4).
+function Get-PortHolders {
+    param([int]$PortNum)
+    $rows = @()
+    foreach ($l in (netstat -ano | Select-String -Pattern ":$PortNum " -SimpleMatch)) {
+        $f = ($l.Line -split '\s+') | Where-Object { $_ -ne '' }
+        if ($f.Count -ge 5) {
+            $rows += [pscustomobject]@{
+                Proto = $f[0]; Local = $f[1]; Remote = $f[2]; State = $f[3]; Pid = [int]$f[4]
+            }
+        }
+    }
+    return $rows
+}
+
+function Wait-PortListening {
+    param([int]$PortNum, [System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 15)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Proc.HasExited) { return $false }
+        $hit = Get-PortHolders -PortNum $PortNum |
+               Where-Object { $_.State -eq 'LISTENING' -and $_.Pid -eq $Proc.Id }
+        if ($hit) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+# [NFR-03] Timeout diagnostic block (design section 3.13).
+function Write-FcDiag {
+    param([string]$StageTag, [string]$Reason, [int]$TimeoutSec,
+          [System.Diagnostics.Process]$Proc, [string]$OutLog, [string]$ErrLog)
+    Write-Host "===== TIMEOUT-DIAG begin stage=$StageTag reason=$Reason timeout=${TimeoutSec}s ====="
+    if ($Proc) {
+        $p = Get-Process -Id $Proc.Id -ErrorAction SilentlyContinue
+        Write-Host "  stuck_pid=$($Proc.Id) name=$(if ($p) { $p.ProcessName } else { '<exited>' })"
+    }
+    Write-Host "  port=$Port netstat:"
+    (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    foreach ($f in @($OutLog, $ErrLog)) {
+        if ($f -and (Test-Path $f)) {
+            Write-Host "  ----- tail $f -----"
+            Get-Content -Path $f -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+        }
+    }
+    if ($ErrLog -and (Test-Path $ErrLog)) {
+        $ph = Get-Content $ErrLog -ErrorAction SilentlyContinue |
+              Select-String -Pattern '\[phase\]|\[hb\]|\[wd\]'
+        if ($ph) { Write-Host "  client_phase_last=$($ph[-1].Line)" }
+        else     { Write-Host "  client_phase_last=<none>" }
+    }
+    if ($logDir -and (Test-Path $logDir)) {
+        Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'srv' } | ForEach-Object {
+                $t = Get-Content $_.FullName -Tail 20 -ErrorAction SilentlyContinue
+                if ($t) {
+                    Write-Host "  ----- tail $($_.Name) -----"
+                    $t | ForEach-Object { Write-Host "    $_" }
+                }
+            }
+    }
+    Write-Host "===== TIMEOUT-DIAG end ====="
+}
+
 function Resolve-Tool {
     param([string]$Hint, [string]$Name)
     if ($Hint -and (Test-Path $Hint)) { return (Resolve-Path $Hint).Path }
@@ -36,21 +135,50 @@ function Resolve-Tool {
 }
 
 function Wait-ExitCode {
-    param([System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 120)
+    param([System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 120, [string]$StageTag = "wait")
+    # [I-2] v2 (R-06): clamp the wait to the global deadline so I-2 closes on this script too.
+    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
+    if ($eff -le 0) {
+        # NOTE: WaitForExit(0) returns immediately regardless of state, so we must NOT fall
+        # through with 0 -- that would silently kill a healthy process and look like a stall.
+        throw "GLOBAL-DEADLINE exceeded waiting for pid=$($Proc.Id) stage=$StageTag (budget=${TimeoutSec}s)"
+    }
     if ($Proc.HasExited) { $Proc.Refresh() }
-    elseif (-not $Proc.WaitForExit($TimeoutSec * 1000)) {
-        Stop-Process -Id $Proc.Id -Force
-        throw "Process $($Proc.Id) did not exit within ${TimeoutSec}s"
+    elseif (-not $Proc.WaitForExit($eff * 1000)) {
+        Write-FcDiag -StageTag $StageTag -Reason "wait-exitcode-timeout" -TimeoutSec $eff `
+            -Proc $Proc -OutLog $null -ErrLog $null
+        Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+        throw "TIMEOUT ${StageTag}: pid=$($Proc.Id) did not exit within ${eff}s (budget ${TimeoutSec}s)"
     }
     $Proc.Refresh()
     return [int]$Proc.ExitCode
 }
 
+# [RC-6] Bounded tool invocation (design section 3.3): v1 declared $TimeoutSec=300 but NEVER
+# used it -- the `cmd /c` below was an unbounded wait. This is the FastCheck path (ctest #4,
+# HandshakeClientCheck). Same shape as Invoke-FastCloneSync: Start-Process + WaitForExit(ms)
+# + kill on timeout + diagnostic block. Default 300s = tier T2 (design section 3.2).
 function Invoke-Tool {
-    param([string]$Exe, [string[]]$CliArgs, [string]$OutLog, [string]$ErrLog, [int]$TimeoutSec = 300)
-    $argLine = ($CliArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join " "
-    cmd /c "`"$Exe`" $argLine 1>`"$OutLog`" 2>`"$ErrLog`"" | Out-Null
-    return [int]$LASTEXITCODE
+    param([string]$Exe, [string[]]$CliArgs, [string]$OutLog, [string]$ErrLog,
+          [int]$TimeoutSec = 300, [string]$StageTag = "tool")
+    foreach ($a in $CliArgs) {
+        if ($null -eq $a -or $a -eq "") { throw "Invoke-Tool: null/empty argument" }
+    }
+    Assert-FcDeadline -Stage "$StageTag/pre"
+    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
+    if ($eff -le 0) { throw "GLOBAL-DEADLINE exceeded before stage='$StageTag'" }
+    $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$CliArgs) `
+        -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
+        -PassThru -NoNewWindow
+    $null = $proc.Handle
+    $null = Register-OwnedProcess -Proc $proc -Tag $StageTag
+    if (-not $proc.WaitForExit($eff * 1000)) {
+        Write-FcDiag -StageTag $StageTag -Reason "tool-timeout" -TimeoutSec $eff `
+            -Proc $proc -OutLog $OutLog -ErrLog $ErrLog
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        throw "TIMEOUT ${StageTag}: pid=$($proc.Id) exe=$Exe did not exit within ${eff}s"
+    }
+    return [int]$proc.ExitCode
 }
 
 function New-TempDir {
@@ -80,7 +208,15 @@ function Start-Server {
     $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$srvArgs) `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
     $null = $proc.Handle
-    Start-Sleep -Milliseconds 1500   # allow bind before the client connects
+    $null = Register-OwnedProcess -Proc $proc -Tag $LogTag
+    # [FR-02 / RC-5d] Bounded readiness probe (design section 3.4) replacing the fixed
+    # 1500ms sleep: fail fast (15s) with the server .err in the diagnostic block instead of
+    # letting the client hang in an unbounded connect/recv.
+    if (-not (Wait-PortListening -PortNum $Port -Proc $proc -TimeoutSec 15)) {
+        Write-FcDiag -StageTag "$LogTag/server-not-listening" -Reason "server-bind" -TimeoutSec 15 `
+            -Proc $proc -OutLog $out -ErrLog $err
+        throw "$LogTag : server pid=$($proc.Id) never reached LISTENING on port $Port within 15s"
+    }
     return $proc
 }
 
@@ -168,6 +304,7 @@ $pw = "cc-invariant-pw"
 
 # ---- S1: baseline tree (empty / 50B / 100KiB / 5MiB / nested / non-ASCII) --------------
 {
+    Assert-FcDeadline -Stage "S1"
     $base = New-TempDir "s1"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null
@@ -187,6 +324,7 @@ $pw = "cc-invariant-pw"
 # ---- S2: historical / boundary mtimes (0 sentinel, 1985 area around the 5e17 ns
 # threshold, future, 2001-01-01) - divergence-point A + TryNormalize boundary coverage ----
 {
+    Assert-FcDeadline -Stage "S2"
     $base = New-TempDir "s2"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null
@@ -206,6 +344,7 @@ $pw = "cc-invariant-pw"
 
 # ---- S3: pre-existing extra file in the target -----------------------------------------
 {
+    Assert-FcDeadline -Stage "S3"
     $base = New-TempDir "s3"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null
@@ -223,6 +362,7 @@ $pw = "cc-invariant-pw"
 
 # ---- S4: idempotent re-run (second sync transfers nothing) ------------------------------
 {
+    Assert-FcDeadline -Stage "S4"
     $base = New-TempDir "s4"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null
@@ -251,6 +391,7 @@ $pw = "cc-invariant-pw"
 # DIFFERENT process whose self-exclude does not cover FastClone.exe => it must report
 # extra_local=1 with exactly that file (the residual divergence pinned by AC-08).
 {
+    Assert-FcDeadline -Stage "S5"
     $base = New-TempDir "s5"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null
@@ -279,6 +420,7 @@ $pw = "cc-invariant-pw"
 # BEFORE the fix: FastCheck without an exclude reported its own exe as extra (exit 1).
 # AFTER the fix (SelfExcludeUnderRoot injected): exit 0, extra_local=0.
 {
+    Assert-FcDeadline -Stage "S6"
     $base = New-TempDir "s6"
     $src = Join-Path $base "src"; $tgt = Join-Path $base "tgt"
     New-Item -ItemType Directory -Path $src | Out-Null

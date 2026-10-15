@@ -53,6 +53,87 @@ std::optional<int> ScheduleClientReconnectOrExit(const std::string& reason,
     return std::nullopt;
 }
 
+// --- Task ci-integration-test-timeout: phase markers + heartbeat (design section 3.8) ---
+
+// Phase markers. Diagnostic-only: they write to stderr and never affect control flow, exit
+// codes or the wire protocol (NFR-02/NFR-04). The t_ms base is shared by BOTH overloads
+// (function-local static singleton) so timestamps stay comparable across all markers.
+const std::chrono::steady_clock::time_point& PhaseClockBase() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return t0;
+}
+
+void EmitPhase(const char* tag) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - PhaseClockBase()).count();
+    std::cerr << "[phase] tag=" << tag << " t_ms=" << ms << std::endl;
+}
+
+// Detail-carrying overload (design section 3.8.3 lists markers like "connect_ok rtt_ms=" /
+// "aux_end n=" / "exit code=N" that need a value appended; the plain-const-char* signature
+// cannot carry it, so this overload is the minimal faithful carrier).
+void EmitPhase(const char* tag, const std::string& detail) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - PhaseClockBase()).count();
+    std::cerr << "[phase] tag=" << tag << " " << detail << " t_ms=" << ms << std::endl;
+}
+
+// v2 (R-04 / gate H-9): RAII heartbeat. Owns BOTH the thread and the state shared with it,
+// so nothing is captured by reference from a stack frame that can go away. Stop() is
+// idempotent and runs from the destructor, which makes ALL of RunClient's return paths
+// (:687 catch, :4803 reconnect-exhausted, :4907 normal) safe -- a bare local std::thread
+// would be destroyed while still joinable on the first two and std::terminate() the process.
+// Output: stderr ONLY (goes to the .err redirect, never the assertion-side .out), default
+// every 5s, FASTCLONE_HB_INTERVAL_MS overrides (milliseconds), 0 = fully disabled (no thread).
+class HeartbeatThread {
+public:
+    explicit HeartbeatThread(int intervalMs) : intervalMs_(intervalMs) {
+        if (intervalMs_ <= 0) { return; }   // disabled via FASTCLONE_HB_INTERVAL_MS=0
+        t_ = std::thread([this] { Loop(); });
+    }
+    ~HeartbeatThread() { Stop(); }
+
+    void SetStage(const char* stage) {      // callers pass string literals (static storage);
+                                            // main thread only (gate H-7)
+        std::lock_guard<std::mutex> g(mu_);
+        stage_ = stage;
+    }
+    void Stop() {                           // idempotent
+        if (!t_.joinable()) { return; }
+        { std::lock_guard<std::mutex> g(mu_); stop_ = true; }
+        cv_.notify_all();
+        t_.join();                          // bounded: Loop() wakes at most every 100ms
+    }
+    HeartbeatThread(const HeartbeatThread&) = delete;
+    HeartbeatThread& operator=(const HeartbeatThread&) = delete;
+
+private:
+    void Loop() {
+        std::unique_lock<std::mutex> g(mu_);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto nextEmit = t0;
+        for (;;) {
+            // 100ms slices: keeps Stop()/join latency <=100ms so the normal exit path (:4907)
+            // does not pay up to one full interval per client invocation (10x5s = +50s).
+            cv_.wait_for(g, std::chrono::milliseconds(100), [this] { return stop_; });
+            if (stop_) { return; }
+            const auto now = std::chrono::steady_clock::now();
+            if (now < nextEmit) { continue; }
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
+            // stderr ONLY: stdout (.out) is what the assertion side greps; stderr goes to .err.
+            std::cerr << "[hb] t_ms=" << ms << " stage=" << stage_ << std::endl;
+            nextEmit = now + std::chrono::milliseconds(intervalMs_);
+        }
+    }
+
+    int intervalMs_ = 0;
+    std::thread t_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    const char* stage_ = "init";
+};
+
 struct ClientHashTask {
     std::string relPath;
     fs::path absPath;
@@ -585,9 +666,46 @@ int RunClient(const CliOptions& options) {
     //   re-enumerates and skips them via size+mtime compare (no in-memory carry-over).
     uint32_t reconnectAttemptsUsed = 0;
 
+    // Task ci-integration-test-timeout (design sections 3.8.2/3.10.4): env-only knobs, read
+    // once. Defaults keep the healthy path bit-for-bit unchanged; 0 disables each mechanism
+    // (rollback switches R-3/R-4). Naming follows the design doc ("g_idleTimeoutMs"); these
+    // are RunClient-locals, not globals.
+    const int g_idleTimeoutMs = [] {
+        if (const char* v = std::getenv("FASTCLONE_IDLE_TIMEOUT_MS")) {
+            if (v[0]) {
+                const int ms = std::atoi(v);
+                if (ms > 0) { return ms; }
+                if (ms == 0 && v[0] == '0') { return 0; }
+            }
+        }
+        return 120000;
+    }();
+    const int hbIntervalMs = [] {
+        if (const char* v = std::getenv("FASTCLONE_HB_INTERVAL_MS")) {
+            if (v[0]) {
+                const int ms = std::atoi(v);
+                if (ms > 0) { return ms; }
+                if (ms == 0 && v[0] == '0') { return 0; }
+            }
+        }
+        return 5000;
+    }();
+
+    // v2 (R-04 / gate H-9): constructed BEFORE the reconnect loop (design: :588, adjacent to
+    // reconnectAttemptsUsed) so ALL of RunClient's return paths -- :687 (connect/handshake
+    // catch), :4803 (reconnect-exhausted), :4907 (normal) -- unwind through the destructor
+    // (Stop+join, bounded <=100ms). A bare local std::thread would std::terminate() here.
+    HeartbeatThread hb(hbIntervalMs);
+    hb.SetStage("init");
+    EmitPhase("init");
+
     // ConnectTo + handshake failures (server not ready) reuse the same reconnect budget
     // as mid-session drops; see ScheduleClientReconnectOrExit().
     while (true) {
+    // Phase markers (task ci-integration-test-timeout, design section 3.8.3): main-thread
+    // only (gate H-7). attempt count is available in the [reconnect] log lines.
+    hb.SetStage("session_begin");
+    EmitPhase("session_begin");
     // Multipath connection pool (design section 4.2). pool[0] is the primary link.
     std::vector<std::unique_ptr<ClientConnection>> pool;
     std::string sessionId;
@@ -620,12 +738,22 @@ int RunClient(const CliOptions& options) {
             primaryPort = options.linkPins.front().port;
         }
         const auto rttConnectStart = std::chrono::steady_clock::now();
+        hb.SetStage("connect_begin");
+        EmitPhase("connect_begin");
         SocketHandle primarySocket = ConnectTo(primaryHost, primaryPort, primaryBinding);
         // TCP connect returns after the SYN/SYN-ACK exchange ~= one round trip, so this is a
         // close application-independent RTT estimate for the primary lane (design D-01).
         sessionRttMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - rttConnectStart).count());
+        // [phase] connect_ok without a following handshake_begin pins a stall inside
+        // ConnectTo itself (residual unbounded point FU-2, design R-10).
+        hb.SetStage("connect_ok");
+        EmitPhase("connect_ok", "rtt_ms=" + std::to_string(sessionRttMs));
+        hb.SetStage("handshake_begin");
+        EmitPhase("handshake_begin");
         const AuthOkInfo authInfo = HandshakeClientNew(primarySocket, options.password);
+        hb.SetStage("handshake_ok");
+        EmitPhase("handshake_ok");
         sessionId = authInfo.sessionId;
         deltaEnabled = (options.deltaMinSizeBytes > 0) &&
                        ((authInfo.capabilities & kCapDelta) != 0);
@@ -664,9 +792,13 @@ int RunClient(const CliOptions& options) {
             }
         }
         // Auxiliary lanes (best-effort; a failed lane is skipped, FR-016 / NFR-002).
+        hb.SetStage("aux_begin");
+        EmitPhase("aux_begin");
         std::vector<EstablishedLink> auxLinks = EstablishAuxiliaryConnections(
             options, sessionId, pool[0]->serverAddr, primaryLocal, primaryActualLocal,
             authInfo, debugEnabled, &probeMinRttMs);
+        hb.SetStage("aux_end");
+        EmitPhase("aux_end", "n=" + std::to_string(auxLinks.size()));
         for (auto& link : auxLinks) {
             auto conn = std::make_unique<ClientConnection>();
             conn->connId = static_cast<uint32_t>(pool.size());
@@ -748,6 +880,8 @@ int RunClient(const CliOptions& options) {
     // IT-3). This send precedes the recv threads / failover machinery, so it is handled here.
     try {
         SendFrame(primary.socket, Frame{MsgType::ManifestRequest, 0, {}});
+        hb.SetStage("manifest_req");
+        EmitPhase("manifest_req");
     } catch (const std::exception& ex) {
         for (auto& cptr : pool) {
             ShutdownBoth(cptr->socket);
@@ -1217,6 +1351,12 @@ int RunClient(const CliOptions& options) {
     std::atomic<bool> recvStop = false;
     std::atomic<bool> recvClosed = false;
     std::string recvError;
+    // v2 (R-02 / gate H-5): main-thread-owned abort latch for the bounded idle watchdog
+    // (design section 3.10). Declared INSIDE the while(reconnect session) loop, at the same
+    // level as recvStop/recvClosed/recvError, so every session starts with a clean false --
+    // hoisting it to RunClient scope would let a previous session's abort pollute the next
+    // (healthy) session straight into the reconnect path.
+    std::atomic<bool> idleAbort = false;
     // W-03/FR-08 signal: incremented (recv thread) every time recv backpressure actually sleeps, so
     // the active-cap controller can tell whether the receive side stalled during a sampling window.
     std::atomic<uint64_t> backpressureSleepCount{0};
@@ -3331,6 +3471,11 @@ int RunClient(const CliOptions& options) {
             }
         } else if (frame.type == MsgType::ManifestEnd) {
             manifestDone = true;
+            // Phase marker (task ci-integration-test-timeout, design section 3.8.3). This
+            // branch runs in processIncomingFrame, which is only ever invoked from the main
+            // loop (:4618) -- main thread, so hb.SetStage stays main-thread-only (gate H-7).
+            hb.SetStage("manifest_end");
+            EmitPhase("manifest_end");
         } else if (frame.type == MsgType::HashResponse) {
             auto value = DecodeHashResponse(frame.payload);
             {
@@ -4354,6 +4499,49 @@ int RunClient(const CliOptions& options) {
                 }
             }
 
+            // [RC-5b/c] Bounded idle watchdog (task ci-integration-test-timeout, design
+            // section 3.10, v2 R-02/R-03 / gate H-4: inserted AFTER the ctrlWorkOutstanding
+            // block, at main-loop top level).
+            // Progress clock = lastForwardProgressAt, which is maintained by the EXISTING
+            // updateStallWatchdog() (originally :3765). That lambda runs EXACTLY ONCE per
+            // main-loop iteration -- its 4 call sites cover every path that does not break --
+            // so this clock is genuinely per-iteration and its notion of "progress" is BROADER
+            // than anything we would write here (it also counts fallbackResolved /
+            // hashResponsesReceived / compareResultsHandled / dirTasksDone /
+            // loopHadForwardProgress).
+            // The main loop wakes at least every 2ms (sleep_for(1ms)/wait_for(1ms)/wait_for(2ms)),
+            // so this check cannot stall itself. 0 disables (FASTCLONE_IDLE_TIMEOUT_MS=0).
+            if (g_idleTimeoutMs > 0) {
+                const auto idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - lastForwardProgressAt).count();
+                if (idleMs > g_idleTimeoutMs) {
+                    std::cerr << "[wd] idle_detected idle_ms=" << idleMs
+                              << " manifest_done=" << (manifestDone ? 1 : 0)
+                              << " enum=" << enumerated << " transferred=" << transferred
+                              << " hash_inflight=" << (hashRequestsSent - hashResponsesReceived)
+                              << " active_downloads=" << activeDownloads.size() << std::endl;
+                    hb.SetStage("idle_abort");
+                    EmitPhase("idle_abort");
+                    // v2 (R-02 / gate H-6/H-7): latch the abort BEFORE breaking. Both writes
+                    // are MAIN-THREAD-ONLY (same ownership as failoverScan()'s recvError
+                    // writes), so there is no race with the recv threads. Relying on the
+                    // recv-thread latch (recvClosed/recvError) instead would race with the
+                    // immediate manifestComplete evaluation AND would not flip it when
+                    // manifestDone==true -- that path falls into RemoveLocalExtras and deletes
+                    // local files against a remote view we know is not final (worse than
+                    // hanging). idleAbort is folded into manifestComplete so the abort always
+                    // lands in the existing reconnect gate.
+                    recvError = "idle_watchdog_abort";   // becomes the reconnect reason below
+                    idleAbort.store(true);
+                    dirStop.store(true);
+                    dirTaskCv.notify_all();
+                    recvStop.store(true);
+                    incomingDataCv.notify_all();
+                    for (auto& cptr : pool) { ShutdownBoth(cptr->socket); }
+                    break;
+                }
+            }
+
             // WAN parallelism failure-rate backoff (design section 3.3, FR-13 / NFR-04 / B8): on a
             // weak SSD/controller failure spike, halve the effective stream count (floor 4) so
             // the session self-heals without the user manually downgrading (NFR-06). No-op on LAN and
@@ -4494,6 +4682,10 @@ int RunClient(const CliOptions& options) {
                 pendingRetryTransfers.empty() && pendingRetryBatchTransfers.empty() &&
                 activeDownloads.empty() && activeBatchDownloads.empty() && allHashDone &&
                 ioOutstanding == 0 && deltaIdle && fileRangeIdle) {
+                // Phase marker (task ci-integration-test-timeout, design section 3.8.3): the
+                // completion-condition exit is the NORMAL end of a healthy session.
+                hb.SetStage("transfer_end");
+                EmitPhase("transfer_end");
                 break;
             }
             const bool needNetworkFrame = !manifestDone || !activeDownloads.empty() || !activeBatchDownloads.empty() ||
@@ -4603,6 +4795,8 @@ int RunClient(const CliOptions& options) {
                                            incomingManifestFrames.empty();
                 }
                 if (recvDrainedAndClosed) {
+                    hb.SetStage("transfer_end");
+                    EmitPhase("transfer_end");
                     break;
                 }
                 // MUST be outside the incomingMu scope above: updateStallWatchdog()'s warn
@@ -4671,12 +4865,21 @@ int RunClient(const CliOptions& options) {
     ioStop.store(true);
     ioTaskCv.notify_all();
     comparePipeline.Join();
+    // Phase markers (task ci-integration-test-timeout, design section 3.8.3): join-site
+    // markers, so a stall in the teardown joins is immediately attributable (D-06 keeps
+    // the join semantics unchanged -- markers only).
+    hb.SetStage("join_hash");
+    EmitPhase("join_hash");
     for (auto& w : hashWorkers) {
         JoinDiag(w, "client-hash");
     }
+    hb.SetStage("join_delta");
+    EmitPhase("join_delta");
     for (auto& w : deltaPlanWorkers) {
         JoinDiag(w, "client-delta-plan");
     }
+    hb.SetStage("join_io");
+    EmitPhase("join_io");
     for (auto& w : ioWorkers) {
         JoinDiag(w, "client-io");
     }
@@ -4684,7 +4887,15 @@ int RunClient(const CliOptions& options) {
     // Manifest completeness gate (used both for the deferred directory creation below
     // and the deletion guard further down). A partial manifest (dropped connection /
     // no ManifestEnd) must neither create nor delete against an incomplete remote view.
-    const bool manifestComplete = manifestDone && recvError.empty() && !recvClosed.load();
+    // v2 (R-02 / gate H-6): idleAbort is folded in EXPLICITLY. Without it, the watchdog's
+    // `break` on a manifestDone==true session -- the primary stall shape (e.g.
+    // hashRequestsSent != hashResponsesReceived never resolving) -- would evaluate
+    // manifestComplete==true and fall through to RemoveLocalExtras below, i.e. it would
+    // DELETE local files against a remote view we know is not final. That is worse than
+    // hanging. With idleAbort folded in, the abort always lands in the existing reconnect
+    // gate. Same-thread read (main loop wrote it before break) -- no cross-thread timing.
+    const bool manifestComplete =
+        manifestDone && recvError.empty() && !recvClosed.load() && !idleAbort.load();
 
     if (diagnostics) {
         int64_t mtimeDeltaP50 = 0, mtimeDeltaP95 = 0, mtimeDeltaP99 = 0, mtimeDeltaMax = 0;
@@ -4800,6 +5011,8 @@ int RunClient(const CliOptions& options) {
         if (const std::optional<int> exitCode = ScheduleClientReconnectOrExit(
                 disconnectReason, options.reconnectRetries, reconnectAttemptsUsed,
                 /*exitWhenDisabled=*/kExitIncompleteNoReconnect)) {
+            hb.SetStage("exit");
+            EmitPhase("exit", "code=" + std::to_string(*exitCode));
             return *exitCode;
         }
         continue;
@@ -4877,12 +5090,16 @@ int RunClient(const CliOptions& options) {
     }
     dirStop.store(true);
     dirTaskCv.notify_all();
+    hb.SetStage("join_dir");
+    EmitPhase("join_dir");
     for (auto& w : dirWorkers) {
         JoinDiag(w, "client-dir");
     }
     PrintClientCounters(enumerated, compared, unchanged, failed, transferred, deleted, pool.size(), lastEnum, lastCompared, lastUnchanged, lastFailed, lastTransferred, lastDeleted, true);
     // SyncDone is sent on every live lane so each per-connection server session (D-02)
     // terminates cleanly; auxiliary lanes that already failed are skipped.
+    hb.SetStage("sync_done");
+    EmitPhase("sync_done");
     for (auto& cptr : pool) {
         if (cptr->healthy.load()) {
             try {
@@ -4897,6 +5114,8 @@ int RunClient(const CliOptions& options) {
     for (auto& cptr : pool) {
         ShutdownBoth(cptr->socket);
     }
+    hb.SetStage("join_recv");
+    EmitPhase("join_recv");
     for (auto& cptr : pool) {
         JoinDiag(cptr->recvThread, "client-recv-final");
     }
@@ -4904,6 +5123,8 @@ int RunClient(const CliOptions& options) {
     std::cout << "Sync completed. changed_files=" << transferred
               << " failed_files=" << failed
               << " elapsed=" << formatElapsed() << std::endl;
+    hb.SetStage("exit");
+    EmitPhase("exit", "code=" + std::to_string(success ? kExitOk : kExitFailedFiles));
     return success ? kExitOk : kExitFailedFiles;
     }  // while (reconnect session)
 }

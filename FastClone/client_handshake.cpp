@@ -32,6 +32,9 @@ void NegotiateHelloAsServer(const SocketHandle& socket) {
 
 // Client side: Hello negotiation (FR-018 / AC-013). Throws on mismatch / server error.
 void NegotiateHelloAsClient(const SocketHandle& socket) {
+    // Wrap site 1/5 (task ci-integration-test-timeout, gate H-10): bounds the HelloBack recv.
+    // SAVE/RESTORE guard: safe to nest inside the enclosing HandshakeClient* guards.
+    HandshakeRecvGuard guard(socket);
     SendSimple(socket, MsgType::Hello, kProtocolVersion);
     Frame helloBack = RecvFrame(socket);
     if (helloBack.type == MsgType::Error) {
@@ -50,6 +53,10 @@ void NegotiateHelloAsClient(const SocketHandle& socket) {
 // Client first connection: Hello -> Auth -> AuthOk(NewSession). Returns the session
 // identity + server-advertised endpoint list (design section 3.2 / FR-003/005/017).
 AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& password) {
+    // Wrap site 2/5 (task ci-integration-test-timeout, gate H-10): the outer guard keeps the
+    // 30s bound armed across BOTH the nested NegotiateHelloAsClient (HelloBack) AND the
+    // AuthOk recv below (v1 left AuthOk unbounded: the inner guard's dtor reset to 0).
+    HandshakeRecvGuard guard(socket);
     NegotiateHelloAsClient(socket);
     // The Auth claim carries the client capability byte + extension string after the bare
     // password (T-largefile-block-multinic, D-02): the server parses the trailing fields
@@ -77,6 +84,10 @@ AuthOkInfo HandshakeClientNew(const SocketHandle& socket, const std::string& pas
 // FastCheck read-only session handshake (fastcheck): Hello -> CheckAuth(password) -> AuthOk(NewSession).
 // The server, after parsing in the CheckAuth branch of HandshakeAndResolveSession, returns a SessionType::Check session.
 AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& password) {
+    // Wrap site 3/5 (task ci-integration-test-timeout, gate H-10): FastCheck path (ctest #4,
+    // clone_check_consistency). v1 missed this entirely; covers HelloBack + the CheckAuth
+    // AuthOk reply.
+    HandshakeRecvGuard guard(socket);
     NegotiateHelloAsClient(socket);
     CheckAuthInfo checkAuth;
     checkAuth.password = password;
@@ -101,6 +112,9 @@ AuthOkInfo HandshakeClientCheck(const SocketHandle& socket, const std::string& p
 // Client follow-up connection: Hello -> SessionJoin(sessionId,pwd) -> AuthOk(JoinAck).
 void HandshakeClientJoin(const SocketHandle& socket, const std::string& password,
                          const std::string& sessionId) {
+    // Wrap site 4/5 (task ci-integration-test-timeout, gate H-10): keeps the bound armed
+    // across HelloBack AND the JoinAck recv below (aux lanes).
+    HandshakeRecvGuard guard(socket);
     NegotiateHelloAsClient(socket);
     SessionJoinInfo join;
     join.sessionId = sessionId;

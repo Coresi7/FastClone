@@ -54,18 +54,100 @@ function Resolve-FastCloneExe {
     throw "FastClone.exe not found; pass -ExePath"
 }
 
-function Stop-AllFastClone {
-    Get-Process FastClone -ErrorAction SilentlyContinue | ForEach-Object {
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+# ---------------------------------------------------------------------------
+# Task ci-integration-test-timeout (design section 3.6/3.7): PID-scoped cleanup + 480s
+# global deadline. This script has NO Invoke-FastCloneSync/Wait-ExitCode/cmd-c path and its
+# big WaitForExit(900000) stays untouched (RC-7 known boundary, annotated below).
+# ---------------------------------------------------------------------------
+
+# [I-2] Global wall-clock budget (diagnostic reserve; ctest TIMEOUT is 600 here).
+$script:FcDeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds(480)
+
+function Get-FcRemainingSec {
+    param([int]$ReserveSec = 30)
+    $r = ($script:FcDeadlineUtc - (Get-Date).ToUniversalTime()).TotalSeconds - $ReserveSec
+    if ($r -lt 0) { $r = 0 }
+    return [int][Math]::Floor($r)
+}
+
+# [FR-03] PID registry: only processes THIS script started.
+$script:FcOwnedPids = @{}
+
+function Register-OwnedProcess {
+    param([System.Diagnostics.Process]$Proc, [string]$Tag)
+    $script:FcOwnedPids[[int]$Proc.Id] = $Tag
+    return $Proc
+}
+
+function Stop-OwnedFastClone {
+    foreach ($pidKey in @($script:FcOwnedPids.Keys)) {
+        $p = Get-Process -Id $pidKey -ErrorAction SilentlyContinue
+        # [FR-03] PID-reuse guard: a recycled PID may now belong to an unrelated process.
+        # Only kill it if it is still FastClone.
+        if ($p -and $p.ProcessName -eq 'FastClone') {
+            Stop-Process -Id $pidKey -Force -ErrorAction SilentlyContinue
+        }
     }
-    # D-04: poll until this script's port is free (~3s) so a re-run avoids a stale listener /
-    # TIME_WAIT residue (root cause of file_range bind WSA=10048).
-    for ($i = 0; $i -lt 12; $i++) {
-        $busy = netstat -ano | Select-String -Pattern ":$Port " -SimpleMatch
-        if (-not $busy) { break }
+    $script:FcOwnedPids = @{}
+}
+
+function Get-PortHolders {
+    param([int]$PortNum)
+    $rows = @()
+    foreach ($l in (netstat -ano | Select-String -Pattern ":$PortNum " -SimpleMatch)) {
+        $f = ($l.Line -split '\s+') | Where-Object { $_ -ne '' }
+        if ($f.Count -ge 5) {
+            $rows += [pscustomobject]@{
+                Proto = $f[0]; Local = $f[1]; Remote = $f[2]; State = $f[3]; Pid = [int]$f[4]
+            }
+        }
+    }
+    return $rows
+}
+
+function Wait-PortFree {
+    param([int]$PortNum, [int]$TimeoutSec = 15)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        # Only a LISTENING socket on the local port actually blocks the next bind.
+        # TIME_WAIT entries (usually the CLIENT side of a previous connection, whose REMOTE
+        # column matches ":port") do NOT block bind -- waiting for them to clear would cost
+        # the full 15s per sub-case on the healthy path (observed +130s on file_range).
+        $blocking = @(Get-PortHolders -PortNum $PortNum | Where-Object { $_.State -eq 'LISTENING' })
+        if ($blocking.Count -eq 0) { return $true }
+        # A non-FastClone LISTENING holder will not go away by waiting (F-2 observed
+        # 3x15s of dead waiting on a foreign holder): bail out immediately with the
+        # caller's warning instead of burning the budget. Only a FastClone holder
+        # (e.g. just killed by the port-scoped cleanup) can be expected to release.
+        $fcHeld = $false
+        foreach ($b in $blocking) {
+            $bp = Get-Process -Id $b.Pid -ErrorAction SilentlyContinue
+            if ($bp -and $bp.ProcessName -eq 'FastClone') { $fcHeld = $true; break }
+        }
+        if (-not $fcHeld) { return $false }
         Start-Sleep -Milliseconds 250
     }
-    Start-Sleep -Milliseconds 700
+    return $false
+}
+
+function Stop-AllFastClone {
+    # [FR-03] Only processes THIS script started. The old implementation
+    # (`Get-Process FastClone | Stop-Process -Force`) was a name-global kill that can
+    # terminate unrelated FastClone processes on a shared build agent (RC-3).
+    Stop-OwnedFastClone
+    # Defensive, PORT-SCOPED fallback: a process we do not own but that holds OUR port would
+    # break the next bind. Kill only that PID and log it (never a name-global sweep).
+    foreach ($h in (Get-PortHolders -PortNum $Port)) {
+        $p = Get-Process -Id $h.Pid -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -eq 'FastClone') {
+            Write-Host "[CLEANUP] killing non-owned FastClone pid=$($h.Pid) state=$($h.State) holding port $Port"
+            Stop-Process -Id $h.Pid -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
+        Write-Host "[CLEANUP][warn] port $Port still not free after 15s:"
+        (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
 }
 
 function New-SparseFile {
@@ -155,6 +237,7 @@ try {
         -RedirectStandardError  (Join-Path $logs "server.err") `
         -PassThru -NoNewWindow
     $null = $srv.Handle
+    $null = Register-OwnedProcess -Proc $srv -Tag "server"
     Start-Sleep -Seconds 2
     if ($srv.HasExited) { throw "server exited early; see $logs\server.err" }
 
@@ -189,6 +272,7 @@ try {
             -RedirectStandardError  (Join-Path $logs ("client_$Stage.err")) `
             -PassThru -NoNewWindow
         $null = $cli.Handle
+        $null = Register-OwnedProcess -Proc $cli -Tag "client_$Stage"
 
         $peakPriv = 0.0
         $peakWork = 0.0
@@ -202,6 +286,15 @@ try {
         }
 
         if ($LetFinish) {
+            # RC-7 (KNOWN BOUNDARY, intentionally NOT fixed by task ci-integration-test-timeout):
+            # this WaitForExit budget is 900s, which is LONGER than the ctest timeout (600s). If
+            # the client ever stalls here, ctest hard-kills the whole powershell process, so
+            # neither the catch block nor any diagnostic below ever runs -- the exact failure
+            # mode that made #2/#6/#9 un-diagnosable. Out of scope here (requirements §7/§11
+            # RC-7: "本任务不强制修，须如实标注"); tracked as a follow-up. This task only adds the
+            # pre-wait marker so a future stall is at least timestamped.
+            $elapsed = if ($sw) { [math]::Round($sw.Elapsed.TotalSeconds, 1) } else { -1 }
+            Write-Host "[rc7] entering WaitForExit(900000) pid=$($cli.Id) elapsed_s=$elapsed"
             $null = $cli.WaitForExit(900000)
             Write-Host ("  {0}: client exit={1}" -f $Stage, $cli.ExitCode)
         } elseif (-not $cli.HasExited) {
