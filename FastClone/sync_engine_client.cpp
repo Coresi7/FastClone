@@ -737,9 +737,12 @@ int RunClient(const CliOptions& options) {
             primaryHost = options.linkPins.front().server;
             primaryPort = options.linkPins.front().port;
         }
-        const auto rttConnectStart = std::chrono::steady_clock::now();
+        // EmitPhase flushes std::cerr synchronously (~5ms, spikes higher under load): keep it
+        // OUTSIDE the connect-RTT window (b535564 semantics) or the WAN threshold misjudges
+        // (FR-A root cause, task ci-integration-test-timeout). Still before ConnectTo.
         hb.SetStage("connect_begin");
         EmitPhase("connect_begin");
+        const auto rttConnectStart = std::chrono::steady_clock::now();
         SocketHandle primarySocket = ConnectTo(primaryHost, primaryPort, primaryBinding);
         // TCP connect returns after the SYN/SYN-ACK exchange ~= one round trip, so this is a
         // close application-independent RTT estimate for the primary lane (design D-01).
