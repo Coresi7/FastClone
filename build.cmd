@@ -22,7 +22,10 @@ set "VCVARS=%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat"
 set "CMAKEBIN=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
 set "NINJABIN=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
 set "LLVMBIN=%VSROOT%\VC\Tools\Llvm\x64\bin"
-set "XXHASH=C:/xxHash-install"
+rem xxhash static lib prefix is per-arch: x64 -> C:/xxHash-install, arm64 -> C:/xxHash-install-arm64.
+rem Selected after ARCH is parsed below (see XXHASH_X64 / XXHASH_ARM64 + selection block).
+set "XXHASH_X64=C:/xxHash-install"
+set "XXHASH_ARM64=C:/xxHash-install-arm64"
 
 set "TC=msvc"
 set "CFG=Release"
@@ -49,6 +52,13 @@ if /i "%ARCH%"=="x64" (
 ) else (
     echo [build] unknown arch "%ARCH%" ^(use x64 / arm64 / x86^)
     exit /b 2
+)
+
+rem --- xxhash prefix by target arch (must match how the lib was built) --------
+if /i "%ARCH%"=="arm64" (
+    set "XXHASH=%XXHASH_ARM64%"
+) else (
+    set "XXHASH=%XXHASH_X64%"
 )
 
 if not exist "%VCVARS%" (

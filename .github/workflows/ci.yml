@@ -7,7 +7,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master]
 
 permissions:
   contents: read
@@ -37,10 +37,20 @@ jobs:
 
       - name: Configure FastClone
         shell: bash
+        # Windows must use the Ninja generator explicitly: the default generator
+        # on windows-latest is Visual Studio 2026, under which ctest -N lists 0
+        # tests (Testing/ metadata never generated) so CI can go green while
+        # running nothing. Ninja is a single-config generator, so no -C flag.
         run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
+          else
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
+          fi
 
       - name: Build
         shell: bash
@@ -48,7 +58,55 @@ jobs:
 
       - name: Test (ctest)
         shell: bash
-        run: ctest --test-dir build --output-on-failure -C Release
+        # Ninja is single-config; -C <cfg> is ignored/invalid there, so omit it.
+        run: ctest --test-dir build --output-on-failure
+
+  # Windows ARM64 cross-build (build-only). The x64-hosted runner cannot execute
+  # ARM64 binaries, so this job intentionally has NO test step:
+  # cross-compiled on x64 host; no test coverage by design.
+  windows-arm64:
+    name: windows-arm64 (build only)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (amd64_arm64 cross env)
+        # ilammy/msvc-dev-cmd configures the vs dev environment for the given
+        # target arch and exports it into subsequent steps' PATH/INCLUDE/LIB.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Setup xxHash (static, ARM64)
+        # Build an ARM64-targeted static xxHash from source so the FastClone ARM64
+        # link has a matching-machine library. Installed to a separate prefix so
+        # the x64 job's /tmp/xxHash-install is never touched.
+        shell: cmd
+        run: |
+          git clone --depth 1 --branch v0.8.3 https://github.com/Cyan4973/xxHash.git C:\xxHash-src || exit /b 1
+          cmake -S C:\xxHash-src\cmake_unofficial -B C:\xxHash-build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=C:\xxHash-install-arm64 || exit /b 1
+          cmake --build C:\xxHash-build-arm64 --parallel || exit /b 1
+          cmake --install C:\xxHash-build-arm64 || exit /b 1
+          echo CMAKE_PREFIX_PATH=C:\xxHash-install-arm64>> "%GITHUB_ENV%"
+
+      - name: Configure FastClone (ARM64, Ninja)
+        shell: cmd
+        # The msvc-dev-cmd step already put the ARM64 cross compiler (Hostx64/arm64
+        # cl.exe) on PATH; Ninja keeps the build single-config like the x64 job.
+        run: cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CMAKE_PREFIX_PATH%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
+
+      - name: Build (ARM64, no test)
+        shell: cmd
+        run: cmake --build build-arm64 --parallel || exit /b 1
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastClone-windows-arm64
+          path: |
+            build-arm64/FastClone.exe
+            build-arm64/FastCheck.exe
 
   # Linux sanitizer job (design §6): independent Debug + ASan/UBSan build.
   sanitizers:
@@ -87,4 +145,5 @@ jobs:
 
       - name: Test (ctest)
         shell: bash
-        run: ctest --test-dir build-san --output-on-failure -C Debug
+        # Ninja is single-config; -C <cfg> is ignored/invalid there, so omit it.
+        run: ctest --test-dir build-san --output-on-failure
