@@ -15,6 +15,6 @@
 
 namespace fc {
 
-constexpr const char* kFastCloneVersion = "1.0.0";
+constexpr const char* kFastCloneVersion = "1.0.71";
 
 }  // namespace fc
