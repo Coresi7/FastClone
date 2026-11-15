@@ -35,6 +35,17 @@ jobs:
           cmake --install /tmp/xxHash/build --config Release
           echo "CMAKE_PREFIX_PATH=/tmp/xxHash-install" >> "$GITHUB_ENV"
 
+      - name: Setup MSVC (x64, Windows only)
+        # Same mechanism as the windows-arm64 job (L74-79): load the VS developer environment so
+        # cl.exe / link.exe and the Windows SDK import libs are exported to the following steps.
+        # Without it, git-bash's PATH makes CMake pick C:/mingw64/bin/c++.exe (GNU 15.2.0) while
+        # Setup xxHash produced an MSVC xxhash.lib -> mixed toolchain + single-pass mingw ld,
+        # which is exactly run 41008618624. No-op on Linux/macOS.
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure FastClone
         shell: bash
         # Windows must use the Ninja generator explicitly: the default generator
@@ -45,12 +56,34 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER=cl \
               -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
           else
             cmake -S . -B build \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
           fi
+
+      - name: Assert MSVC toolchain (Windows only)
+        # B-05 guard: prove the selected toolchain is MSVC and fail loud here, instead of
+        # degrading into link-time "undefined reference" noise from a mingw fallback.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(build/CMakeFiles/*/CMakeCXXCompiler.cmake)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no build/CMakeFiles/*/CMakeCXXCompiler.cmake (configure did not run)"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            if ! grep -q 'set(CMAKE_CXX_COMPILER_ID "MSVC")' "$f"; then
+              echo "::error::expected MSVC on windows-latest, got: $(grep -m1 'set(CMAKE_CXX_COMPILER_ID' "$f") [$f]"
+              exit 1
+            fi
+          done
+          echo "MSVC toolchain confirmed: ${files[*]}"
 
       - name: Build
         shell: bash

@@ -259,7 +259,9 @@ message(STATUS "FastClone: xxhash include=${FC_XXHASH_INCLUDE_DIRS} lib=${FC_XXH
 # only executable targets received the include directory. On a clean environment (vcvars
 # reset INCLUDE, no cl.exe fallback) that left library TUs with a fatal C1083; the old
 # builds only passed because cl.exe fell back to the INCLUDE env var. Libraries need the
-# header path only — they do not link xxhash (the symbol is pulled in by the exe).
+# header path; the xxHash link itself is declared on fc_core as an INTERFACE dependency
+# (see below) — single-pass linkers require the archive before the library, multi-pass
+# linkers (Apple ld64, MSVC link.exe) are order-insensitive.
 # Defined HERE, before the library targets below, because CMake requires a function to be
 # defined before it is called.
 function(fc_apply_xxhash_includes tgt)
@@ -292,6 +294,13 @@ target_include_directories(fc_core PRIVATE FastClone)
 # P0-1: fc_core sources (delta.cpp, file_index.cpp) #include "xxhash.h"; give the library
 # target the xxhash header path so a clean environment (no INCLUDE fallback) compiles it.
 fc_apply_xxhash_includes(fc_core)
+# xxHash is referenced ONLY by fc_core's own objects (file_index.cpp / delta.cpp call
+# XXH3_*/XXH128_*), so the dependency is declared on the target that needs it, as an INTERFACE
+# link dependency. CMake then emits the xxHash archive AFTER libfc_core.a on every consumer's
+# link line, which is what single-pass linkers require (GNU ld.bfd / mingw ld drop archive
+# members nobody referenced yet). Multi-pass linkers (Apple ld64, MSVC link.exe) are
+# order-insensitive, so this stays neutral for them.
+target_link_libraries(fc_core INTERFACE ${FC_XXHASH_LIBRARIES})
 
 # fc_sync: FastClone transfer engine only.
 add_library(fc_sync STATIC
@@ -317,19 +326,19 @@ target_include_directories(fc_check PRIVATE FastClone FastCheck)
 fc_apply_xxhash_includes(fc_check)
 
 # Single configure entry point for every final target (design §4.3). Consumes the
-# already-resolved xxhash result; applies include dirs, Threads, platform macros and
-# system libraries uniformly so the four duplicated target_* blocks collapse to one.
+# already-resolved xxhash result; applies include dirs, link dirs, compile options,
+# Threads and platform macros uniformly so the four duplicated target_* blocks collapse
+# to one. It does not link xxHash here — fc_core's INTERFACE dependency (above) already
+# provides it after libfc_core.a on every consumer's link line.
 function(fc_configure_target tgt)
     target_include_directories(${tgt} PRIVATE ${CMAKE_SOURCE_DIR}/FastClone ${CMAKE_SOURCE_DIR}/FastCheck)
     target_link_libraries(${tgt} PRIVATE Threads::Threads)
     if(XXHASH_FOUND)
         target_include_directories(${tgt} PRIVATE ${FC_XXHASH_INCLUDE_DIRS})
         target_link_directories(${tgt} PRIVATE ${FC_XXHASH_LIBRARY_DIRS})
-        target_link_libraries(${tgt} PRIVATE ${FC_XXHASH_LIBRARIES})
         target_compile_options(${tgt} PRIVATE ${FC_XXHASH_CFLAGS})
     else()
         target_include_directories(${tgt} PRIVATE ${FC_XXHASH_INCLUDE_DIRS})
-        target_link_libraries(${tgt} PRIVATE ${FC_XXHASH_LIBRARIES})
     endif()
     if(WIN32)
         target_compile_definitions(${tgt} PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
