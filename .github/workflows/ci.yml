@@ -56,11 +56,13 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
+              -DFC_VERSION_FREEZE=ON \
               -DCMAKE_CXX_COMPILER=cl \
               -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
           else
             cmake -S . -B build \
               -DCMAKE_BUILD_TYPE=Release \
+              -DFC_VERSION_FREEZE=ON \
               -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
           fi
 
@@ -93,6 +95,37 @@ jobs:
         shell: bash
         # Ninja is single-config; -C <cfg> is ignored/invalid there, so omit it.
         run: ctest --test-dir build --output-on-failure
+
+      # Package (install→archive) — runs only after ctest is green (post-test
+      # gating). The helper reads RUNNER_TEMP / GITHUB_* from os.environ itself
+      # (D-10), so no absolute path ever crosses a bash/cmd argv: no MSYS path
+      # rewriting, no quoting surface. Windows uses `python`, Linux/macOS use
+      # `python3` (both ship on the hosted images; no setup-python, no new
+      # action). Any non-zero exit fails the job (zero continue-on-error).
+      - name: Package (install→archive)
+        id: pkg
+        if: success()
+        shell: bash
+        env:
+          FC_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || (runner.os == 'Linux' && 'linux' || 'macos') }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python scripts/package_ci.py package --build-dir ./build --platform "$FC_PLATFORM" --kind native --tests passed
+          else
+            python3 scripts/package_ci.py package --build-dir ./build --platform "$FC_PLATFORM" --kind native --tests passed
+          fi
+
+      # Upload consumes only the validated outputs (Actions evaluates them in
+      # `with:`; they never pass through a shell). if-no-files-found: error
+      # makes a missing manifest a hard failure — a partial package is never
+      # reported as success (D-13).
+      - name: Upload package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.artifact_name }}
+          path: ${{ steps.pkg.outputs.dist_glob }}
+          if-no-files-found: error
 
   # Windows ARM64 cross-build (build-only). The x64-hosted runner cannot execute
   # ARM64 binaries, so this job intentionally has NO test step:
@@ -127,19 +160,31 @@ jobs:
         shell: cmd
         # The msvc-dev-cmd step already put the ARM64 cross compiler (Hostx64/arm64
         # cl.exe) on PATH; Ninja keeps the build single-config like the x64 job.
-        run: cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CMAKE_PREFIX_PATH%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
+        run: cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CMAKE_PREFIX_PATH%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DFC_VERSION_FREEZE=ON || exit /b 1
 
       - name: Build (ARM64, no test)
         shell: cmd
         run: cmake --build build-arm64 --parallel || exit /b 1
 
-      - name: Upload ARM64 artifact
+      # Package (cross) — 04-design-v2 §3.7 / 05-gate §4.2.4: install the two
+      # production targets into a private RUNNER_TEMP stage, prove ARM64 from
+      # the PE headers (0xAA64), record on_target=false / cross-build-only, and
+      # replace the old bare two-exe upload with the versioned archive package.
+      # The helper reads RUNNER_TEMP/GITHUB_* itself (D-10); relative
+      # --build-dir only, so the cmd shell never touches an absolute path.
+      - name: Package (cross)
+        id: pkg
+        if: success()
+        shell: cmd
+        run: python scripts\package_ci.py package --build-dir build-arm64 --platform windows --kind cross --expected-arch arm64 --tests cross-build-only || exit /b 1
+
+      - name: Upload package
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: FastClone-windows-arm64
-          path: |
-            build-arm64/FastClone.exe
-            build-arm64/FastCheck.exe
+          name: ${{ steps.pkg.outputs.artifact_name }}
+          path: ${{ steps.pkg.outputs.dist_glob }}
+          if-no-files-found: error
 
   # Linux sanitizer job (design §6): independent Debug + ASan/UBSan build.
   sanitizers:
@@ -168,6 +213,7 @@ jobs:
         run: |
           cmake -S . -B build-san \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DFC_VERSION_FREEZE=ON \
             -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
             -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.san }}" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.san }}"

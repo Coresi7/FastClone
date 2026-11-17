@@ -31,6 +31,10 @@ include(GNUInstallDirs)
 # kFastCloneVersion = "..."; }) is preserved, so all consumers and the regex parse below keep
 # working unchanged. Known side effect: version.h is rewritten every configure, so the working
 # tree shows dirty continuously; the user decides when to commit (this build never commits).
+# --- CI version freeze (17-design §3.1): default OFF; ON is CI-explicit only ---
+# ON: take kFastCloneVersion verbatim from the committed FastClone/version.h (strict
+# quoted MAJOR.MINOR.PATCH, FATAL on missing/invalid); no +1, no .fcversion, no rewrite.
+option(FC_VERSION_FREEZE "CI version freeze: use committed FastClone/version.h verbatim (no auto-increment, no .fcversion, no version.h rewrite)" OFF)
 set(FC_VERSION_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/FastClone/version.h")
 set(FC_VERSION_COUNTER_FILE "${CMAKE_CURRENT_SOURCE_DIR}/.fcversion")
 
@@ -50,6 +54,17 @@ function(fc_split_version _in _maj _min _pat)
 endfunction()
 
 # 1) Determine the base version and the counter, per scenario.
+if(FC_VERSION_FREEZE)
+  if(NOT EXISTS "${FC_VERSION_HEADER}")                        # 缺头 → FATAL（FR-13）
+    message(FATAL_ERROR "FC_VERSION_FREEZE=ON: version header not found: ${FC_VERSION_HEADER}")
+  endif()
+  file(READ "${FC_VERSION_HEADER}" _fc_frozen_header)          # 只读，不碰 git/.fcversion
+  if(NOT _fc_frozen_header MATCHES "kFastCloneVersion[ \t]*=[ \t]*\"([0-9]+\\.[0-9]+\\.[0-9]+)\"")
+    message(FATAL_ERROR "FC_VERSION_FREEZE=ON: kFastCloneVersion must be a quoted MAJOR.MINOR.PATCH (no fallback/counter)")
+  endif()
+  set(FC_NEW_VERSION "${CMAKE_MATCH_1}")                       # 无 +1、无 counter
+  message(STATUS "Auto-version: frozen ${FC_NEW_VERSION} from committed version.h")
+else()
 if(EXISTS "${FC_VERSION_COUNTER_FILE}")
     # ---- Local development: base + counter come from .fcversion; version.h is output only. ----
     # Read the whole file and extract base=/counter= with two regexes (no foreach: foreach body
@@ -138,6 +153,7 @@ if(_fc_have_old GREATER_EQUAL 0)
     else()
         message(STATUS "Auto-version: version.h already at ${FC_NEW_VERSION}; no change")
     endif()
+endif()
 endif()
 
 set(FASTCLONE_VERSION "${FC_NEW_VERSION}")
