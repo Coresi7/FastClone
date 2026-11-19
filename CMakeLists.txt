@@ -527,7 +527,9 @@ if(WIN32)
                 -Port 27896
                 -BindLoopback
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-    set_tests_properties(once_multi_integration PROPERTIES TIMEOUT 600)
+    # ci-once-multi-test-budget (design 03 section 3.7): 1500 = SCRIPT_SUITE_DEADLINE 1320
+    # + DIAG_RESERVE 180, so a hard kill can never eat the catch/diag block (#58 lesson).
+    set_tests_properties(once_multi_integration PROPERTIES TIMEOUT 1500)
 
     add_test(NAME once_server_integration
         COMMAND powershell -ExecutionPolicy Bypass

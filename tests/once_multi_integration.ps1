@@ -1,6 +1,7 @@
 # FastClone --once-multi (multi-session idle-grace server) integration tests (Windows).
 # Usage: .\tests\once_multi_integration.ps1 [-ExePath path\to\FastClone.exe] [-Port 27894]
-# Creates small/large temp fixtures; always kills FastClone processes on exit.
+#            [-Case OM-1,OM-2,...]   # default: all six scenarios (ctest behavior unchanged)
+# Creates small/large temp fixtures; always kills the FastClone processes it started.
 #
 # Covers (design §9.2 / requirements AC-08..16):
 #   OM-1 sequential   -> server stays up between two real sessions, exits 0 after idle-grace
@@ -11,13 +12,20 @@
 #                        (AC-14 / B5)
 #   OM-5 probe/never  -> (a) probes during grace do not reset it; (b) probe-only never idle-exits
 #                        (AC-11 / AC-12)
+#
+# Task ci-once-multi-test-budget: per-case budget skeleton + frame-gate OM-4 abort
+# (design 10 sections 4.1-4.6, gate 11 section 4 C1..C11, contract 12). A `-Case` subset run
+# (e.g. -Case OM-4) is a LOCAL REPEAT vehicle only and must never be reported as a
+# full-suite pass.
 
 param(
     [string]$ExePath = "",
     [int]$Port = 27894,
     # Test-only: when set (ctest passes -BindLoopback on), the server binds ::1 instead of ::
     # so external LAN/WAN traffic cannot flood its single session (OM-4 flaky root cause).
-    [switch]$BindLoopback
+    [switch]$BindLoopback,
+    # [3.8] Scenario subset filter. Default = all six (ctest invocation unchanged).
+    [string[]]$Case = @('OM-1', 'OM-2', 'OM-3', 'OM-4', 'OM-5a', 'OM-5b')
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,49 +35,143 @@ $ErrorActionPreference = "Stop"
 $bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
 # ---------------------------------------------------------------------------
-# Task ci-integration-test-timeout: global bounded-execution skeleton (design sections
-# 3.4/3.5/3.12/3.13). Canonical implementation; the same block is copied into every
-# integration script (N3: no shared dot-source module).
+# Task ci-once-multi-test-budget: shared support module (design 03 section 3.2). Budget,
+# bounded-wait, incremental log parsing and the OM-4 abort-gate decision live there so the
+# isolated harness (tests/test_once_multi_test_support.ps1) drives the REAL functions under
+# an injected fake clock. The other integration scripts keep their self-contained skeletons
+# (their 480/600 budget structure is untouched by this task); once_multi is the only script
+# re-based because it is the only one whose budget structure changed.
+. "$PSScriptRoot\once_multi_test_support.ps1"
+
 # ---------------------------------------------------------------------------
-
-# [I-2] Global wall-clock budget. ctest hard-kills at 600s, and a hard-kill means neither the
-# catch block nor any diagnostic ever runs -- which is exactly why #2/#6/#9 produced nothing
-# but "(Timeout)" on build #58. Aborting at 480s leaves 120s for the diagnostic dump + cleanup.
-$script:FcDeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds(480)
-
-function Get-FcRemainingSec {
-    param([int]$ReserveSec = 30)
-    $r = ($script:FcDeadlineUtc - (Get-Date).ToUniversalTime()).TotalSeconds - $ReserveSec
-    if ($r -lt 0) { $r = 0 }
-    return [int][Math]::Floor($r)
+# [3.1] Budget constants. Every case gets its OWN budget counted from its OWN start, so a
+# slow predecessor can never squeeze a later case (G-AC4; the old shared 480s deadline
+# clamped OM-4's second client to 99s on CI run 44066798220). Values are the worst-step
+# decompositions from design 03 section 3.1:
+#   OM-1  90  = bind15 + c1a30 + c1b30 + srvExit15
+#   OM-2 300  = bind15 + two-accept readiness 60 + client wait 210 + srvExit15
+#   OM-3 300  = bind15 + c3a30 + armed10 + reset10 + grace window 7 + c3b200 + srvExit25
+#   OM-4 350  = bind15 + gateReady10 + abortGate60 + settle15 + c4b210 + srvExit25 (+15 slack)
+#               [10 section 4.6 / 12 section 5, C6: 330 -> 350 with the frame-gate proxy;
+#                sum(case) = 1160, 1160+150 = 1310 <= 1320, 1320+180 = 1500 <= CTEST 1500]
+#   OM-5a 75  = bind15 + c5 20 + probe 2 + srvExit30
+#   OM-5b 45  = bind15 + probe 1 + alive window 8 + kill/portfree 15
+$script:FcCaseBudgetSec = @{
+    'OM-1'  = 90
+    'OM-2'  = 300
+    'OM-3'  = 300
+    'OM-4'  = 350
+    'OM-5a' = 75
+    'OM-5b' = 45
 }
+# FIXED_SUITE_OVERHEAD 150 = 512MB sparse fixture creation + initial port sweep + final cleanup.
+$script:FcFixedSuiteOverheadSec = 150
+# SCRIPT_SUITE_DEADLINE 1320 = hard cap for the whole body (sum(case)=1160 + 150 = 1310 with
+# 10s slack). This is the total cap: fixed at script start, never renewed, no
+# extend-on-progress, no skip/retry-to-green (G-AC5, D-02).
+$script:FcSuiteDeadlineSec = 1320
+# DIAG_RESERVE 180 = the [1320,1500] window for the diagnostic dump + owned-process cleanup,
+# so a ctest hard kill can never eat the diagnostics again (#58 lesson).
+$script:FcDiagReserveSec = 180
+# CTest TIMEOUT for once_multi_integration (CMakeLists, single line) = 1500.
+$script:FcCtestTimeoutSec = 1500
 
-function Assert-FcDeadline {
-    param([string]$Stage)
-    if ((Get-FcRemainingSec) -le 0) {
-        throw "GLOBAL-DEADLINE exceeded at stage='$Stage' (480s budget, 30s reserve)"
+# [3.1] Startup self-check: executable form of the two budget relations.
+#   (1) sum(case) + FIXED  <= SCRIPT_SUITE_DEADLINE
+#   (2) SCRIPT_SUITE_DEADLINE + DIAG_RESERVE <= CTEST_TIMEOUT
+# Throws CONFIG-BUDGET-INVARIANT before anything runs if anyone breaks a constant.
+$null = Test-FcBudgetInvariant -CaseBudgets $script:FcCaseBudgetSec `
+    -FixedOverheadSec $script:FcFixedSuiteOverheadSec -SuiteDeadlineSec $script:FcSuiteDeadlineSec `
+    -DiagReserveSec $script:FcDiagReserveSec -CtestTimeoutSec $script:FcCtestTimeoutSec
+
+$script:FcSuiteDeadlineUtc = (Get-FcNowUtc).AddSeconds($script:FcSuiteDeadlineSec)
+$script:FcCurrentCase = $null
+$script:FcDiagEmitted = $false
+
+function Enter-FcCase {
+    param([string]$Name)
+    # [G-AC4/G-AC5] Suite guard, then a FRESH per-case budget: CaseDeadline =
+    # min(caseStart + BudgetSec, SCRIPT_SUITE_DEADLINE) -- gate 05 C1 authoritative wording
+    # (NOT SuiteDeadline-DiagReserve; that would re-create the 99s clamp). The startup
+    # invariant guarantees the suite cap is not binding for on-schedule cases, so each case
+    # receives its full own budget no matter how much its predecessors spent.
+    if ((Get-FcSuiteRemainingSec) -le 0) {
+        throw "SUITE-BUDGET-EXHAUSTED entering case '$Name' (suite=$($script:FcSuiteDeadlineSec)s)"
     }
+    $script:FcCurrentCase = New-FcCaseBudget -Name $Name `
+        -BudgetSec $script:FcCaseBudgetSec[$Name] -SuiteDeadlineUtc $script:FcSuiteDeadlineUtc
+    $script:FcDiagEmitted = $false
+    Write-Host ("[BUDGET] case={0} budget={1}s case_remaining={2}s suite_remaining={3}s" -f `
+        $Name, $script:FcCurrentCase.BudgetSec, (Get-FcCaseRemainingSec), (Get-FcSuiteRemainingSec))
 }
 
-# [FR-03] PID registry: only processes THIS script started.
+# [FR-03] PID registry: only processes THIS script started. [3.6] The registry also records
+# each process's StartTime so the PID-reuse guard requires BOTH the FastClone name AND an
+# identical start time (a recycled PID would have a different one).
 $script:FcOwnedPids = @{}
 
 function Register-OwnedProcess {
     param([System.Diagnostics.Process]$Proc, [string]$Tag)
-    $script:FcOwnedPids[[int]$Proc.Id] = $Tag
+    $startUtc = $null
+    try { $startUtc = $Proc.StartTime.ToUniversalTime() } catch { $startUtc = $null }
+    $script:FcOwnedPids[[int]$Proc.Id] = [pscustomobject]@{ Tag = $Tag; StartTimeUtc = $startUtc }
     return $Proc
 }
 
 function Stop-OwnedFastClone {
     foreach ($pidKey in @($script:FcOwnedPids.Keys)) {
+        $info = $script:FcOwnedPids[$pidKey]
         $p = Get-Process -Id $pidKey -ErrorAction SilentlyContinue
-        # [FR-03] PID-reuse guard: a recycled PID may now belong to an unrelated process.
-        # Only kill it if it is still FastClone.
-        if ($p -and $p.ProcessName -eq 'FastClone') {
+        # [FR-03/3.6] PID-reuse guard: stop it only if it is STILL named FastClone AND was
+        # started at exactly the recorded time. Anything else is not ours -- never kill.
+        $ours = $false
+        if ($p -and $p.ProcessName -eq 'FastClone' -and $null -ne $info.StartTimeUtc) {
+            try {
+                if ($p.StartTime.ToUniversalTime() -eq $info.StartTimeUtc) { $ours = $true }
+            } catch { $ours = $false }
+        }
+        if ($ours) {
             Stop-Process -Id $pidKey -Force -ErrorAction SilentlyContinue
+        } elseif ($p) {
+            Write-Host "[CLEANUP] skipping pid=$pidKey (name=$($p.ProcessName) no longer matches our registry entry)"
         }
     }
     $script:FcOwnedPids = @{}
+}
+
+function Stop-FcOwnedProcess {
+    # [12 section 4 A7] Single-process first-abort stop with the triple ownership guard:
+    # the pid must be in THIS run's registry, STILL be named FastClone, and carry the exact
+    # StartTime recorded at registration (a recycled PID fails the start-time check; a
+    # MISSING StartTimeUtc is a hard refusal -- fail-closed, 16 B-05). No whole-machine
+    # kill, no by-port/by-name fallback for the abort path.
+    # Returns $true if the stop was issued, $false if the process was already gone (the
+    # CALLER must judge that case: no kill happened, so the A7 abort chain was not exercised).
+    param([System.Diagnostics.Process]$Proc, [string]$StageTag = "stop-owned")
+    if ($null -eq $Proc) { throw "$StageTag`: Stop-FcOwnedProcess called with no process" }
+    if (-not $script:FcOwnedPids.ContainsKey([int]$Proc.Id)) {
+        throw "$StageTag`: pid=$($Proc.Id) is not in this run's owned-process registry (refusing to touch it)"
+    }
+    $info = $script:FcOwnedPids[[int]$Proc.Id]
+    $p = Get-Process -Id $Proc.Id -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }    # already exited on its own
+    if ($p.ProcessName -ne 'FastClone') {
+        throw "$StageTag`: pid=$($Proc.Id) name='$($p.ProcessName)' is not FastClone (pid reuse? refusing)"
+    }
+    # [16 B-05] Fail-closed on a MISSING StartTime: a registry entry without a recorded
+    # creation time cannot satisfy the triple guard, so the stop is REFUSED (consistent
+    # with Stop-OwnedFastClone's null->skip-kill behavior). The previous code skipped only
+    # the comparison and still killed -- fail-open.
+    if ($null -eq $info.StartTimeUtc) {
+        throw "$StageTag`: pid=$($Proc.Id) registry entry has no recorded StartTimeUtc (fail-closed: refusing to stop)"
+    }
+    $same = $false
+    try { $same = ($p.StartTime.ToUniversalTime() -eq $info.StartTimeUtc) } catch { $same = $false }
+    if (-not $same) {
+        throw "$StageTag`: pid=$($Proc.Id) StartTime differs from the registry entry (pid reuse? refusing)"
+    }
+    Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+    return $true
 }
 
 # [FR-02] Bounded port helpers. Replaces the fixed `Start-Sleep -Seconds 1` readiness
@@ -126,16 +228,36 @@ function Wait-PortListening {
     return $false
 }
 
-# [NFR-03] Timeout diagnostic block: stuck PID + port netstat + client/server log tails +
-# last [phase]/[hb]/[wd] marker, so a failure is attributable instead of "(Timeout)".
-# Reads $Port / $logDir via PowerShell dynamic scoping.
+# [NFR-03/3.5] Timeout diagnostic block: stuck PID (+pid_start) + port netstat + client/server
+# log tails + budget fields + last [phase]/[hb]/[wd] and [server]/[mp]/[om] markers, so any
+# failure is attributable to a specific scenario and client instead of "(Timeout)".
+# Reads $Port / $logDir via PowerShell dynamic scoping. [3.5] Sets $script:FcDiagEmitted so
+# the catch block can tell whether this case already produced its diagnostics.
 function Write-FcDiag {
     param([string]$StageTag, [string]$Reason, [int]$TimeoutSec,
           [System.Diagnostics.Process]$Proc, [string]$OutLog, [string]$ErrLog)
+    $script:FcDiagEmitted = $true
     Write-Host "===== TIMEOUT-DIAG begin stage=$StageTag reason=$Reason timeout=${TimeoutSec}s ====="
+    # [3.5] Fixed budget fields (G-AC7): case + budget + elapsed + remaining + suite_remaining.
+    $caseName = '<none>'
+    $budget = 0; $elapsed = 0; $remaining = 0
+    if ($null -ne $script:FcCurrentCase) {
+        $caseName = $script:FcCurrentCase.Name
+        $budget = $script:FcCurrentCase.BudgetSec
+        $elapsed = [int][Math]::Floor(((Get-FcNowUtc) - $script:FcCurrentCase.StartUtc).TotalSeconds)
+        $remaining = Get-FcCaseRemainingSec
+    }
+    Write-Host ("  case={0} budget={1}s elapsed={2}s remaining={3}s suite_remaining={4}s" -f `
+        $caseName, $budget, $elapsed, $remaining, (Get-FcSuiteRemainingSec))
     if ($Proc) {
         $p = Get-Process -Id $Proc.Id -ErrorAction SilentlyContinue
         Write-Host "  stuck_pid=$($Proc.Id) name=$(if ($p) { $p.ProcessName } else { '<exited>' })"
+        if ($script:FcOwnedPids.ContainsKey([int]$Proc.Id)) {
+            $st = $script:FcOwnedPids[[int]$Proc.Id].StartTimeUtc
+            $stTxt = '<unknown>'
+            if ($st) { $stTxt = $st.ToString('yyyy-MM-dd HH:mm:ss') + 'Z' }
+            Write-Host "  pid_start=$stTxt"
+        }
     }
     Write-Host "  port=$Port netstat:"
     (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -152,16 +274,39 @@ function Write-FcDiag {
         else     { Write-Host "  client_phase_last=<none>" }
     }
     if (Test-Path $logDir) {
+        $serverLast = $null
         Get-ChildItem -Path $logDir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match 'server' } | ForEach-Object {
                 $t = Get-Content $_.FullName -Tail 20 -ErrorAction SilentlyContinue
                 if ($t) {
                     Write-Host "  ----- tail $($_.Name) -----"
                     $t | ForEach-Object { Write-Host "    $_" }
+                    $sl = $t | Select-String -Pattern '\[server\]|\[mp\]|\[om\]'
+                    if ($sl) { $serverLast = $sl[-1].Line }
                 }
             }
+        if ($serverLast) { Write-Host "  server_state_last=$serverLast" }
+        else             { Write-Host "  server_state_last=<none>" }
     }
     Write-Host "===== TIMEOUT-DIAG end ====="
+}
+
+# [10 section 4.4 A11 / 12 section 3] OM-4 frame-gate diagnostic helper: dumps the gate
+# state/events/bytes/port (metadata ONLY -- the gate never logs payload or password) plus
+# the tail of its own log. Called from the OM-4 failure paths BEFORE any cleanup runs.
+function Write-FcGateDiag {
+    param($GateObj, [string]$GateLog)
+    if ($null -eq $GateObj) {
+        Write-Host "  [OM-4] frame gate: <not started>"
+        return
+    }
+    try { Write-Host "  [OM-4] frame gate snapshot: $($GateObj.Snapshot())" } catch {
+        Write-Host "  [OM-4] frame gate snapshot: <unavailable: $_>"
+    }
+    if ($GateLog -and (Test-Path -LiteralPath $GateLog)) {
+        Write-Host "  ----- tail $(Split-Path -Leaf $GateLog) -----"
+        Get-Content -LiteralPath $GateLog -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    }
 }
 
 function Stop-AllFastClone {
@@ -170,7 +315,8 @@ function Stop-AllFastClone {
     # terminate unrelated FastClone processes on a shared build agent (RC-3).
     Stop-OwnedFastClone
     # Defensive, PORT-SCOPED fallback: a process we do not own but that holds OUR port would
-    # break the next bind. Kill only that PID and log it (never a name-global sweep).
+    # break the next bind. Kill only that PID (still gated on the FastClone name -- a user
+    # process on our port is NEVER killed) and log it.
     foreach ($h in (Get-PortHolders -PortNum $Port)) {
         $p = Get-Process -Id $h.Pid -ErrorAction SilentlyContinue
         if ($p -and $p.ProcessName -eq 'FastClone') {
@@ -186,15 +332,16 @@ function Stop-AllFastClone {
 
 function Wait-ExitCode {
     param([System.Diagnostics.Process]$Proc, [int]$TimeoutSec = 30, [string]$StageTag = "wait")
-    # [I-2] v2 (R-06): Wait-ExitCode is the LARGEST single wait budget in these scripts
-    # (OM-2 uses 300s for the concurrent 512MB clients). Without clamping it to the global
-    # deadline, I-2 does not close on #6: 300s (OM-2) + 150s (a T0 stall) = 450s, with no
-    # room left for the diagnostic dump.
-    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
+    # [3.1] The wait is clamped to the CURRENT CASE's remaining budget (falls back to the
+    # suite deadline outside cases), so a slow predecessor can no longer starve later cases
+    # -- the old global clamp was exactly the 99s failure on CI run 44066798220.
+    $eff = [Math]::Min($TimeoutSec, (Get-FcCaseRemainingSec))
     if ($eff -le 0) {
         # NOTE: WaitForExit(0) returns immediately regardless of state, so we must NOT fall
         # through with 0 -- that would silently kill a healthy process and look like a stall.
-        throw "GLOBAL-DEADLINE exceeded waiting for pid=$($Proc.Id) stage=$StageTag (budget=${TimeoutSec}s)"
+        $cn = '<suite>'
+        if ($null -ne $script:FcCurrentCase) { $cn = $script:FcCurrentCase.Name }
+        throw "CASE-BUDGET-EXHAUSTED waiting for pid=$($Proc.Id) stage=$StageTag (requested ${TimeoutSec}s, case=$cn)"
     }
     if ($Proc.HasExited) {
         $Proc.Refresh()
@@ -202,7 +349,7 @@ function Wait-ExitCode {
         Write-FcDiag -StageTag $StageTag -Reason "wait-exitcode-timeout" -TimeoutSec $eff `
             -Proc $Proc -OutLog $null -ErrLog $null
         Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
-        throw "TIMEOUT ${StageTag}: pid=$($Proc.Id) did not exit within ${eff}s (budget ${TimeoutSec}s)"
+        throw "TIMEOUT ${StageTag}: pid=$($Proc.Id) did not exit within ${eff}s (CASE-BUDGET-EXHAUSTED, requested ${TimeoutSec}s)"
     }
     $Proc.Refresh()
     if ($null -eq $Proc.ExitCode) {
@@ -252,7 +399,12 @@ function Invoke-FastCloneSync {
             throw "Invoke-FastCloneSync: null/empty argument"
         }
     }
-    Assert-FcDeadline -Stage "$StageTag/pre"
+    # [3.1] Case-budget pre-check (was: global Assert-FcDeadline).
+    if ((Get-FcCaseRemainingSec) -le 0) {
+        $cn = '<suite>'
+        if ($null -ne $script:FcCurrentCase) { $cn = $script:FcCurrentCase.Name }
+        throw "CASE-BUDGET-EXHAUSTED before stage='$StageTag' (case=$cn)"
+    }
 
     # Local fault-injection hooks (AC-02, design section 3.14). Never set on CI; inert by
     # default: the branch is only entered when the environment variable exists. NOTE: the
@@ -266,8 +418,9 @@ function Invoke-FastCloneSync {
     }
     if ($env:FASTCLONE_TEST_CLIENT_TIMEOUT_SEC) { $TimeoutSec = [int]$env:FASTCLONE_TEST_CLIENT_TIMEOUT_SEC }
 
-    $eff = [Math]::Min($TimeoutSec, (Get-FcRemainingSec))
-    if ($eff -le 0) { throw "GLOBAL-DEADLINE exceeded before stage='$StageTag'" }
+    # [3.1] Clamp to the CURRENT CASE's remaining budget (was: shared global deadline).
+    $eff = [Math]::Min($TimeoutSec, (Get-FcCaseRemainingSec))
+    if ($eff -le 0) { throw "CASE-BUDGET-EXHAUSTED before stage='$StageTag'" }
 
     $env:FASTCLONE_DEBUG = "1"
     $proc = Start-Process -FilePath $Exe -ArgumentList ([string[]]$CliArgs) `
@@ -309,11 +462,42 @@ function Send-Probe {
     $probe.Close()
 }
 
+# [3.8] Validate the -Case filter up front: no silent empty runs, no typo'd scenario names.
+$validCases = @('OM-1', 'OM-2', 'OM-3', 'OM-4', 'OM-5a', 'OM-5b')
+if ($null -eq $Case -or @($Case).Count -eq 0) {
+    throw "Invalid -Case: at least one of $($validCases -join ',') is required"
+}
+foreach ($c in $Case) {
+    if ($validCases -notcontains $c) {
+        throw "Invalid -Case value '$c' (valid: $($validCases -join ','))"
+    }
+}
+
 $exe = Resolve-FastCloneExe -Hint $ExePath
-$root = Join-Path $env:TEMP "fastclone-onemulti-it-$(Get-Random)"
+# [16 B-07] Exe provenance echo: every run log records WHICH local product binary executed
+# the scenarios (path + mtime/size + --version self-report with the real exit code), so the
+# A2/A3/A9 evidence is attributable to a concrete local build. The v2 runs' logs lacked
+# this line -- the run exe had to be reconstructed from the probe scripts + post-v2 notes.
+try {
+    $exeItem = Get-Item -LiteralPath $exe
+    $exeVerLines = @(& cmd /c "`"$exe`" --version 2>&1" | ForEach-Object { "$_" })
+    Write-Host ("[EXE] path={0}" -f $exe)
+    Write-Host ("[EXE] mtime={0} size={1}" -f $exeItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'), $exeItem.Length)
+    Write-Host ("[EXE] --version='{0}' exit={1}" -f ($exeVerLines -join ' '), $LASTEXITCODE)
+} catch {
+    Write-Host "[EXE] provenance echo failed: $_"
+}
+# [16 S-06] Unique temp root (regenerated on collision -- never overwrites an existing
+# tree) + a per-run ownership marker: cleanup deletes ONLY a structurally-guarded root
+# whose marker file carries THIS run's token (Test-FcSafeTempRoot + Test-FcOwnTempMarker).
+$script:FcRunOwnerToken = [System.Guid]::NewGuid().ToString('N')
+do {
+    $root = Join-Path $env:TEMP "fastclone-onemulti-it-$(Get-Random)"
+} while (Test-Path -LiteralPath $root)
 $logDir = Join-Path $root "logs"
 $src = Join-Path $root "src"
-New-Item -ItemType Directory -Force -Path $logDir, $src | Out-Null
+New-Item -ItemType Directory -Path $logDir, $src | Out-Null
+Set-Content -LiteralPath (Join-Path $root '.fc-it-owner') -Value $script:FcRunOwnerToken
 
 # Small fixture for quick real sessions.
 1..15 | ForEach-Object {
@@ -338,8 +522,9 @@ $failures = 0
 try {
     Stop-AllFastClone
 
+    if ($Case -contains 'OM-1') {
     Write-Host "[OM-1] sequential: server survives between two real sessions, exits 0 after grace"
-    Assert-FcDeadline -Stage "OM-1"
+    Enter-FcCase -Name 'OM-1'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-1 server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -369,9 +554,11 @@ try {
     $done1 = (Select-String -Path "$logDir\om1-server.out" -Pattern "\[mp\] conn_done").Count
     if ($done1 -lt 2) { throw "OM-1: expected >=2 completed sessions in server log, got $done1" }
     Write-Host "  OK two sequential sessions served; server exit=$code1"
+    }
 
+    if ($Case -contains 'OM-2') {
     Write-Host "[OM-2] concurrent: two real sessions served at once, exit 0 after both finish"
-    Assert-FcDeadline -Stage "OM-2"
+    Enter-FcCase -Name 'OM-2'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-2 server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -395,9 +582,21 @@ try {
         "client", "--server", $serverAddr, "--target", $tgt2b, "--password", $password,
         "--streams", "1", "--chunk-kb", "1"
     ) -OutLog "$logDir\om2-c2b.out" -ErrLog "$logDir\om2-c2b.err"
-    # Give both time to connect concurrently, then verify the server is still up (both active).
-    Start-Sleep -Seconds 3
+    # [3.4] Wait until BOTH concurrent sessions are really accepted (two [mp] conn_accept
+    # lines in om2-server.out) instead of a fixed 3s sleep; bounded by min(60, case budget).
+    $script:Om2Offset = 0
+    $script:Om2Accepts = 0
+    $g2 = Wait-FcCondition -Condition {
+        $new = Get-FcLogNewLines -Path "$logDir\om2-server.out" -Offset ([ref]$script:Om2Offset)
+        foreach ($l in @($new)) { if ($l -match '\[mp\] conn_accept') { $script:Om2Accepts++ } }
+        ($script:Om2Accepts -ge 2) -or $srv2.HasExited
+    } -TimeoutSec ([Math]::Min(60, (Get-FcCaseRemainingSec))) -PollMs 250
     if ($srv2.HasExited) { throw "OM-2: server exited while two sessions were active" }
+    if ($script:Om2Accepts -lt 2) {
+        Write-FcDiag -StageTag "OM-2/concurrent-accept" -Reason "abort-signal-missing" -TimeoutSec 60 `
+            -Proc $srv2 -OutLog "$logDir\om2-c2a.out" -ErrLog "$logDir\om2-c2a.err"
+        throw "OM-2: expected 2 [mp] conn_accept within window, saw $($script:Om2Accepts) (ABORT-SIGNAL-MISSING)"
+    }
     $code2a = Wait-ExitCode -Proc $c2a -TimeoutSec 300
     $code2b = Wait-ExitCode -Proc $c2b -TimeoutSec 300
     if ($code2a -ne 0) { throw "OM-2: client A expected exit 0, got $code2a" }
@@ -405,9 +604,11 @@ try {
     $code2 = Wait-ExitCode -Proc $srv2 -TimeoutSec 30
     if ($code2 -ne 0) { throw "OM-2: server expected exit 0 after both finished, got $code2" }
     Write-Host "  OK two concurrent sessions served; server exit=$code2"
+    }
 
+    if ($Case -contains 'OM-3') {
     Write-Host "[OM-3] grace race: a new real session before grace expiry resets the timer"
-    Assert-FcDeadline -Stage "OM-3"
+    Enter-FcCase -Name 'OM-3'
     $longGrace = "5s"
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-3 server start:"
@@ -429,20 +630,46 @@ try {
     ) -OutLog "$logDir\om3-c3a.out" -ErrLog "$logDir\om3-c3a.err" -TimeoutSec 150 -StageTag "OM-3"
     if ($c3a -ne 0) { throw "OM-3: first client expected exit 0, got $c3a" }
     $armedAt = Get-Date
-    # Let the grace timer actually arm (a couple of 200ms ticks with zero active sessions) so the
-    # second session below provably *resets* an armed timer rather than racing in before it arms.
-    Start-Sleep -Milliseconds 1500
+    # [3.4] Wait for the grace to REALLY arm ([om] idle_grace_armed in om3-server.out)
+    # instead of a fixed 1500ms sleep, so the second session below provably RESETS an armed
+    # timer; bounded by min(10, case budget).
+    $script:Om3Offset = 0
+    $script:Om3Armed = 0
+    $g3a = Wait-FcCondition -Condition {
+        $new = Get-FcLogNewLines -Path "$logDir\om3-server.out" -Offset ([ref]$script:Om3Offset)
+        foreach ($l in @($new)) { if ($l -match 'idle_grace_armed') { $script:Om3Armed++ } }
+        ($script:Om3Armed -ge 1) -or $srv3.HasExited
+    } -TimeoutSec ([Math]::Min(10, (Get-FcCaseRemainingSec))) -PollMs 200
     if ($srv3.HasExited) { throw "OM-3: server exited during initial grace window (grace too short?)" }
+    if ($script:Om3Armed -lt 1) {
+        Write-FcDiag -StageTag "OM-3/grace-armed" -Reason "abort-signal-missing" -TimeoutSec 10 `
+            -Proc $srv3 -OutLog "$logDir\om3-c3a.out" -ErrLog "$logDir\om3-c3a.err"
+        throw "OM-3: idle_grace_armed not observed within window (ABORT-SIGNAL-MISSING)"
+    }
     # Still well before the 5s grace expires, start a long second session so the timer must reset.
     $tgt3b = Join-Path $root "tgt3b"; New-Item -ItemType Directory -Force -Path $tgt3b | Out-Null
     $c3b = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "client", "--server", $serverAddr, "--target", $tgt3b, "--password", $password,
         "--streams", "1", "--chunk-kb", "1"
     ) -OutLog "$logDir\om3-c3b.out" -ErrLog "$logDir\om3-c3b.err"
-    Start-Sleep -Seconds 2  # second session now active (well inside the first grace window)
+    # [3.4] Wait for the REAL reset ([om] idle_grace_reset) instead of a fixed 2s sleep;
+    # bounded by min(10, case budget).
+    $script:Om3Reset = 0
+    $g3r = Wait-FcCondition -Condition {
+        $new = Get-FcLogNewLines -Path "$logDir\om3-server.out" -Offset ([ref]$script:Om3Offset)
+        foreach ($l in @($new)) { if ($l -match 'idle_grace_reset') { $script:Om3Reset++ } }
+        ($script:Om3Reset -ge 1) -or $srv3.HasExited
+    } -TimeoutSec ([Math]::Min(10, (Get-FcCaseRemainingSec))) -PollMs 200
     if ($srv3.HasExited) { throw "OM-3: server exited despite a new session arriving during grace" }
+    if ($script:Om3Reset -lt 1) {
+        Write-FcDiag -StageTag "OM-3/grace-reset" -Reason "abort-signal-missing" -TimeoutSec 10 `
+            -Proc $srv3 -OutLog "$logDir\om3-c3b.out" -ErrLog "$logDir\om3-c3b.err"
+        throw "OM-3: idle_grace_reset not observed within window (ABORT-SIGNAL-MISSING)"
+    }
     # Wait until safely past "first-session-completed + grace": server must STILL be alive,
-    # proving the grace timer was reset by the second session (AC-10).
+    # proving the grace timer was reset by the second session (AC-10). [C6] This finite 7s
+    # window carries the real grace timing (not an unbounded sleep, not a completeness wait)
+    # and is implicitly clamped by the case budget.
     while (((Get-Date) - $armedAt).TotalSeconds -lt 7) { Start-Sleep -Milliseconds 200 }
     if ($srv3.HasExited) { throw "OM-3: server exited at first-grace deadline; timer was not reset" }
     $code3b = Wait-ExitCode -Proc $c3b -TimeoutSec 300
@@ -454,9 +681,11 @@ try {
     if ($armed3 -lt 1) { throw "OM-3: expected the grace to arm after the first session, found none" }
     if ($reset3 -lt 1) { throw "OM-3: expected an idle_grace_reset log entry, found none" }
     Write-Host "  OK grace armed then reset by second session; server exit=$code3"
+    }
 
+    if ($Case -contains 'OM-4') {
     Write-Host "[OM-4] failure aggregation: aborted session -> sticky exit 5 (clean later session does not mask it)"
-    Assert-FcDeadline -Stage "OM-4"
+    Enter-FcCase -Name 'OM-4'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-4 server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -470,26 +699,283 @@ try {
             -Proc $srv4 -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
         throw "OM-4: server pid=$($srv4.Id) never reached LISTENING on port $Port within 15s"
     }
-    $tgt4a = Join-Path $root "tgt4a"; New-Item -ItemType Directory -Force -Path $tgt4a | Out-Null
-    $c4a = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt4a, "--password", $password,
-        "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
-    ) -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
-    Start-Sleep -Seconds 2
-    if ($c4a.HasExited) { throw "OM-4: failing client finished before it could be interrupted" }
-    Stop-Process -Id $c4a.Id -Force -ErrorAction SilentlyContinue  # abort mid-transfer -> hadError
-    # A later CLEAN session must NOT clear the sticky failure (B5).
-    $tgt4b = Join-Path $root "tgt4b"; New-Item -ItemType Directory -Force -Path $tgt4b | Out-Null
-    $c4b = Invoke-FastCloneSync -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt4b, "--password", $password
-    ) -OutLog "$logDir\om4-c4b.out" -ErrLog "$logDir\om4-c4b.err" -TimeoutSec 150 -StageTag "OM-4"
-    if ($c4b -ne 0) { throw "OM-4: clean second client expected exit 0, got $c4b" }
-    $code4 = Wait-ExitCode -Proc $srv4 -TimeoutSec 30
-    if ($code4 -ne 5) { throw "OM-4: server expected sticky exit 5, got $code4" }
-    Write-Host "  OK aborted session forced sticky exit=$code4"
 
+    # [10 section 4.4 / 12 section 4] Frame-gate abort chain A1..A11. The old rate-tick
+    # gate (03 section 3.3 S2, structurally unreachable on fast machines per 07 B-01) is
+    # REPLACED by the in-process loopback proxy: c4a connects through the gate, the gate
+    # holds after the FIRST complete FileChunk frame (machine-speed independent), the TEST
+    # kills the owned c4a, and the gate RSTs the single upstream socket.
+    $gate = $null
+    $gateLog = Join-Path $logDir "om4-gate.log"
+    $om4Failed = $false
+    try {
+        # A1: start the gate AFTER the server is LISTENING and BEFORE c4a. Readiness is the
+        # in-process Bind+Listen + FRAME_GATE_READY log line ONLY -- no TCP probe is ever
+        # aimed at the gate port (C2; Send-Probe is only used by OM-5 against $Port).
+        $gate = Start-FcFrameGateProxy -UpstreamHost '127.0.0.1' -UpstreamPort $Port `
+            -StopAfterType 31 -CapBytes 64MB -FixtureBytes 512MB -ReadTimeoutMs 60000 -LogPath $gateLog
+        if ($gate.State -ne [FcGate.GateState]::Listening) {
+            Write-FcDiag -StageTag "OM-4/gate-start" -Reason "FRAME-GATE-NOT-READY" -TimeoutSec 10 `
+                -Proc $srv4 -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
+            throw "OM-4: FRAME-GATE-NOT-READY gate state=$($gate.State) (expected Listening)"
+        }
+        Write-Host "  [OM-4] frame gate ready port=$($gate.Port) -> upstream 127.0.0.1:$Port"
+
+        # [10 section 4.3, C3/C5] c4a goes THROUGH the gate with BOTH --server and the
+        # single --link pin aimed at it: pins[0] overrides the primary lane onto the gate,
+        # pins[1..] is empty => aux lanes = 0 (sync_engine_client.cpp L364-369/L734-739),
+        # and advertised endpoints are only consumed in the automatic branch (L391), so the
+        # 12-endpoint bypass of 07 S-04 is pinned shut. 512MB fixture + streams 1 + chunk-kb
+        # 1 stay exactly as before (G-AC1).
+        $gateAddr = "127.0.0.1:$($gate.Port)"
+        $tgt4a = Join-Path $root "tgt4a"; New-Item -ItemType Directory -Force -Path $tgt4a | Out-Null
+        $c4a = Start-FastCloneProcess -Exe $exe -CliArgs @(
+            "client", "--server", $gateAddr, "--link", "127.0.0.1=$gateAddr",
+            "--target", $tgt4a, "--password", $password,
+            "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
+        ) -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+
+        # A2 (first half): exactly one connection reaches the gate within 10s.
+        $null = Wait-FcCondition -Condition {
+            ($gate.AcceptedConnections -ge 1) -or $c4a.HasExited
+        } -TimeoutSec ([Math]::Min(10, (Get-FcCaseRemainingSec))) -PollMs 200
+        if ($gate.AcceptedConnections -ne 1) {
+            Write-FcDiag -StageTag "OM-4/gate-accept" -Reason "PROXY-BYPASS-MULTI-CONN" -TimeoutSec 10 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: PROXY-BYPASS-MULTI-CONN gate accepted $($gate.AcceptedConnections) connections (expected exactly 1)"
+        }
+
+        # A4: the own-case server really accepted the proxied session (S1, [mp] conn_accept
+        # only prints after a successful handshake; Test-FcSessionAccepted kept).
+        $script:Om4SrvOutOffset = 0
+        $null = Wait-FcCondition -Condition {
+            $new = Get-FcLogNewLines -Path "$logDir\om4-server.out" -Offset ([ref]$script:Om4SrvOutOffset)
+            (Test-FcSessionAccepted -Lines $new) -or $srv4.HasExited
+        } -TimeoutSec ([Math]::Min(30, (Get-FcCaseRemainingSec))) -PollMs 250
+        if (-not (Test-FcSessionAccepted -Lines @(Get-Content "$logDir\om4-server.out" -ErrorAction SilentlyContinue))) {
+            Write-FcDiag -StageTag "OM-4/session-accepted" -Reason "ABORT-SIGNAL-MISSING" -TimeoutSec 30 `
+                -Proc $srv4 -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
+            throw "OM-4: ABORT-SIGNAL-MISSING no [mp] conn_accept in om4-server.out"
+        }
+
+        # A5: the gate holds at the FIRST complete FileChunk (type=31, len>0). Bounded by
+        # min(60, case remaining); a missing chunk fails closed (D-06 B).
+        $abortWindow = [Math]::Min(60, (Get-FcCaseRemainingSec))
+        if (-not $gate.WaitForState([FcGate.GateState]::Held, ($abortWindow * 1000))) {
+            Write-FcDiag -StageTag "OM-4/frame-gate-hold" -Reason "FRAME-GATE-NO-FILECHUNK" -TimeoutSec $abortWindow `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: FRAME-GATE-NO-FILECHUNK gate did not reach Held within ${abortWindow}s (state=$($gate.State))"
+        }
+        $firstChunkLine = (Select-String -Path $gateLog -Pattern 'FRAME_GATE_FIRST_FILECHUNK' |
+            Select-Object -First 1).Line
+        $fcLen = -1; $fcCum = -1
+        if ($firstChunkLine) {
+            if ($firstChunkLine -match 'len=(\d+)') { $fcLen = [long]$Matches[1] }
+            if ($firstChunkLine -match 'cum=(\d+)') { $fcCum = [long]$Matches[1] }
+        }
+        if ($fcLen -le 0 -or $fcCum -lt 0 -or $fcCum -ge 524288000) {
+            Write-FcDiag -StageTag "OM-4/frame-gate-hold" -Reason "FRAME-GATE-NO-FILECHUNK" -TimeoutSec $abortWindow `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: FRAME-GATE-NO-FILECHUNK first chunk evidence bad: len=$fcLen cum=$fcCum (need len>0, cum<512MB)"
+        }
+        Write-Host ("  [OM-4] frame gate HELD at first FileChunk len={0}B cum={1}B -- c4a provably mid-transfer" -f $fcLen, $fcCum)
+
+        # A2 (second half): re-check == 1 AFTER the hold. The gate polls listener.Pending()
+        # every 50ms during the hold, so a second (bypassing) lane would be counted by now.
+        Start-Sleep -Milliseconds 300
+        if ($gate.AcceptedConnections -ne 1) {
+            Write-FcDiag -StageTag "OM-4/gate-accept-recheck" -Reason "PROXY-BYPASS-MULTI-CONN" -TimeoutSec 10 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: PROXY-BYPASS-MULTI-CONN gate accepted $($gate.AcceptedConnections) connections after hold (aux lane bypass?)"
+        }
+
+        # A6: at the hold point the client must STILL be alive (the gate stopped forwarding,
+        # so a fast machine physically cannot have finished -- the 07 B-01 gap is closed).
+        $c4a.Refresh()
+        if ($c4a.HasExited) {
+            Write-FcDiag -StageTag "OM-4/hold-alive-check" -Reason "ABORT-CLIENT-FINISHED-EARLY" -TimeoutSec 0 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-CLIENT-FINISHED-EARLY c4a pid=$($c4a.Id) already exited at the hold (exit=$($c4a.ExitCode))"
+        }
+
+        # A3: the client itself confirms zero aux lanes: [phase] tag=aux_end n=0 (EmitPhase
+        # writes stderr unconditionally, sync_engine_client.cpp L66-79/L803-804). A missing
+        # line (old binary) or n>0 (bypass) is an explicit failure, never a silent pass.
+        $script:Om4CliErrOffset = 0
+        $null = Wait-FcCondition -Condition {
+            $new = Get-FcLogNewLines -Path "$logDir\om4-c4a.err" -Offset ([ref]$script:Om4CliErrOffset)
+            $hit = $false
+            foreach ($l in @($new)) { if ($l -match '\[phase\] tag=aux_end n=') { $hit = $true } }
+            $hit -or $c4a.HasExited
+        } -TimeoutSec ([Math]::Min(10, (Get-FcCaseRemainingSec))) -PollMs 250
+        $auxN = -1
+        $auxLine = (Select-String -Path "$logDir\om4-c4a.err" -Pattern '\[phase\] tag=aux_end n=(\d+)' |
+            Select-Object -First 1).Line
+        if ($auxLine -and $auxLine -match 'n=(\d+)') { $auxN = [int]$Matches[1] }
+        if ($auxN -ne 0) {
+            Write-FcDiag -StageTag "OM-4/aux-lane-guard" -Reason "PROXY-BYPASS-AUX-LANE" -TimeoutSec 10 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: PROXY-BYPASS-AUX-LANE aux_end n=$auxN (expected 0; missing line is also a failure)"
+        }
+
+        # A7: first-abort the owned c4a with the triple-guard stop (Id in registry +
+        # ProcessName FastClone + identical StartTime), then require a NON-ZERO exit within
+        # 15s. [D-05 A] the TEST performs the kill; exit 0 means the kill was ineffective.
+        Write-Host "  [OM-4] stopping owned c4a pid=$($c4a.Id) (Id+StartTime+FastClone triple guard)"
+        $a7StopIssued = Stop-FcOwnedProcess -Proc $c4a -StageTag "OM-4/abort"
+        if (-not $a7StopIssued) {
+            # [16 B-05] The guard reports the process is ALREADY GONE: no kill was issued,
+            # so the TEST-abort chain (A7) was never exercised -- judge that reality instead
+            # of silently continuing into A8/A9 with a session that was not aborted by us.
+            Write-FcDiag -StageTag "OM-4/abort" -Reason "ABORT-CLIENT-FINISHED-EARLY" -TimeoutSec 15 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-CLIENT-FINISHED-EARLY c4a pid=$($c4a.Id) exited on its own before the guarded stop was issued (no kill happened)"
+        }
+        if (-not $c4a.WaitForExit(15000)) {
+            Write-FcDiag -StageTag "OM-4/abort-exit" -Reason "ABORT-NOT-OBSERVED" -TimeoutSec 15 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-NOT-OBSERVED c4a pid=$($c4a.Id) did not exit within 15s after stop"
+        }
+        $c4a.Refresh()
+        if ($null -eq $c4a.ExitCode) { throw "OM-4: EXITCODE-UNAVAILABLE for c4a pid=$($c4a.Id)" }
+        if ([int]$c4a.ExitCode -eq 0) {
+            Write-FcDiag -StageTag "OM-4/abort-exit" -Reason "ABORT-NOT-OBSERVED" -TimeoutSec 15 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-NOT-OBSERVED c4a exited 0 (transfer completed before the kill; abort ineffective)"
+        }
+        Write-Host "  [OM-4] c4a aborted exit=$([int]$c4a.ExitCode)"
+
+        # A8: the gate observed the client close and RST'd the single upstream socket within
+        # 15s (CLIENT_CLOSED + UPSTREAM_ABORTED). The kill alone proves nothing: the chain
+        # A5+A6+A8+A9+A10 must hold together.
+        if (-not $gate.WaitForState([FcGate.GateState]::Aborted, 15000)) {
+            Write-FcDiag -StageTag "OM-4/gate-aborted" -Reason "ABORT-NOT-OBSERVED" -TimeoutSec 15 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-NOT-OBSERVED gate did not reach Aborted within 15s (state=$($gate.State))"
+        }
+        $om4Snap = $gate.Snapshot()
+        if (-not ($om4Snap.Contains('client_closed') -and $om4Snap.Contains('upstream_aborted'))) {
+            Write-FcDiag -StageTag "OM-4/gate-aborted" -Reason "ABORT-NOT-OBSERVED" -TimeoutSec 15 `
+                -Proc $c4a -OutLog "$logDir\om4-c4a.out" -ErrLog "$logDir\om4-c4a.err"
+            throw "OM-4: ABORT-NOT-OBSERVED gate events missing client_closed/upstream_aborted ($om4Snap)"
+        }
+
+        # A9: the server observed the interruption within 15s. Source chain (11 section 3,
+        # C1 -- quoted, not assumed): hold + stop reading the downlink => client TCP window
+        # closes; the server cannot push 512MB past kWinDefaultSndBuf=16MB, so SyncDone/
+        # done/conn_done cannot happen and RunSessionServer has no early return; the gate's
+        # RST makes WSASend/recv fail => [mp] conn_error => sticky exit 5.
+        # [16 B-01] Per-poll evidence: every 250ms poll records elapsed / file len / mtime /
+        # offset / new-complete-lines / hit, so a miss is ATTRIBUTABLE instead of guessed:
+        #   (a) the pattern exists but the tail line has no newline yet (never consumable),
+        #   (b) the [ref] offset fails to write through the Wait-FcCondition invocation
+        #       (covered in isolation by E10/E11), or
+        #   (c) the server only wrote the line after the deadline (real delay).
+        # The 15s window itself is UNCHANGED (12 section 4 A9) -- no extension, no early
+        # c4b start, no retry; if real evidence ever demands a different window that is a
+        # contract change for @designer, not a number to tune here.
+        $script:Om4SrvErrOffset = 0
+        $script:Om4A9Trace = New-Object System.Collections.Generic.List[string]
+        $script:Om4A9Start = [DateTime]::UtcNow
+        $script:Om4A9HitLine = $null
+        $script:Om4A9HitMs = -1
+        $a9 = Wait-FcCondition -Condition {
+            $a9Len = -1; $a9Mtime = '<none>'
+            try {
+                $a9Fi = Get-Item -LiteralPath "$logDir\om4-server.err" -ErrorAction SilentlyContinue
+                if ($a9Fi) { $a9Len = $a9Fi.Length; $a9Mtime = $a9Fi.LastWriteTime.ToString('HH:mm:ss.fff') }
+            } catch { }
+            $new = Get-FcLogNewLines -Path "$logDir\om4-server.err" -Offset ([ref]$script:Om4SrvErrOffset)
+            $hit = $false
+            foreach ($l in @($new)) {
+                if ($l -match '\[mp\] conn_error') { $hit = $true; $script:Om4A9HitLine = $l }
+            }
+            $a9Ms = [int][Math]::Floor(([DateTime]::UtcNow - $script:Om4A9Start).TotalMilliseconds)
+            if ($hit -and $script:Om4A9HitMs -lt 0) { $script:Om4A9HitMs = $a9Ms }
+            $script:Om4A9Trace.Add(("poll t=+{0}ms len={1} mtime={2} off={3} new={4} hit={5}" -f `
+                $a9Ms, $a9Len, $a9Mtime, $script:Om4SrvErrOffset, @($new).Count, $hit))
+            $hit
+        } -TimeoutSec 15 -PollMs 250
+        # Final full-text record (tail kept verbatim, even without a trailing newline):
+        # distinguishes miss-cause (a) [pattern present, tail unterminated] from (c)
+        # [pattern absent during the window / landed late] -- Get-FcLogFullText (16 B-01).
+        $a9Full = Get-FcLogFullText -Path "$logDir\om4-server.err"
+        $a9FullLen = -1; $a9FullHas = $false; $a9TailTerm = $false
+        if ($null -ne $a9Full) {
+            $a9FullLen = $a9Full.Length
+            $a9FullHas = $a9Full.Contains('[mp] conn_error')
+            $a9TailTerm = $a9Full.EndsWith("`n")
+        }
+        if (-not $a9.Met) {
+            Write-FcDiag -StageTag "OM-4/server-conn-error" -Reason "ABORT-NOT-OBSERVED" -TimeoutSec 15 `
+                -Proc $srv4 -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
+            Write-Host "  [OM-4] A9 per-poll trace (window=15s, polls=$($script:Om4A9Trace.Count)):"
+            foreach ($a9t in $script:Om4A9Trace) { Write-Host "    $a9t" }
+            Write-Host ("  [OM-4] A9 final full-text: len={0} contains_conn_error={1} tail_newline_terminated={2}" -f `
+                $a9FullLen, $a9FullHas, $a9TailTerm)
+            throw "OM-4: ABORT-NOT-OBSERVED server never logged [mp] conn_error within 15s of the abort"
+        }
+        Write-Host ("  [OM-4] A9 [mp] conn_error observed within the 15s window (hit=+{0}ms, elapsed={1}s, polls={2})" -f `
+            $script:Om4A9HitMs, $a9.ElapsedSec, $script:Om4A9Trace.Count)
+        Write-Host ("  [OM-4] A9 hit line: {0}" -f $script:Om4A9HitLine)
+
+        # A10 (original assertions, unchanged semantics): a later CLEAN DIRECT session must
+        # NOT clear the sticky failure (B5). c4b bypasses the gate entirely (direct
+        # $serverAddr), exits 0, and the server ends sticky exit 5 with [om] terminal exit=5.
+        # [16 S-01] c4b must still reach the server INSIDE its 3s idle grace (armed after the
+        # aborted session ended): it starts immediately after the A9 hit, and the measured
+        # gap below (hit -> c4b start) is the evidence; A10's exit-0 + sticky terminal-exit=5
+        # assertions prove the direct connection really happened inside that window.
+        if ($script:Om4A9HitMs -ge 0) {
+            $a9ToC4bMs = [int][Math]::Floor(([DateTime]::UtcNow - $script:Om4A9Start).TotalMilliseconds) - $script:Om4A9HitMs
+            Write-Host ("  [OM-4] c4b direct session starting {0}ms after the A9 hit (server idle grace=3s)" -f $a9ToC4bMs)
+        }
+        $tgt4b = Join-Path $root "tgt4b"; New-Item -ItemType Directory -Force -Path $tgt4b | Out-Null
+        $c4b = Invoke-FastCloneSync -Exe $exe -CliArgs @(
+            "client", "--server", $serverAddr, "--target", $tgt4b, "--password", $password
+        ) -OutLog "$logDir\om4-c4b.out" -ErrLog "$logDir\om4-c4b.err" -TimeoutSec 210 -StageTag "OM-4"
+        if ($c4b -ne 0) { throw "OM-4: clean second client expected exit 0, got $c4b" }
+        $code4 = Wait-ExitCode -Proc $srv4 -TimeoutSec 30
+        if ($code4 -ne 5) { throw "OM-4: server expected sticky exit 5, got $code4" }
+        $termLine = (Select-String -Path "$logDir\om4-server.out" -Pattern '\[om\] terminal exit=5' |
+            Select-Object -First 1).Line
+        if (-not $termLine) {
+            throw "OM-4: server log missing '[om] terminal exit=5' (process exit code was $code4)"
+        }
+        Write-Host "  OK aborted session forced sticky exit=$code4 (gate: $($gate.Snapshot()))"
+    }
+    catch {
+        # A11: the ORIGINAL failure gets its diagnostics BEFORE any cleanup (never masked);
+        # the gate snapshot/log tail is appended, then the exception propagates unchanged.
+        $om4Failed = $true
+        if (-not $script:FcDiagEmitted) {
+            Write-FcDiag -StageTag "OM-4/unhandled" -Reason "unhandled-failure" -TimeoutSec 0 `
+                -Proc $null -OutLog $null -ErrLog $null
+        }
+        Write-FcGateDiag -GateObj $gate -GateLog $gateLog
+        throw
+    }
+    finally {
+        # [12 section 3, C8] Dispose the gate: cancel -> Shutdown(Both) both sockets ->
+        # Close sockets+listener (before the joins) -> aggregate 5000ms Join(remaining).
+        # A dispose timeout is APPENDED (FRAME-GATE-CLOSE-TIMEOUT), never masking the
+        # original failure; on the success path it IS the failure.
+        if ($null -ne $gate) {
+            try { $gate.Dispose() } catch {
+                Write-Host "  [OM-4] FRAME-GATE-CLOSE-TIMEOUT: gate dispose threw: $_" -ForegroundColor Red
+            }
+            if ($gate.DisposeTimedOut) {
+                $closeFail = "OM-4: FRAME-GATE-CLOSE-TIMEOUT gate worker threads did not join within $($gate.DisposeTimeoutMs)ms (see $gateLog)"
+                Write-Host "FAILED: $closeFail" -ForegroundColor Red
+                if (-not $om4Failed) { throw $closeFail }
+            }
+        }
+    }
+    }
+
+    if ($Case -contains 'OM-5a') {
     Write-Host "[OM-5a] probes during grace do not reset it; server exits on schedule"
-    Assert-FcDeadline -Stage "OM-5a"
+    Enter-FcCase -Name 'OM-5a'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-5a server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -509,7 +995,8 @@ try {
     ) -OutLog "$logDir\om5a-c5.out" -ErrLog "$logDir\om5a-c5.err" `
         -TimeoutSec 150 -StageTag "OM-5a"
     if ($c5 -ne 0) { throw "OM-5a: real client expected exit 0, got $c5" }
-    # Inject probes during the grace window; they must not re-arm/extend it.
+    # Inject probes during the grace window; they must not re-arm/extend it. [C6] The finite
+    # 800ms spacing carries the real probe timing and is clamped by the case budget.
     Send-Probe -ProbePort $Port
     Start-Sleep -Milliseconds 800
     Send-Probe -ProbePort $Port
@@ -518,9 +1005,11 @@ try {
     $resetA = (Select-String -Path "$logDir\om5a-server.out" -Pattern "idle_grace_reset").Count
     if ($resetA -ne 0) { throw "OM-5a: probe wrongly reset the grace ($resetA reset events)" }
     Write-Host "  OK probes did not reset grace; server exit=$code5"
+    }
 
+    if ($Case -contains 'OM-5b') {
     Write-Host "[OM-5b] probe-only (no real session): server never idle-exits"
-    Assert-FcDeadline -Stage "OM-5b"
+    Enter-FcCase -Name 'OM-5b'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-5b server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -538,21 +1027,46 @@ try {
     Start-Sleep -Milliseconds 500
     Send-Probe -ProbePort $Port
     # Wait well beyond the grace; with no real session ever served the server must stay up.
+    # [C6] Finite alive window (6s) carrying the real grace timing, clamped by case budget.
     Start-Sleep -Seconds 6
     if ($srv6.HasExited) { throw "OM-5b: server idle-exited without ever serving a real session" }
     Stop-Process -Id $srv6.Id -Force -ErrorAction SilentlyContinue
     Write-Host "  OK probe-only server stayed alive (killed for cleanup)"
+    }
 
-    Write-Host "All once-multi integration tests passed. Logs: $logDir"
+    # [3.8/C5] Report exactly what ran: a subset run (e.g. -Case OM-4) is a local repeat and
+    # is NEVER a full-suite pass claim.
+    $ranCases = @($Case)
+    Write-Host ("Selected case(s) [{0}] passed ({1}/6 scenarios). Logs: {2}" -f `
+        ($ranCases -join ', '), $ranCases.Count, $logDir)
     Stop-AllFastClone
     exit 0
 }
 catch {
     Write-Host "FAILED: $_" -ForegroundColor Red
     Write-Host "Logs: $logDir"
+    # [3.5] If this case has not produced a diag block yet, emit one BEFORE cleanup so every
+    # failure is attributable (case/budget/elapsed/laststate/PID) even for throws that did
+    # not come from a wait helper.
+    if (-not $script:FcDiagEmitted) {
+        Write-FcDiag -StageTag "catch/unhandled" -Reason "unhandled-failure" -TimeoutSec 0 `
+            -Proc $null -OutLog $null -ErrLog $null
+    }
     $failures = 1
 }
 finally {
     Stop-AllFastClone
+    # [19 compliance / 18 S-01] RETENTION ONLY -- the user's standing rules forbid recursive
+    # force-delete execution statements, and an ownership guard is NOT a literal exemption
+    # from that rule. This run's unique temp tree ($env:TEMP\fastclone-onemulti-it-<digits>,
+    # created fresh with the per-run .fc-it-owner token [16 S-06]) is therefore KEPT on BOTH
+    # the success and the failure path. The original guard validation (Test-FcSafeTempRoot
+    # structure check + Test-FcOwnTempMarker token check) is still evaluated and reported,
+    # but it gates nothing destructive anymore -- no deletion call of any kind (no recursive
+    # force-delete cmdlet, no substitute API) exists in this script. Inspect the tree at the
+    # retained path below; per-case logs live inside it ("Logs: $logDir" above).
+    $retOwnerOk = (Test-FcSafeTempRoot -Path $root) -and `
+        (Test-FcOwnTempMarker -Path $root -Token $script:FcRunOwnerToken)
+    Write-Host ("RETAINED run temp root (no deletion by design; owner structure+token guard=" + $retOwnerOk + "): " + $root)
     if ($failures -ne 0) { exit 1 }
 }
