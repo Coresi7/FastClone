@@ -681,10 +681,567 @@ try {
     Write-Host ("RETAINED H8-H10 fixture dir (no deletion): " + $ownTokenDir)
 }
 
+# ---------------------------------------------------------------------------
+# I: [36 section 3.6] REAL two-gate Graceful lifecycle suite. Two live [FcGate.FrameGate]
+# instances (the SAME production Scanner / ResumeDrain / uplink SyncDone observer the
+# OM-2 host drives), ONE shared fake upstream listener standing in for the FastClone
+# server, two fake client sockets. Downlink frames (server->client, what triggers the
+# hold): FileChunk(31,100)+FileEnd(32,50) -- the $sticky pair from group F. Uplink frames
+# (client->server): a valid FileChunk(31,100) then the 9-byte SyncDone(40,0,0). Every
+# assertion maps to a decidable fact; nothing is padded.
+# ---------------------------------------------------------------------------
+Write-Host "== I: real two-gate Graceful lifecycle (production FrameGate + fake upstream/client) =="
+
+$iTemp = Join-Path $env:TEMP ("fc-gate-selftest-" + [System.Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $iTemp | Out-Null
+try {
+    # --- I1: CloseMode surface (append-only; every pre-existing caller stays Abortive) ---
+    $i1Up = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $i1Up.Start()
+    $i1Port = ([System.Net.IPEndPoint]$i1Up.LocalEndpoint).Port
+    $i1a = [FcGate.FrameGate]::Start('127.0.0.1', $i1Port, 31, 64MB, 512MB, 5000, (Join-Path $iTemp "i1a.log"))
+    Assert-Equal 'Abortive' $i1a.CloseMode.ToString() "I1a legacy 7-arg Start defaults to CloseMode=Abortive (OM-4 compat)"
+    $i1a.Dispose()
+    $i1b = [FcGate.FrameGate]::Start('127.0.0.1', $i1Port, 31, 64MB, 512MB, 5000, (Join-Path $iTemp "i1b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    Assert-Equal 'Graceful' $i1b.CloseMode.ToString() "I1b 8-arg Start with Graceful yields CloseMode=Graceful"
+    $i1b.Dispose()
+    $i1c = Start-FcFrameGateProxy -UpstreamHost '127.0.0.1' -UpstreamPort $i1Port `
+        -StopAfterType 31 -CapBytes 64MB -FixtureBytes 512MB -ReadTimeoutMs 5000 -LogPath (Join-Path $iTemp "i1c.log")
+    Assert-Equal 'Abortive' $i1c.CloseMode.ToString() "I1c Start-FcFrameGateProxy without -CloseMode defaults to Abortive"
+    $i1c.Dispose()
+    $i1Up.Stop()
+
+    # --- I2-I8: the real two-gate overlap scenario (one shared fake upstream listener) ---
+    $cliFrame = New-FcFrameBytes 31 1 $p100      # the valid FileChunk(31,len>0) each fake client writes up
+    $syncDone = New-FcFrameBytes 40 0 @()        # the 9-byte SyncDone(40,0,0) frame
+    $fakeUp = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $fakeUp.Start()
+    $fakeUpPort = ([System.Net.IPEndPoint]$fakeUp.LocalEndpoint).Port
+    $gA = [FcGate.FrameGate]::Start('127.0.0.1', $fakeUpPort, 31, 64MB, 512MB, 15000, (Join-Path $iTemp "gate-a.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $gB = [FcGate.FrameGate]::Start('127.0.0.1', $fakeUpPort, 31, 64MB, 512MB, 15000, (Join-Path $iTemp "gate-b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cliA = New-Object System.Net.Sockets.TcpClient
+    $cliA.Connect('127.0.0.1', $gA.Port)
+    $cliB = New-Object System.Net.Sockets.TcpClient
+    $cliB.Connect('127.0.0.1', $gB.Port)
+    $upA = $fakeUp.AcceptTcpClient()      # gate A's single upstream connection
+    $upB = $fakeUp.AcceptTcpClient()      # gate B's single upstream connection
+    $csA = $cliA.GetStream()
+    $csA.Write($cliFrame, 0, $cliFrame.Length); $csA.Flush()
+    $csB = $cliB.GetStream()
+    $csB.Write($cliFrame, 0, $cliFrame.Length); $csB.Flush()
+    $usA = $upA.GetStream()
+    $usA.Write($sticky, 0, $sticky.Length); $usA.Flush()
+    $usB = $upB.GetStream()
+    $usB.Write($sticky, 0, $sticky.Length); $usB.Flush()
+    $heldA = $gA.WaitForState([FcGate.GateState]::Held, 8000)
+    $heldB = $gB.WaitForState([FcGate.GateState]::Held, 8000)
+    Assert-True ($heldA -and $heldB) "I2a both gates Held BEFORE any Resume (real overlap barrier)"
+    Assert-Equal 1 $gA.AcceptedConnections "I2b gate A AcceptedConnections == 1"
+    Assert-Equal 1 $gB.AcceptedConnections "I2c gate B AcceptedConnections == 1"
+
+    # Joint release: two consecutive statements, never "finish A then release B".
+    $gA.Resume(); $gB.Resume()
+
+    $downA = Read-FcExact -Stream $csA -Count $sticky.Length
+    Test-FcBytesEqual $sticky $downA "I3a fake client A received the full downlink byte stream"
+    $downB = Read-FcExact -Stream $csB -Count $sticky.Length
+    Test-FcBytesEqual $sticky $downB "I3b fake client B received the full downlink byte stream"
+
+    $upGotA1 = Read-FcExact -Stream $usA -Count $cliFrame.Length
+    Test-FcBytesEqual $cliFrame $upGotA1 "I4a fake upstream A received the client FileChunk byte-exact"
+    $upGotB1 = Read-FcExact -Stream $usB -Count $cliFrame.Length
+    Test-FcBytesEqual $cliFrame $upGotB1 "I4b fake upstream B received the client FileChunk byte-exact"
+
+    # Clients now send the valid 9-byte SyncDone then shutdown(Send) -- the product
+    # client's exact normal finish (SendFrame(SyncDone,0,{}) then ShutdownBoth, client
+    # L5109/L5115-5118); the read side stays open so the downlink tail is still writable.
+    foreach ($cli in @($cliA, $cliB)) {
+        $s = $cli.GetStream()
+        $s.Write($syncDone, 0, 9); $s.Flush()
+        $cli.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    }
+    $oneByte = New-Object byte[] 1
+    $upGotA2 = Read-FcExact -Stream $usA -Count 9
+    Test-FcBytesEqual $syncDone $upGotA2 "I5a fake upstream A received the 9-byte SyncDone frame byte-exact"
+    $finA = $usA.Read($oneByte, 0, 1)
+    Assert-Equal 0 $finA "I5b fake upstream A sees Read==0 after SyncDone (gate half-close FIN, not a 10054 RST)"
+    $upGotB2 = Read-FcExact -Stream $usB -Count 9
+    Test-FcBytesEqual $syncDone $upGotB2 "I5c fake upstream B received the 9-byte SyncDone frame byte-exact"
+    $finB = $usB.Read($oneByte, 0, 1)
+    Assert-Equal 0 $finB "I5d fake upstream B sees Read==0 after SyncDone (gate half-close FIN, not a 10054 RST)"
+
+    # Server side now ends both lanes (RunSessionServer return -> conn_done -> closesocket
+    # -> per-connection FIN): the gates' downlinks hit EOF and must classify Finished.
+    $upA.Close()
+    $upB.Close()
+    Assert-True ($gA.WaitForState([FcGate.GateState]::Finished, 15000)) "I6a gate A reaches Finished within 15s"
+    Assert-True ($gB.WaitForState([FcGate.GateState]::Finished, 15000)) "I6b gate B reaches Finished within 15s"
+    $logA = Get-Content -LiteralPath (Join-Path $iTemp "gate-a.log") -Raw
+    $logB = Get-Content -LiteralPath (Join-Path $iTemp "gate-b.log") -Raw
+    Assert-True (Test-FcGateFinishedOrder -LogText $logA) "I6c gate A log: SYNCDONE_FORWARDED strictly before FINISHED"
+    Assert-True (Test-FcGateFinishedOrder -LogText $logB) "I6d gate B log: SYNCDONE_FORWARDED strictly before FINISHED"
+    Assert-True (-not $logA.Contains('FRAME_GATE_UPSTREAM_ABORTED')) "I7a gate A log has no UPSTREAM_ABORTED"
+    Assert-True (-not $logB.Contains('FRAME_GATE_UPSTREAM_ABORTED')) "I7b gate B log has no UPSTREAM_ABORTED"
+    Assert-True (-not $logA.Contains('FRAME_GATE_ERROR')) "I7c gate A log has no FRAME_GATE_ERROR"
+    Assert-True (-not $logB.Contains('FRAME_GATE_ERROR')) "I7d gate B log has no FRAME_GATE_ERROR"
+
+    $swI8 = [System.Diagnostics.Stopwatch]::StartNew()
+    $gA.Dispose(); $gA.Dispose()
+    $gB.Dispose(); $gB.Dispose()
+    $swI8.Stop()
+    Assert-True ($swI8.ElapsedMilliseconds -lt 10500) "I8a post-Finished Dispose idempotent and bounded (two gates, aggregate budget each)"
+    Assert-Equal 'Finished' $gA.State.ToString() "I8b gate A state stays Finished after Dispose"
+    Assert-Equal 'Finished' $gB.State.ToString() "I8c gate B state stays Finished after Dispose"
+    Assert-True (-not $gA.DisposeTimedOut -and -not $gB.DisposeTimedOut) "I8d no DisposeTimedOut on either gate"
+    $fakeUp.Stop()
+    $cliA.Close(); $cliB.Close()
+
+    # --- I9a: client closes BEFORE any SyncDone -> Error/NoSyncDone, never Finished ---
+    $f9 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f9.Start()
+    $g9a = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f9.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g9a.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli9a = New-Object System.Net.Sockets.TcpClient
+    $cli9a.Connect('127.0.0.1', $g9a.Port)
+    $up9a = $f9.AcceptTcpClient()
+    $us9a = $up9a.GetStream()
+    $us9a.Write($sticky, 0, $sticky.Length); $us9a.Flush()
+    $null = $g9a.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs9a = $cli9a.GetStream()
+    $cs9a.Write($cliFrame, 0, $cliFrame.Length); $cs9a.Flush()
+    $g9a.Resume()
+    $cli9a.Close()      # NO SyncDone was ever sent: an early disconnect, not a clean finish
+    $up9a.Close()       # server side observes the broken lane and goes away too
+    Assert-True ($g9a.WaitForState([FcGate.GateState]::Error, 15000)) "I9a-a client close before SyncDone -> Error"
+    $log9a = Get-Content -LiteralPath (Join-Path $iTemp "g9a.log") -Raw
+    Assert-True ($log9a -match 'FRAME_GATE_ERROR reason=NoSyncDone') "I9a-b reason=NoSyncDone logged"
+    Assert-True (-not ($log9a -match '(?m)^FRAME_GATE_FINISHED ')) "I9a-c no FINISHED line on the early-close path"
+    Assert-True ($g9a.State -ne [FcGate.GateState]::Finished) "I9a-d state is not Finished"
+    Assert-True (-not ($log9a -match 'FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND')) "I9a-e no downstream EOF forwarded on the early-close path (positive conditions only, 39 B-01)"
+    $g9a.Dispose()
+    $f9.Stop()
+
+    # --- I9b: only 5 of the 9 SyncDone header bytes, then close -> still NoSyncDone ---
+    $f9b = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f9b.Start()
+    $g9b = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f9b.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g9b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli9b = New-Object System.Net.Sockets.TcpClient
+    $cli9b.Connect('127.0.0.1', $g9b.Port)
+    $up9b = $f9b.AcceptTcpClient()
+    $us9b = $up9b.GetStream()
+    $us9b.Write($sticky, 0, $sticky.Length); $us9b.Flush()
+    $null = $g9b.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs9b = $cli9b.GetStream()
+    $cs9b.Write($cliFrame, 0, $cliFrame.Length); $cs9b.Flush()
+    $g9b.Resume()
+    $cs9b.Write($syncDone, 0, 5); $cs9b.Flush()   # HALF a SyncDone header only
+    $cli9b.Close()
+    $up9b.Close()
+    Assert-True ($g9b.WaitForState([FcGate.GateState]::Error, 15000)) "I9b-a half SyncDone frame then close -> Error"
+    $log9b = Get-Content -LiteralPath (Join-Path $iTemp "g9b.log") -Raw
+    Assert-True ($log9b -match 'FRAME_GATE_ERROR reason=NoSyncDone') "I9b-b reason=NoSyncDone logged (half frame is not completion)"
+    Assert-True (-not ($log9b -match '(?m)^FRAME_GATE_FINISHED ')) "I9b-c no FINISHED line"
+    Assert-True (-not ($log9b -match 'FRAME_GATE_SYNCDONE_FORWARDED')) "I9b-d no SYNCDONE_FORWARDED (observer never completed the 9-byte header)"
+    Assert-True ($g9b.State -ne [FcGate.GateState]::Finished) "I9b-e state is not Finished"
+    $g9b.Dispose()
+    $f9b.Stop()
+
+    # --- I9c: fake upstream closes the downlink BEFORE any SyncDone -> NoSyncDone ---
+    $f9c = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f9c.Start()
+    $g9c = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f9c.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g9c.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli9c = New-Object System.Net.Sockets.TcpClient
+    $cli9c.Connect('127.0.0.1', $g9c.Port)
+    $up9c = $f9c.AcceptTcpClient()
+    $us9c = $up9c.GetStream()
+    $us9c.Write($sf1, 0, $sf1.Length); $us9c.Flush()
+    $null = $g9c.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs9c = $cli9c.GetStream()
+    $cs9c.Write($cliFrame, 0, $cliFrame.Length); $cs9c.Flush()
+    $g9c.Resume()
+    # Drain the bytes the gate already forwarded so Close() sends a clean FIN (a Close with
+    # unread buffered data would RST and turn the downlink EOF into a reset exception).
+    $null = Read-FcExact -Stream $us9c -Count $cliFrame.Length
+    $up9c.Close()       # upstream EOF before the client ever sent its SyncDone
+    Assert-True ($g9c.WaitForState([FcGate.GateState]::Error, 15000)) "I9c-a upstream early close -> Error"
+    $log9c = Get-Content -LiteralPath (Join-Path $iTemp "g9c.log") -Raw
+    Assert-True ($log9c -match 'FRAME_GATE_ERROR reason=NoSyncDone') "I9c-b reason=NoSyncDone logged (upstream EOF without SyncDone)"
+    Assert-True (-not ($log9c -match '(?m)^FRAME_GATE_FINISHED ')) "I9c-c no FINISHED line"
+    Assert-True ($g9c.State -ne [FcGate.GateState]::Finished) "I9c-d state is not Finished"
+    Assert-True (-not ($log9c -match 'FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND')) "I9c-e no downstream EOF forwarded when the upstream EOF lacks a SyncDone (39 B-01)"
+    $g9c.Dispose()
+    $cli9c.Close()
+    $f9c.Stop()
+
+    # --- I9d: Graceful upstream WRITE fault -> Error/Upstream, no fabricated client_closed ---
+    $f9d = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f9d.Start()
+    $g9d = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f9d.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g9d.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli9d = New-Object System.Net.Sockets.TcpClient
+    $cli9d.Connect('127.0.0.1', $g9d.Port)
+    $up9d = $f9d.AcceptTcpClient()
+    Start-Sleep -Milliseconds 200
+    $up9d.Close()       # server side gone: the next gate->upstream write must fail
+    $cs9d = $cli9d.GetStream()
+    for ($i = 0; $i -lt 6; $i++) { $cs9d.Write($g12Chunk, 0, $g12Chunk.Length); $cs9d.Flush(); Start-Sleep -Milliseconds 100 }
+    $null = $g9d.WaitForState([FcGate.GateState]::Error, 8000)
+    $snap9d = $g9d.Snapshot()
+    $log9d = Get-Content -LiteralPath (Join-Path $iTemp "g9d.log") -Raw
+    Assert-Equal 'Error' $g9d.State.ToString() "I9d-a Graceful upstream write fault -> Error state"
+    Assert-True ($log9d -match 'FRAME_GATE_ERROR reason=Upstream') "I9d-b reason=Upstream logged"
+    Assert-True (-not $snap9d.Contains('client_closed')) "I9d-c no fabricated client_closed event"
+    Assert-True (-not ($log9d -match '(?m)^FRAME_GATE_FINISHED ')) "I9d-d no FINISHED line"
+    Assert-True ($g9d.State -ne [FcGate.GateState]::Finished) "I9d-e state is not Finished"
+    Assert-True (-not ($log9d -match 'FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND')) "I9d-f no downstream EOF forwarded on the upstream-fault path (39 B-01)"
+    $g9d.Dispose()
+    $cli9d.Close()
+    $f9d.Stop()
+
+    # --- I10a: fragmented (1-byte-per-write) SyncDone still marks only at the last byte ---
+    $f10 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f10.Start()
+    $g10a = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f10.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g10a.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli10 = New-Object System.Net.Sockets.TcpClient
+    $cli10.Connect('127.0.0.1', $g10a.Port)
+    $up10 = $f10.AcceptTcpClient()
+    $us10 = $up10.GetStream()
+    $us10.Write($sticky, 0, $sticky.Length); $us10.Flush()
+    $null = $g10a.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs10 = $cli10.GetStream()
+    $cs10.Write($cliFrame, 0, $cliFrame.Length); $cs10.Flush()
+    $g10a.Resume()
+    $null = Read-FcExact -Stream $cs10 -Count $sticky.Length   # drain the downlink
+    for ($i = 0; $i -lt 9; $i++) { $cs10.WriteByte($syncDone[$i]); $cs10.Flush() }
+    $cli10.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    $null = Read-FcExact -Stream $us10 -Count ($cliFrame.Length + 9)
+    $up10.Close()
+    Assert-True ($g10a.WaitForState([FcGate.GateState]::Finished, 15000)) "I10a-a byte-fragmented SyncDone still completes to Finished"
+    $log10a = Get-Content -LiteralPath (Join-Path $iTemp "g10a.log") -Raw
+    Assert-True (Test-FcGateFinishedOrder -LogText $log10a) "I10a-b order holds under fragmentation (mark only after the last byte+flush)"
+    $g10a.Dispose()
+    $cli10.Close()
+    $f10.Stop()
+
+    # --- I10b: type==40 with a NON-zero payload is NOT the SyncDone (len must be 0) ---
+    $f10b = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f10b.Start()
+    $g10b = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f10b.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g10b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli10b = New-Object System.Net.Sockets.TcpClient
+    $cli10b.Connect('127.0.0.1', $g10b.Port)
+    $up10b = $f10b.AcceptTcpClient()
+    $us10b = $up10b.GetStream()
+    $us10b.Write($sticky, 0, $sticky.Length); $us10b.Flush()
+    $null = $g10b.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs10b = $cli10b.GetStream()
+    $fake40 = New-FcFrameBytes 40 0 (New-FcPayload 10)   # type 40 but len=10: not SyncDone
+    $cs10b.Write($cliFrame, 0, $cliFrame.Length); $cs10b.Flush()
+    $cs10b.Write($fake40, 0, $fake40.Length); $cs10b.Flush()
+    $g10b.Resume()
+    $null = Read-FcExact -Stream $cs10b -Count $sticky.Length
+    $cli10b.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    $up10b.Close()
+    Assert-True ($g10b.WaitForState([FcGate.GateState]::Error, 15000)) "I10b-a type=40 with len>0 does not count as SyncDone -> Error"
+    $log10b = Get-Content -LiteralPath (Join-Path $iTemp "g10b.log") -Raw
+    Assert-True ($log10b -match 'FRAME_GATE_ERROR reason=NoSyncDone') "I10b-b reason=NoSyncDone logged"
+    Assert-True (-not ($log10b -match 'FRAME_GATE_SYNCDONE_FORWARDED')) "I10b-c no SYNCDONE_FORWARDED for the len>0 frame"
+    Assert-True ($g10b.State -ne [FcGate.GateState]::Finished) "I10b-d state is not Finished"
+    $g10b.Dispose()
+    $cli10b.Close()
+    $f10b.Stop()
+
+    # --- I10c: a non-zero SyncDone streamId is recorded, never asserted (36 section 3.1.3) ---
+    $f10c = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f10c.Start()
+    $g10c = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f10c.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g10c.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli10c = New-Object System.Net.Sockets.TcpClient
+    $cli10c.Connect('127.0.0.1', $g10c.Port)
+    $up10c = $f10c.AcceptTcpClient()
+    $us10c = $up10c.GetStream()
+    $us10c.Write($sticky, 0, $sticky.Length); $us10c.Flush()
+    $null = $g10c.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs10c = $cli10c.GetStream()
+    $sd5 = New-FcFrameBytes 40 5 @()     # same 9-byte SyncDone shape, streamId=5
+    $cs10c.Write($cliFrame, 0, $cliFrame.Length); $cs10c.Flush()
+    $cs10c.Write($sd5, 0, 9); $cs10c.Flush()
+    $g10c.Resume()
+    $null = Read-FcExact -Stream $cs10c -Count $sticky.Length
+    $cli10c.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    $null = Read-FcExact -Stream $us10c -Count ($cliFrame.Length + 9)
+    $up10c.Close()
+    Assert-True ($g10c.WaitForState([FcGate.GateState]::Finished, 15000)) "I10c-a sid=5 SyncDone still completes (sid recorded, not asserted)"
+    $log10c = Get-Content -LiteralPath (Join-Path $iTemp "g10c.log") -Raw
+    Assert-True ($log10c -match 'FRAME_GATE_SYNCDONE_FORWARDED .*sid=5') "I10c-b the sid=5 value is recorded in the log line"
+    $g10c.Dispose()
+    $cli10c.Close()
+    $f10c.Stop()
+
+    # --- I10d: full client Close (not shutdown) with a downlink tail still in flight ---
+    # The ONLY swallowable write failure (36 section 3.2.4): Graceful + SyncDone already
+    # forwarded + client really gone -> CLIENT_WRITE_AFTER_CLOSE metadata, discard to EOF,
+    # Finished still reached (transport complete), no Error, no Aborted.
+    $f10d = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f10d.Start()
+    $g10d = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f10d.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g10d.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli10d = New-Object System.Net.Sockets.TcpClient
+    $cli10d.Connect('127.0.0.1', $g10d.Port)
+    $up10d = $f10d.AcceptTcpClient()
+    $us10d = $up10d.GetStream()
+    $us10d.Write($sf1, 0, $sf1.Length); $us10d.Flush()     # ONLY frame 1 reaches the hold: no over-read
+    $null = $g10d.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs10d = $cli10d.GetStream()
+    $cs10d.Write($cliFrame, 0, $cliFrame.Length); $cs10d.Flush()
+    $cs10d.Write($syncDone, 0, 9); $cs10d.Flush()
+    $g10d.Resume()
+    # Reading the full uplink from the fake upstream PROVES the gate already Write+Flush'ed
+    # the complete SyncDone (the observer has marked _syncDoneForwarded) BEFORE the close.
+    $null = Read-FcExact -Stream $us10d -Count ($cliFrame.Length + 9)
+    $null = Read-FcExact -Stream $cs10d -Count $sf1.Length   # client consumes frame 1 completely
+    # RST-close (Linger(true,0)) models the product client that has ShutdownBoth and no
+    # longer accepts a single downlink byte: the gate's tail write below must FAIL -- the
+    # sole swallowable failure (36 section 3.2.4). A plain Close() would let the Windows
+    # kernel silently ACK-and-discard the tail, hiding the path under test.
+    $cli10d.Client.LingerState = New-Object System.Net.Sockets.LingerOption($true, 0)
+    $cli10d.Close()
+    # Wait until the gate's uplink has OBSERVED the abort (state ClientClosed): from this
+    # moment the client socket is aborted in the gate's TCP stack, so the tail write below
+    # fails deterministically instead of racing the RST across the wire.
+    $null = $g10d.WaitForState([FcGate.GateState]::ClientClosed, 5000)
+    # A >64KB tail forces MULTIPLE 64KB gate->client writes: after an aborted connection the
+    # FIRST send can still land in the dead kernel send buffer, but a subsequent one fails
+    # deterministically (WSAECONNRESET) -- that is the swallowable failure under test.
+    $tailBig = New-Object byte[] 262144
+    $us10d.Write($sf2, 0, $sf2.Length); $us10d.Flush()
+    $us10d.Write($tailBig, 0, $tailBig.Length); $us10d.Flush()
+    $up10d.Close()       # server EOF
+    Assert-True ($g10d.WaitForState([FcGate.GateState]::Finished, 15000)) "I10d-a post-SyncDone full client close still reaches Finished"
+    $log10d = Get-Content -LiteralPath (Join-Path $iTemp "g10d.log") -Raw
+    Assert-True ($log10d -match 'FRAME_GATE_CLIENT_WRITE_AFTER_CLOSE') "I10d-b CLIENT_WRITE_AFTER_CLOSE logged (metadata only)"
+    $finLine10d = @($log10d -split "`r?`n" | Where-Object { $_ -match '^FRAME_GATE_FINISHED ' } | Select-Object -First 1)
+    $td10d = -1
+    if ($finLine10d.Count -gt 0 -and $finLine10d[0] -match 'tail_discarded=(\d+)') { $td10d = [long]$Matches[1] }
+    Assert-True ($td10d -gt 0) "I10d-c tail_discarded>0 recorded in the FINISHED line (got $td10d)"
+    Assert-True (-not $log10d.Contains('FRAME_GATE_ERROR')) "I10d-d no FRAME_GATE_ERROR on the swallowable path"
+    Assert-True (-not $log10d.Contains('FRAME_GATE_UPSTREAM_ABORTED')) "I10d-e no UPSTREAM_ABORTED on the swallowable path"
+    $g10d.Dispose()
+    $f10d.Stop()
+
+    # --- I13: Dispose during Held / right after Resume never fabricates Finished/Aborted ---
+    $f13 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f13.Start()
+    $g13a = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f13.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g13a.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli13 = New-Object System.Net.Sockets.TcpClient
+    $cli13.Connect('127.0.0.1', $g13a.Port)
+    $up13 = $f13.AcceptTcpClient()
+    $us13 = $up13.GetStream()
+    $us13.Write($sf1, 0, $sf1.Length); $us13.Flush()
+    $null = $g13a.WaitForState([FcGate.GateState]::Held, 8000)
+    $g13a.Dispose()      # cancel while Held
+    $log13a = Get-Content -LiteralPath (Join-Path $iTemp "g13a.log") -Raw
+    Assert-True ($g13a.State -ne [FcGate.GateState]::Finished) "I13a-a dispose while Held -> not Finished"
+    Assert-True (-not ($log13a -match '(?m)^FRAME_GATE_FINISHED ')) "I13a-b no FINISHED line"
+    Assert-True ($g13a.State -ne [FcGate.GateState]::Aborted) "I13a-c not Aborted (cancel fabricates nothing)"
+    Assert-True (-not $g13a.DisposeTimedOut) "I13a-d dispose bounded, no DisposeTimedOut"
+    Assert-True (-not ($log13a -match 'FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND')) "I13a-e cancel while Held forwards no downstream EOF (39 B-01)"
+    $cli13.Close(); $up13.Close()
+
+    $g13b = [FcGate.FrameGate]::Start('127.0.0.1', ([int]([System.Net.IPEndPoint]$f13.LocalEndpoint).Port), 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g13b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli13b = New-Object System.Net.Sockets.TcpClient
+    $cli13b.Connect('127.0.0.1', $g13b.Port)
+    $up13b = $f13.AcceptTcpClient()
+    $us13b = $up13b.GetStream()
+    $us13b.Write($sf1, 0, $sf1.Length); $us13b.Flush()
+    $null = $g13b.WaitForState([FcGate.GateState]::Held, 8000)
+    $cs13b = $cli13b.GetStream()
+    $cs13b.Write($cliFrame, 0, $cliFrame.Length); $cs13b.Flush()
+    $g13b.Resume()
+    $g13b.Dispose()      # cancel immediately after Resume, drain in flight
+    $log13b = Get-Content -LiteralPath (Join-Path $iTemp "g13b.log") -Raw
+    Assert-True ($g13b.State -ne [FcGate.GateState]::Finished) "I13b-a dispose mid-drain -> not Finished"
+    Assert-True (-not ($log13b -match '(?m)^FRAME_GATE_FINISHED ')) "I13b-b no FINISHED line"
+    Assert-True ($g13b.State -ne [FcGate.GateState]::Aborted) "I13b-c not Aborted"
+    Assert-True (-not $g13b.DisposeTimedOut) "I13b-d dispose bounded, no DisposeTimedOut"
+    Assert-True (-not ($log13b -match 'FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND')) "I13b-e cancel mid-drain forwards no downstream EOF (39 B-01)"
+    $cli13b.Close(); $up13b.Close()
+    $f13.Stop()
+
+    # --- I14: [39 B-01] the server-side EOF must be FORWARDED to the clients (two gates) ---
+    # The fake server ends BOTH lanes exactly like the product server on the clean path
+    # (RunSessionServer return -> [mp] conn_done -> per-connection closesocket = FIN, 36
+    # section 2.1): a pure Shutdown(Send), not a test Close. THE FIX UNDER TEST: each fake
+    # client's blocked read must wake with Read==0 inside a SHORT bounded deadline (the
+    # pre-fix gate never forwarded the EOF and the product client hung on its 120s idle
+    # watchdog), and Finished may only appear AFTER the success conditions (complete
+    # SyncDone forwarded, downstream half-close sent).
+    $f14 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $f14.Start()
+    $f14Port = ([int]([System.Net.IPEndPoint]$f14.LocalEndpoint).Port)
+    $g14a = [FcGate.FrameGate]::Start('127.0.0.1', $f14Port, 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g14a.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $g14b = [FcGate.FrameGate]::Start('127.0.0.1', $f14Port, 31, 64MB, 512MB, 15000, (Join-Path $iTemp "g14b.log"), [FcGate.UpstreamCloseMode]::Graceful)
+    $cli14a = New-Object System.Net.Sockets.TcpClient
+    $cli14a.Connect('127.0.0.1', $g14a.Port)
+    $cli14b = New-Object System.Net.Sockets.TcpClient
+    $cli14b.Connect('127.0.0.1', $g14b.Port)
+    $up14a = $f14.AcceptTcpClient()
+    $up14b = $f14.AcceptTcpClient()
+    $cs14a = $cli14a.GetStream()
+    $cs14a.Write($cliFrame, 0, $cliFrame.Length); $cs14a.Flush()
+    $cs14b = $cli14b.GetStream()
+    $cs14b.Write($cliFrame, 0, $cliFrame.Length); $cs14b.Flush()
+    $us14a = $up14a.GetStream()
+    $us14a.Write($sticky, 0, $sticky.Length); $us14a.Flush()
+    $us14b = $up14b.GetStream()
+    $us14b.Write($sticky, 0, $sticky.Length); $us14b.Flush()
+    $held14a = $g14a.WaitForState([FcGate.GateState]::Held, 8000)
+    $held14b = $g14b.WaitForState([FcGate.GateState]::Held, 8000)
+    Assert-True ($held14a -and $held14b) "I14a both gates Held before the joint Resume (real overlap barrier)"
+    Assert-Equal 1 $g14a.AcceptedConnections "I14b gate A AcceptedConnections == 1"
+    Assert-Equal 1 $g14b.AcceptedConnections "I14c gate B AcceptedConnections == 1"
+    $g14a.Resume(); $g14b.Resume()
+    $down14a = Read-FcExact -Stream $cs14a -Count $sticky.Length
+    Test-FcBytesEqual $sticky $down14a "I14d client A received the full downlink byte stream"
+    $down14b = Read-FcExact -Stream $cs14b -Count $sticky.Length
+    Test-FcBytesEqual $sticky $down14b "I14e client B received the full downlink byte stream"
+    $upGot14a = Read-FcExact -Stream $us14a -Count $cliFrame.Length
+    Test-FcBytesEqual $cliFrame $upGot14a "I14f upstream A received the client FileChunk byte-exact"
+    $upGot14b = Read-FcExact -Stream $us14b -Count $cliFrame.Length
+    Test-FcBytesEqual $cliFrame $upGot14b "I14g upstream B received the client FileChunk byte-exact"
+    # The product client's normal finish, verbatim: SendFrame(SyncDone{40,0,0}) then a send
+    # half-close (client L5109 -> L5115-5118); the read side stays open for the downlink.
+    foreach ($cli in @($cli14a, $cli14b)) {
+        $s = $cli.GetStream()
+        $s.Write($syncDone, 0, 9); $s.Flush()
+        $cli.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    }
+    $upGot14a2 = Read-FcExact -Stream $us14a -Count 9
+    Test-FcBytesEqual $syncDone $upGot14a2 "I14h upstream A received the full 9-byte SyncDone frame (reverse forwarding intact)"
+    $fin14a = $us14a.Read($oneByte, 0, 1)
+    Assert-Equal 0 $fin14a "I14i upstream A sees Read==0 after SyncDone (gate upstream half-close preserved)"
+    $upGot14b2 = Read-FcExact -Stream $us14b -Count 9
+    Test-FcBytesEqual $syncDone $upGot14b2 "I14j upstream B received the full 9-byte SyncDone frame (reverse forwarding intact)"
+    $fin14b = $us14b.Read($oneByte, 0, 1)
+    Assert-Equal 0 $fin14b "I14k upstream B sees Read==0 after SyncDone (gate upstream half-close preserved)"
+    # The server now ends BOTH lanes with a clean FIN (the product closesocket shape).
+    $up14a.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    $up14b.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    # THE FIX UNDER TEST: the forwarded downstream FIN must wake each client's blocked read
+    # promptly. Poll(5s) bounds the wait: a gate that fails to forward FAILS here, not stalls.
+    $finCliA = $false
+    if ($cli14a.Client.Poll(5000000, [System.Net.Sockets.SelectMode]::SelectRead)) {
+        $finCliA = ($cs14a.Read($oneByte, 0, 1) -eq 0)
+    }
+    Assert-True $finCliA "I14l client A sees the forwarded EOF (Read==0 within 5s, no 120s idle-watchdog rescue)"
+    $finCliB = $false
+    if ($cli14b.Client.Poll(5000000, [System.Net.Sockets.SelectMode]::SelectRead)) {
+        $finCliB = ($cs14b.Read($oneByte, 0, 1) -eq 0)
+    }
+    Assert-True $finCliB "I14m client B sees the forwarded EOF (Read==0 within 5s, no 120s idle-watchdog rescue)"
+    Assert-True ($g14a.WaitForState([FcGate.GateState]::Finished, 15000)) "I14n gate A reaches Finished within 15s"
+    Assert-True ($g14b.WaitForState([FcGate.GateState]::Finished, 15000)) "I14o gate B reaches Finished within 15s"
+    $log14a = Get-Content -LiteralPath (Join-Path $iTemp "g14a.log") -Raw
+    $log14b = Get-Content -LiteralPath (Join-Path $iTemp "g14b.log") -Raw
+    foreach ($lp in @(@($log14a, 'A'), @($log14b, 'B'))) {
+        $lines14 = @($lp[0] -split "`r?`n")
+        $iSd14 = -1; $iDh14 = -1; $iFin14 = -1
+        for ($k = 0; $k -lt $lines14.Count; $k++) {
+            if ($lines14[$k] -match '^FRAME_GATE_SYNCDONE_FORWARDED ') { $iSd14 = $k }
+            elseif ($lines14[$k] -match '^FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND ') { $iDh14 = $k }
+            elseif ($lines14[$k] -match '^FRAME_GATE_FINISHED ') { $iFin14 = $k }
+        }
+        Assert-True (($iSd14 -ge 0) -and ($iDh14 -ge 0) -and ($iFin14 -ge 0) -and ($iSd14 -lt $iDh14) -and ($iDh14 -lt $iFin14)) `
+            ("I14p/q gate " + $lp[1] + ": Finished happens AFTER the success conditions (SYNCDONE_FORWARDED < DOWNSTREAM_HALF_CLOSE_SEND < FINISHED)")
+        Assert-True (-not ($lp[0].Contains('FRAME_GATE_ERROR')) -and -not ($lp[0].Contains('FRAME_GATE_UPSTREAM_ABORTED'))) `
+            ("I14r/s gate " + $lp[1] + ": no ERROR and no UPSTREAM_ABORTED on the clean path")
+    }
+    $sw14 = [System.Diagnostics.Stopwatch]::StartNew()
+    $g14a.Dispose(); $g14a.Dispose()
+    $g14b.Dispose(); $g14b.Dispose()
+    $sw14.Stop()
+    Assert-True ($sw14.ElapsedMilliseconds -lt 10500) "I14t post-Finished Dispose idempotent and bounded (two gates)"
+    Assert-True (($g14a.State.ToString() -eq 'Finished') -and ($g14b.State.ToString() -eq 'Finished') -and (-not $g14a.DisposeTimedOut) -and (-not $g14b.DisposeTimedOut)) "I14u both gates stay Finished after Dispose, no DisposeTimedOut"
+    $f14.Stop()
+    $cli14a.Close(); $cli14b.Close(); $up14a.Close(); $up14b.Close()
+
+    # No payload/password ever logged (G11 discipline holds for the I-group logs too).
+    $iAllGateLogs = (Get-ChildItem -LiteralPath $iTemp -Filter '*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+    Assert-True (-not $iAllGateLogs.Contains('payload')) "I11a I-group gate logs carry no payload bytes"
+} finally {
+    # [19 compliance] RETENTION ONLY: no deletion call of any kind; the self-created I-group
+    # dir is KEPT and its path printed (same discipline as the G-group dir).
+    $leafI = Split-Path -Path $iTemp -Leaf
+    $parentOkI = ([System.IO.Path]::GetFullPath((Split-Path -Path $iTemp -Parent))) -eq `
+                 ([System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\'))
+    $ownSelftestDirI = ($parentOkI -and $leafI -match '^fc-gate-selftest-[0-9a-f]{32}$' -and (Test-Path -LiteralPath $iTemp))
+    Write-Host ("RETAINED selftest I-group gate dir (no deletion; ownership check=" + $ownSelftestDirI + "): " + $iTemp)
+}
+
+# ---------------------------------------------------------------------------
+# J: [36 section 3.6] auxiliary pure helpers -- Test-FcOm2OverlapEvidence (33 section 3.5
+# key/reason-code set, kept as the AUXILIARY checker) and Test-FcGateFinishedOrder.
+# ---------------------------------------------------------------------------
+Write-Host "== J: overlap-evidence and finished-order pure helpers (auxiliary only) =="
+
+$okEv = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $true; GateB_Held = $true; GateA_Cum = 1000; GateB_Cum = 2000
+    Accepted_A = 1; Accepted_B = 1; ClientA_Alive = $true; ClientB_Alive = $true
+    SessionIds = @('sess-one', 'sess-two'); AuxEndA = 0; AuxEndB = 0; FixtureBytes = 134217728
+}
+Assert-True $okEv.Ok "J1a positive overlap evidence passes"
+Assert-Equal 0 @($okEv.Reasons).Count "J1b positive evidence carries zero reason codes"
+
+$evJ2 = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $true; GateB_Held = $true; GateA_Cum = 1000; GateB_Cum = 2000
+    Accepted_A = 1; Accepted_B = 1; ClientA_Alive = $false; ClientB_Alive = $true
+    SessionIds = @('sess-one', 'sess-two'); AuxEndA = 0; AuxEndB = 0; FixtureBytes = 134217728
+}
+Assert-True (-not $evJ2.Ok) "J2a a client that already exited fails the overlap check"
+Assert-True (@($evJ2.Reasons) -contains 'CLIENT-FINISHED-EARLY') "J2b reason CLIENT-FINISHED-EARLY"
+
+$evJ3 = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $false; GateB_Held = $true; GateA_Cum = 0; GateB_Cum = 2000
+    Accepted_A = 1; Accepted_B = 1; ClientA_Alive = $true; ClientB_Alive = $true
+    SessionIds = @('sess-one', 'sess-two'); AuxEndA = 0; AuxEndB = 0; FixtureBytes = 134217728
+}
+Assert-True (-not $evJ3.Ok) "J3a a gate that never held a chunk fails"
+Assert-True (@($evJ3.Reasons) -contains 'NO-FILECHUNK') "J3b reason NO-FILECHUNK"
+
+$evJ4 = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $true; GateB_Held = $true; GateA_Cum = 1000; GateB_Cum = 2000
+    Accepted_A = 1; Accepted_B = 1; ClientA_Alive = $true; ClientB_Alive = $true
+    SessionIds = @('sess-one', 'sess-one'); AuxEndA = 0; AuxEndB = 0; FixtureBytes = 134217728
+}
+Assert-True (-not $evJ4.Ok) "J4a identical sessionIds fail (no two distinct sessions)"
+Assert-True (@($evJ4.Reasons) -contains 'SESSION-NOT-DISTINCT') "J4b reason SESSION-NOT-DISTINCT"
+
+$evJ5 = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $true; GateB_Held = $true; GateA_Cum = 1000; GateB_Cum = 2000
+    Accepted_A = 2; Accepted_B = 1; ClientA_Alive = $true; ClientB_Alive = $true
+    SessionIds = @('sess-one', 'sess-two'); AuxEndA = 0; AuxEndB = 3; FixtureBytes = 134217728
+}
+Assert-True (-not $evJ5.Ok) "J5a a second accepted lane (or a non-zero aux_end) fails"
+Assert-True (@($evJ5.Reasons) -contains 'MULTI-LANE') "J5b reason MULTI-LANE"
+
+$evJ6 = Test-FcOm2OverlapEvidence -E @{
+    GateA_Held = $false; GateB_Held = $true; GateA_Cum = 0; GateB_Cum = 2000
+    Accepted_A = 1; Accepted_B = 1; ClientA_Alive = $true; ClientB_Alive = $false
+    SessionIds = @('only-one'); AuxEndA = 0; AuxEndB = 0; FixtureBytes = 134217728
+}
+Assert-True (-not $evJ6.Ok) "J6a multiple violations still fail"
+Assert-True ((@($evJ6.Reasons) -contains 'NO-FILECHUNK') -and (@($evJ6.Reasons) -contains 'SESSION-NOT-DISTINCT') -and
+             (@($evJ6.Reasons) -contains 'CLIENT-FINISHED-EARLY')) "J6b all three reason codes aggregate without swallowing"
+Assert-Equal 3 @($evJ6.Reasons).Count "J6c exactly the three expected codes (no extras)"
+
+$j7pos = "FRAME_GATE_READY port=1`nFRAME_GATE_SCANNING`nFRAME_GATE_SYNCDONE_FORWARDED upbytes=118 sid=0`nFRAME_GATE_FINISHED sync_done_forwarded=1 eof=1 downbytes=168 upbytes=118"
+Assert-True (Test-FcGateFinishedOrder -LogText $j7pos) "J7a SYNCDONE_FORWARDED before FINISHED -> true"
+$j7rev = "FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1`nFRAME_GATE_SYNCDONE_FORWARDED upbytes=118 sid=0"
+Assert-True (-not (Test-FcGateFinishedOrder -LogText $j7rev)) "J7b reversed order -> false"
+Assert-True (-not (Test-FcGateFinishedOrder -LogText "FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1")) "J7c missing SYNCDONE_FORWARDED -> false"
+$j7sup = "FRAME_GATE_SYNCDONE_FORWARDED upbytes=9 sid=0`nFRAME_GATE_FINISHED_SUPPRESSED reason=cancel"
+Assert-True (-not (Test-FcGateFinishedOrder -LogText $j7sup)) "J7d FINISHED_SUPPRESSED is not a FINISHED verdict"
+Assert-True (-not (Test-FcGateFinishedOrder -LogText '')) "J7e empty log text -> false"
+
 Write-Host ""
 $total = $script:PassCount + $script:FailCount
 Write-Host ("SUPPORT-TESTS RESULT: pass=" + $script:PassCount + " fail=" + $script:FailCount + " total=" + $total)
-Write-Host ("GROUPS: A=3 B=4 C=7 D=3 E=25 F=40 G=38 H=11 (16 B-01..B-07 rework: +E10/E11 wait-chain and unterminated-tail, +F7c-e cap-before-Found, +G12/G13 uplink classification, +H8-H11 ownership marker; >=48 total, 13 parser cases + 38 socket assertions)")
+Write-Host ("GROUPS: A=3 B=4 C=7 D=3 E=25 F=40 G=38 H=11 I=92 J=18 = 241 (40 EOF-forward rework: A-H 131 verbatim + I real two-gate Graceful suite I1-I14 (I14 = server-side Shutdown(Send) EOF forwarded to both clients as a downstream half-close, Finished strictly after the success conditions; I9a-e/I9c-e/I9d-f/I13a-e/I13b-e = no forwarding on early-close/upstream-early-close/upstream-fault/cancel paths) + J overlap/finished-order helpers; >=143 required, real count reported as measured)")
 Reset-FcNowUtcProvider
 if ($script:FailCount -gt 0) { exit 1 }
 exit 0

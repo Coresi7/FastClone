@@ -246,8 +246,13 @@ using System.Text;
 using System.Threading;
 
 namespace FcGate {
-    public enum GateState { Init, Listening, UpstreamConnected, Scanning, Held, ClientClosed, Aborted, Error }
-    public enum GateError { None, NoListener, Upstream, BadLength, Cap, OverFixture, EofBeforeChunk, NoFileChunk, ClientWrite, DisposeTimeout }
+    // [36 §3.2.1] append-only lifecycle additions: Finished appended AFTER Error (existing
+    // values never reordered); GateError gains NoSyncDone + ClientClosedBeforeResume at the
+    // END only. UpstreamCloseMode is new (09 §1 / 32 §1 authorized): Abortive = the frozen
+    // OM-4 RST chain (default everywhere), Graceful = the OM-2 half-close(FIN) completion.
+    public enum GateState { Init, Listening, UpstreamConnected, Scanning, Held, ClientClosed, Aborted, Error, Finished }
+    public enum GateError { None, NoListener, Upstream, BadLength, Cap, OverFixture, EofBeforeChunk, NoFileChunk, ClientWrite, DisposeTimeout, NoSyncDone, ClientClosedBeforeResume }
+    public enum UpstreamCloseMode { Abortive = 0, Graceful = 1 }
 
     public sealed class GateEvent {
         public string Kind; public int Type; public uint StreamId;
@@ -265,6 +270,18 @@ namespace FcGate {
     // this very same static method; copying or faking this logic anywhere else is forbidden.
     public static class Scanner {
         public const long MaxSaneFramePayload = 1073741824L;   // 1 GiB (protocol.cpp L20)
+
+        // [36 §3.1.1] The single shared 9-byte header decode (LE32 fields, protocol.cpp
+        // L66-72/L83-98: type(1) + streamId(LE32) + payloadLen(LE32), plaintext, no TLS).
+        // Scanner.Scan and the FrameGate uplink SyncDone observer BOTH call this method --
+        // there is no second parser anywhere. Byte-equivalent with the previous inline code
+        // (F11 endianness evidence unchanged).
+        public static void DecodeHeader(byte[] hdr, out int type, out uint streamId, out long len) {
+            if (hdr == null || hdr.Length < 9) throw new ArgumentException("DecodeHeader needs the full 9-byte header");
+            type = hdr[0] & 0xFF;
+            streamId = (uint)(hdr[1] | (hdr[2] << 8) | (hdr[3] << 16) | (hdr[4] << 24));
+            len = (long)((uint)(hdr[5] | (hdr[6] << 8) | (hdr[7] << 16) | (hdr[8] << 24)));
+        }
 
         public static Result Scan(Stream down, Stream up, int stopType, long capBytes, long fixtureBytes,
                                   int readTimeoutMs, byte[] copyBuf, Func<bool> clientAlive) {
@@ -299,9 +316,8 @@ namespace FcGate {
                     if (pending.Count < 9) { res.Error = GateError.EofBeforeChunk; break; }
                     for (int i = 0; i < 9; i++) hdr[i] = pending[i];
                     pending.RemoveRange(0, 9);
-                    int type = hdr[0] & 0xFF;
-                    uint streamId = (uint)(hdr[1] | (hdr[2] << 8) | (hdr[3] << 16) | (hdr[4] << 24));
-                    long len = (long)((uint)(hdr[5] | (hdr[6] << 8) | (hdr[7] << 16) | (hdr[8] << 24)));
+                    int type; uint streamId; long len;
+                    DecodeHeader(hdr, out type, out streamId, out len);
                     // Fail-closed bounds BEFORE forwarding any byte of this frame.
                     if (len > MaxSaneFramePayload) { res.Error = GateError.BadLength; break; }
                     if (cum + 9 + len > fixtureBytes) { res.Error = GateError.OverFixture; break; }
@@ -374,6 +390,73 @@ namespace FcGate {
             up.Flush();
             return total;
         }
+
+        // [36 §3.1.2] Outcome of ResumeDrain. Total = bytes successfully written to the
+        // client-side stream; TailDiscarded = bytes dropped after the client was observed
+        // gone (write-failure block + every later block read to EOF); Eof = the ONLY
+        // completion signal (down.Read<=0); ClientWriteFailed = a gate->client write failed
+        // while clientGone()==true (the sole swallowable failure, 36 section 3.2.4).
+        public sealed class ResumeOutcome {
+            public long Total;
+            public long TailDiscarded;
+            public bool Eof;
+            public bool ClientWriteFailed;
+        }
+
+        // [36 §3.1.2] Graceful continuation: identical to the 4-arg Resume when clientGone
+        // is null (any up.Write failure throws -- legacy semantics preserved verbatim);
+        // with a clientGone observer, a gate->client write/flush failure is swallowed ONLY
+        // when the client is really gone (FIN observed), switching to discard mode which
+        // keeps reading the SAME fixed 64KB copyBuf to EOF and counts TailDiscarded. A
+        // clientGone()==false write failure rethrows (real client/upstream error). Eof is
+        // set ONLY by down.Read<=0; read timeouts/exceptions always propagate (never a
+        // completion). Zero new byte[len] allocations anywhere; buffer bound stays 64KB.
+        // [39 S-01] Layering note: this observer only answers client LIVENESS; the
+        // _syncDoneForwarded leg of the "Graceful + forwarded + clientGone" swallow rule
+        // (36 section 3.2.4) is enforced by the CALLER -- ClassifyGracefulDrain re-checks
+        // _syncDoneForwarded and turns a missing SyncDone into NoSyncDone (fail-closed),
+        // so a swallowed tail write can never fabricate a Finished verdict.
+        public static ResumeOutcome ResumeDrain(Stream down, Stream up, byte[] overRead, byte[] copyBuf, Func<bool> clientGone) {
+            if (copyBuf == null || copyBuf.Length < 1 || copyBuf.Length > 65536)
+                throw new ArgumentException("copyBuf must be a caller-owned fixed buffer of 1..65536 bytes");
+            ResumeOutcome res = new ResumeOutcome();
+            long total = 0;
+            bool discard = false;
+            if (overRead != null && overRead.Length > 0) {
+                try {
+                    up.Write(overRead, 0, overRead.Length);
+                    total += overRead.Length;
+                } catch (Exception) {
+                    if (clientGone == null || !clientGone()) throw;
+                    res.ClientWriteFailed = true; discard = true;
+                    res.TailDiscarded += overRead.Length;
+                }
+            }
+            while (true) {
+                int n = down.Read(copyBuf, 0, copyBuf.Length);
+                if (n <= 0) { res.Eof = true; break; }
+                if (!discard) {
+                    try {
+                        up.Write(copyBuf, 0, n);
+                        total += n;
+                    } catch (Exception) {
+                        if (clientGone == null || !clientGone()) throw;
+                        res.ClientWriteFailed = true; discard = true;
+                        res.TailDiscarded += n;
+                    }
+                } else {
+                    res.TailDiscarded += n;
+                }
+            }
+            if (!discard) {
+                try { up.Flush(); } catch (Exception) {
+                    if (clientGone == null || !clientGone()) throw;
+                    res.ClientWriteFailed = true;
+                }
+            }
+            res.Total = total;
+            return res;
+        }
     }
 
     public sealed class FrameGate : IDisposable {
@@ -397,6 +480,15 @@ namespace FcGate {
         private int _port = 0;
         private bool _disposeTimedOut = false;
         private string _lastError = "";
+        // [36 §3.1.3/§3.2] Graceful lifecycle state: close mode (fixed at Start), the
+        // uplink SyncDone observer (9B + counters only, zero payload copies) and the
+        // downlink tail bookkeeping for CLIENT_WRITE_AFTER_CLOSE.
+        private readonly UpstreamCloseMode _closeMode = UpstreamCloseMode.Abortive;
+        private volatile bool _syncDoneForwarded = false;
+        private byte[] _obsHdr = new byte[9];
+        private int _obsNeed = 9;      // header bytes still required for the current frame
+        private long _obsSkip = 0;     // payload bytes still to be passed for the current frame
+        private long _tailDiscarded = 0;
 
         // Aggregate dispose budget (ms): ONE deadline shared by all Join(remaining) calls
         // (C8: never 3x5000). Writable so the isolated tests can shrink it.
@@ -406,10 +498,11 @@ namespace FcGate {
         public static int TestHookThreadExitDelayMs = 0;
 
         private FrameGate(string upHost, int upPort, int stopType, long capBytes, long fixtureBytes,
-                          int readTimeoutMs, string logPath) {
+                          int readTimeoutMs, string logPath, UpstreamCloseMode closeMode) {
             _upHost = upHost; _upPort = upPort; _stopType = stopType;
             _capBytes = capBytes; _fixtureBytes = fixtureBytes;
             _readTimeoutMs = readTimeoutMs; _logPath = logPath;
+            _closeMode = closeMode;
             DisposeTimeoutMs = 5000;
         }
 
@@ -417,11 +510,20 @@ namespace FcGate {
         // write FRAME_GATE_READY, spawn the single accept thread, and only then return.
         // Readiness is exactly this; there is NO TCP probe / self-connect anywhere (C2).
         // Any failure stops and disposes the half-built listener before rethrowing.
+        // [36 §3.2.1] The legacy 7-arg Start is kept VERBATIM in behavior: it delegates to
+        // the 8-arg overload with the default Abortive mode, so every existing caller
+        // (OM-4 A1, the G group, I1) compiles and behaves exactly as before.
         public static FrameGate Start(string upHost, int upPort, int stopType, long capBytes, long fixtureBytes,
                                       int readTimeoutMs, string logPath) {
+            return Start(upHost, upPort, stopType, capBytes, fixtureBytes, readTimeoutMs, logPath,
+                         UpstreamCloseMode.Abortive);
+        }
+
+        public static FrameGate Start(string upHost, int upPort, int stopType, long capBytes, long fixtureBytes,
+                                      int readTimeoutMs, string logPath, UpstreamCloseMode closeMode) {
             if (!IPAddress.Parse(upHost).Equals(IPAddress.Loopback))
                 throw new ArgumentException("FrameGate is loopback-only (127.0.0.1), got: " + upHost);
-            FrameGate g = new FrameGate(upHost, upPort, stopType, capBytes, fixtureBytes, readTimeoutMs, logPath);
+            FrameGate g = new FrameGate(upHost, upPort, stopType, capBytes, fixtureBytes, readTimeoutMs, logPath, closeMode);
             try {
                 g._listener = new TcpListener(IPAddress.Loopback, 0);   // port 0 -> OS picks a free port
                 g._listener.Start();
@@ -445,6 +547,103 @@ namespace FcGate {
         public GateState State { get { return _state; } }
         public int AcceptedConnections { get { return _acceptedConnections; } }
         public bool DisposeTimedOut { get { return _disposeTimedOut; } }
+        // [36 §3.2.1] Fixed at Start; Abortive is the default for every pre-existing caller.
+        public UpstreamCloseMode CloseMode { get { return _closeMode; } }
+
+        // [36 §3.2.3] Direct client-liveness observation (FIN or RST both count as gone):
+        // the uplink thread's _clientClosedSeen flag, or a zero-timeout Poll that sees the
+        // socket readable with no buffered bytes (the FIN has arrived but the uplink thread
+        // has not read it yet) -- no dependence on thread timing. Any Poll/Available error
+        // means the socket is dead: gone.
+        private bool ClientGone() {
+            if (_clientClosedSeen) return true;
+            try {
+                Socket s = _client.Client;
+                return s.Poll(0, SelectMode.SelectRead) && s.Available == 0;
+            } catch (Exception) {
+                return true;
+            }
+        }
+
+        // [36 §3.1.3] Uplink SyncDone observer: advances ONLY over bytes whose Write+Flush
+        // to the upstream already succeeded (called right after both), reuses the single
+        // Scanner.DecodeHeader, and marks _syncDoneForwarded at a FRAME BOUNDARY of a
+        // type==40 && len==0 frame -- the last byte of that 9-byte frame must already be
+        // written and flushed. Memory bound: 9 bytes + counters. sid is recorded, never
+        // asserted (protocol redundancy stays out of the hard gate).
+        private void AdvanceUplinkObserver(byte[] buf, int n, long upbytesAfter) {
+            int pos = 0;
+            while (pos < n) {
+                if (_obsNeed > 0) {
+                    int take = _obsNeed;
+                    if (take > n - pos) take = n - pos;
+                    Array.Copy(buf, pos, _obsHdr, 9 - _obsNeed, take);
+                    pos += take; _obsNeed -= take;
+                    if (_obsNeed == 0) {
+                        int t; uint sid; long len;
+                        Scanner.DecodeHeader(_obsHdr, out t, out sid, out len);
+                        if (len == 0) {
+                            // zero-payload frame: its boundary IS the end of its 9-byte header
+                            if (t == 40) MarkSyncDoneForwarded(sid, upbytesAfter);
+                            _obsNeed = 9;
+                        } else {
+                            _obsSkip = len;
+                        }
+                    }
+                } else {
+                    int take = (int)Math.Min(_obsSkip, (long)(n - pos));
+                    pos += take; _obsSkip -= take;
+                    if (_obsSkip == 0) _obsNeed = 9;   // payload-frame boundary (len>0: cannot be the len==0 SyncDone)
+                }
+            }
+        }
+
+        private void MarkSyncDoneForwarded(uint sid, long upbytes) {
+            _syncDoneForwarded = true;
+            LogEvent("sync_done_forwarded", 40, sid, 0, 0, null);
+            LogLine("FRAME_GATE_SYNCDONE_FORWARDED upbytes=" + upbytes + " sid=" + sid);
+        }
+
+        // [36 §3.2.3] Graceful terminal classification after ResumeDrain. Finished needs
+        // ALL of: upstream EOF, a complete forwarded SyncDone, no cancel, and the client
+        // observed gone (its FIN, or a swallowed post-close tail write). A missing
+        // SyncDone at EOF is NoSyncDone (early close / server fault / half frame -- never
+        // Finished). The <=2000ms bounded poll only waits for the client FIN to arrive for
+        // classification; it never carries semantics and is not additive with the host's
+        // 15s Finished window.
+        private void ClassifyGracefulDrain(Scanner.ResumeOutcome o) {
+            if (_cancel) {
+                LogLine("FRAME_GATE_FINISHED_SUPPRESSED reason=cancel");
+                return;
+            }
+            if (o.Eof) {
+                if (_syncDoneForwarded) {
+                    bool gone = o.ClientWriteFailed || ClientGone();
+                    if (!gone) {
+                        Stopwatch sw = Stopwatch.StartNew();
+                        while (sw.ElapsedMilliseconds < 2000 && !_cancel) {
+                            if (ClientGone()) { gone = true; break; }
+                            Thread.Sleep(25);
+                        }
+                    }
+                    if (_cancel) { LogLine("FRAME_GATE_FINISHED_SUPPRESSED reason=cancel"); return; }
+                    if (gone) {
+                        SetState(GateState.Finished);
+                        LogEvent("finished", 0, 0, 0, 0, null);
+                        LogLine("FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1 downbytes=" + _downBytes +
+                                " upbytes=" + _upBytes + " tail_discarded=" + _tailDiscarded + " frames=" + _frames);
+                    } else {
+                        SetError(GateError.ClientWrite, "client still connected after upstream EOF (no FIN within 2000ms)");
+                    }
+                } else {
+                    SetError(GateError.NoSyncDone, "upstream EOF before a complete SyncDone frame was forwarded");
+                }
+                return;
+            }
+            // Unreachable by construction (ResumeDrain returns only on Read<=0; timeouts and
+            // resets propagate to the caller's catch). Fail closed if it is ever reached.
+            SetError(GateError.Upstream, "drain ended without EOF");
+        }
 
         public bool WaitForState(GateState s, int ms) {
             Stopwatch sw = Stopwatch.StartNew();
@@ -627,15 +826,69 @@ namespace FcGate {
                         PollExtraConnection();
                         if (_exitSignal.Wait(50)) break;
                     }
-                    if (_resumed && !_cancel && !_clientClosedSeen) {
-                        LogLine("FRAME_GATE_RESUMED");
-                        long extra = Scanner.Resume(down, cli, r.OverRead, copyBuf);
-                        _downBytes += extra;
-                        LogLine("FRAME_GATE_DRAINED extra=" + extra + " downbytes=" + _downBytes);
-                    }
-                    while (!_cancel && !_clientClosedSeen) {
-                        PollExtraConnection();
-                        if (_exitSignal.Wait(50)) break;
+                    if (_closeMode == UpstreamCloseMode.Graceful) {
+                        // [36 §3.2.3] Graceful: exactly ONE path after the hold. A client
+                        // close observed while still Held (before Resume) is an error, never
+                        // Finished; a Resume goes straight into ResumeDrain with the
+                        // ClientGone observer and the terminal classification -- there is no
+                        // second wait loop on this branch.
+                        if (_clientClosedSeen && !_resumed && !_cancel) {
+                            SetError(GateError.ClientClosedBeforeResume,
+                                     "client closed while the gate was Held (before Resume)");
+                        } else if (_resumed && !_cancel) {
+                            LogLine("FRAME_GATE_RESUMED");
+                            Scanner.ResumeOutcome o = Scanner.ResumeDrain(down, cli, r.OverRead, copyBuf,
+                                                                          new Func<bool>(ClientGone));
+                            _downBytes += o.Total;
+                            _tailDiscarded = o.TailDiscarded;
+                            LogLine("FRAME_GATE_DRAINED extra=" + o.Total + " downbytes=" + _downBytes +
+                                    " tail_discarded=" + _tailDiscarded);
+                            if (o.ClientWriteFailed) {
+                                // [36 §3.2.4] The ONLY swallowable write failure: Graceful +
+                                // SyncDone already forwarded + client really gone. Metadata
+                                // only; no Error, no Aborted.
+                                LogLine("FRAME_GATE_CLIENT_WRITE_AFTER_CLOSE n=" + o.TailDiscarded);
+                            }
+                            // [39 B-01] Forward the upstream (server) EOF to the client as a
+                            // downstream half-close: a byte-transparent proxy must relay the
+                            // server's per-connection FIN (conn_done -> closesocket, 36
+                            // section 2.1) the way a direct connection would deliver it.
+                            // Without this the client's blocked recv (sync_engine_client.cpp
+                            // L1421-1422) only wakes on the 120s idle watchdog (L681) and the
+                            // whole run stalls ~120s per client. The half-close PRECEDES the
+                            // terminal classification on purpose: in the EOF-first /
+                            // clientGone-second race between the two threads, forwarding the
+                            // FIN here is exactly what lets the client finish its join and
+                            // close, making ClientGone() true for ClassifyGracefulDrain's
+                            // bounded (<=2000ms) poll -- the poll itself stays unchanged.
+                            // ONLY Shutdown(Send): the uplink pump keeps reading the client
+                            // (never CloseBoth -- that would truncate a client still sending).
+                            // Positive conditions ONLY (Graceful + resumed branch, upstream
+                            // EOF actually observed, complete SyncDone already forwarded, no
+                            // cancel): every other path (early close / upstream fault /
+                            // cancel / missing SyncDone) stays fail-closed and forwards
+                            // nothing (unit-verified: I9a-e, I9c-e, I9d-f, I13a-e, I13b-e).
+                            if (o.Eof && _syncDoneForwarded && !_cancel) {
+                                try {
+                                    _client.Client.Shutdown(SocketShutdown.Send);
+                                    LogLine("FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND downbytes=" + _downBytes +
+                                            " sync_done_forwarded=1 eof=1");
+                                } catch (Exception) { }
+                            }
+                            ClassifyGracefulDrain(o);
+                        }
+                    } else {
+                        // Abortive: the original two-phase path, verbatim semantics.
+                        if (_resumed && !_cancel && !_clientClosedSeen) {
+                            LogLine("FRAME_GATE_RESUMED");
+                            long extra = Scanner.Resume(down, cli, r.OverRead, copyBuf);
+                            _downBytes += extra;
+                            LogLine("FRAME_GATE_DRAINED extra=" + extra + " downbytes=" + _downBytes);
+                        }
+                        while (!_cancel && !_clientClosedSeen) {
+                            PollExtraConnection();
+                            if (_exitSignal.Wait(50)) break;
+                        }
                     }
                 } else {
                     if (!_cancel) SetError(r.Error, r.Error.ToString());
@@ -646,6 +899,14 @@ namespace FcGate {
                 // NORMAL completion path, not a gate error: never overwrite Aborted with
                 // Error here (introduced-bug fix #2).
                 if (!_cancel && !_clientClosedSeen) SetError(GateError.Upstream, ex.Message);
+                else if (!_cancel && _clientClosedSeen && _closeMode == UpstreamCloseMode.Graceful
+                         && _state != GateState.Error && _state != GateState.Finished) {
+                    // [36 §3.2.3] Graceful drain interrupted by a read exception after the
+                    // client closed: classify fail-closed (a timeout/reset is NEVER EOF, so
+                    // it can never be Finished).
+                    if (!_syncDoneForwarded) SetError(GateError.NoSyncDone, "drain failed before SyncDone: " + ex.Message);
+                    else SetError(GateError.Upstream, "drain failed after client close: " + ex.Message);
+                }
             }
         }
 
@@ -697,6 +958,10 @@ namespace FcGate {
                         break;
                     }
                     total += n;
+                    // [36 §3.1.3] Observer advances only over bytes whose Write+Flush to the
+                    // upstream ALREADY succeeded -- a partial Write or an unflushed SyncDone
+                    // can never mark _syncDoneForwarded here.
+                    AdvanceUplinkObserver(buf, n, total);
                 }
             } catch (Exception) {
                 if (_cancel) return;
@@ -720,15 +985,32 @@ namespace FcGate {
             SetState(GateState.ClientClosed);
             LogEvent("client_closed", 0, 0, 0, 0, null);
             LogLine("FRAME_GATE_CLIENT_CLOSED upbytes=" + total);
+            if (_closeMode == UpstreamCloseMode.Graceful) {
+                // [36 §3.2.2] Graceful branch: a forwarded complete SyncDone means the client
+                // closed NORMALLY -> half-close the upstream send side (FIN, no LingerState,
+                // no RST, no Close, no _exitSignal) so the server sees the lane ending
+                // cleanly. No SyncDone forwarded => an early disconnect is an ERROR.
+                if (_syncDoneForwarded) {
+                    try {
+                        _upstream.Client.Shutdown(SocketShutdown.Send);
+                        LogLine("FRAME_GATE_UPSTREAM_HALF_CLOSE_SEND upbytes=" + total + " sync_done=1");
+                    } catch (Exception) { }
+                } else {
+                    SetError(GateError.NoSyncDone, "client closed before a complete SyncDone frame was forwarded");
+                    _exitSignal.Set();
+                }
+                ThreadDelayHook();
+                return;
+            }
+            // Abortive close of the single upstream socket: LingerOption(true,0) + Close()
+            // WITHOUT a prior Shutdown (12 section 2 L42 intent; introduced-bug fix #3).
+            // [16 S-02] Evidence discipline: the OBSERVED pair is full-v2-run1
+            // (Shutdown-first variant) failing A9 inside its 15s window vs full-v2-run2/
+            // run3 + the om4 repeats passing after the switch to the bare abortive close.
+            // The exact server-side failure latency is NOT claimed from any probe --
+            // rst_semantics_probe.ps1 was cancelled before producing output -- and the
+            // asserted abort source chain remains the quoted 11 section 3 C1 chain above.
             try {
-                // Abortive close of the single upstream socket: LingerOption(true,0) + Close()
-                // WITHOUT a prior Shutdown (12 section 2 L42 intent; introduced-bug fix #3).
-                // [16 S-02] Evidence discipline: the OBSERVED pair is full-v2-run1
-                // (Shutdown-first variant) failing A9 inside its 15s window vs full-v2-run2/
-                // run3 + the om4 repeats passing after the switch to the bare abortive close.
-                // The exact server-side failure latency is NOT claimed from any probe --
-                // rst_semantics_probe.ps1 was cancelled before producing output -- and the
-                // asserted abort source chain remains the quoted 11 section 3 C1 chain above.
                 Socket s = _upstream.Client;
                 s.LingerState = new LingerOption(true, 0);   // RST on close, no FIN handshake
                 s.Close();
@@ -809,9 +1091,11 @@ function Start-FcFrameGateProxy {
     # Starts the in-process OM-4 frame gate. Loopback-only for BOTH the bind and the
     # upstream (a 0.0.0.0 bind or a non-loopback upstream is refused). Returns the live
     # [FcGate.FrameGate] object (Port/State/AcceptedConnections/Snapshot/Resume/Dispose).
+    # [36 §3.3] -CloseMode 'Abortive' (default -- OM-4 and every pre-existing caller) or
+    # 'Graceful' (the OM-2 lifecycle gates). Pure forwarding only: no port probe.
     param([string]$UpstreamHost = '127.0.0.1', [int]$UpstreamPort,
           [int]$StopAfterType = 31, [long]$CapBytes = 67108864, [long]$FixtureBytes = 536870912,
-          [int]$ReadTimeoutMs = 60000, [string]$LogPath)
+          [int]$ReadTimeoutMs = 60000, [string]$LogPath, [string]$CloseMode = 'Abortive')
     if ($UpstreamHost -ne '127.0.0.1') {
         throw "Start-FcFrameGateProxy: loopback-only upstream expected (127.0.0.1), got '$UpstreamHost'"
     }
@@ -821,9 +1105,64 @@ function Start-FcFrameGateProxy {
     if ([string]::IsNullOrWhiteSpace($LogPath)) {
         throw "Start-FcFrameGateProxy: LogPath is required (gate evidence must be on disk)"
     }
+    # Compile FIRST: the [FcGate.*] type literals below need the assembly loaded in a fresh
+    # process (the isolated harness pre-loads it in group F, the integration host does not
+    # -- the first Start-FcFrameGateProxy call IS the first compile point).
     Initialize-FcFrameGateType
+    $mode = [FcGate.UpstreamCloseMode]::Abortive
+    if ($CloseMode -eq 'Graceful') { $mode = [FcGate.UpstreamCloseMode]::Graceful }
+    elseif ($CloseMode -ne 'Abortive') {
+        throw "Start-FcFrameGateProxy: CloseMode must be 'Abortive' or 'Graceful', got '$CloseMode'"
+    }
     return [FcGate.FrameGate]::Start($UpstreamHost, $UpstreamPort, $StopAfterType,
-        $CapBytes, $FixtureBytes, $ReadTimeoutMs, $LogPath)
+        $CapBytes, $FixtureBytes, $ReadTimeoutMs, $LogPath, $mode)
+}
+
+function Test-FcGateFinishedOrder {
+    # [36 §3.3] Pure helper shared by OM-2 step10 and the I group: true only when the gate
+    # log contains BOTH a FRAME_GATE_SYNCDONE_FORWARDED line and a real FRAME_GATE_FINISHED
+    # line (the exact 'FRAME_GATE_FINISHED ' event, NOT FRAME_GATE_FINISHED_SUPPRESSED) and
+    # the SYNCDONE_FORWARDED line comes strictly BEFORE it -- the forwarded-complete-SyncDone
+    # event must precede the Finished verdict, on the same gate log.
+    param([string]$LogText)
+    if ([string]::IsNullOrWhiteSpace($LogText)) { return $false }
+    $lines = @($LogText -split "`r?`n")
+    $sdIdx = -1
+    $finIdx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($sdIdx -lt 0 -and $lines[$i] -match 'FRAME_GATE_SYNCDONE_FORWARDED') { $sdIdx = $i }
+        if ($finIdx -lt 0 -and $lines[$i] -match '^FRAME_GATE_FINISHED ') { $finIdx = $i }
+    }
+    if ($sdIdx -lt 0 -or $finIdx -lt 0) { return $false }
+    return ($sdIdx -lt $finIdx)
+}
+
+function Test-FcOm2OverlapEvidence {
+    # [33 §3.5 spec, kept as the AUXILIARY checker per 36 §3.3] Aggregating overlap-evidence
+    # validator for the OM-2 barrier moment. $E keys: GateA_Held, GateB_Held, GateA_Cum,
+    # GateB_Cum, Accepted_A, Accepted_B, ClientA_Alive, ClientB_Alive, SessionIds (array),
+    # AuxEndA, AuxEndB, FixtureBytes. Reason codes aggregate without swallowing:
+    #   NO-FILECHUNK            (a gate not Held, or its Cum <= 0 / >= FixtureBytes)
+    #   SESSION-NOT-DISTINCT    (fewer than 2 distinct conn_accept sessionIds)
+    #   CLIENT-FINISHED-EARLY   (either client already exited at the barrier)
+    #   MULTI-LANE              (any Accepted != 1 or any AuxEnd != 0)
+    # This is NEVER the only overlap evidence (the real barrier + joint Resume + the host
+    # joint chain are); it re-checks the same observable values the host just collected.
+    param([hashtable]$E)
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if (-not $E.GateA_Held -or -not $E.GateB_Held -or
+        [long]$E.GateA_Cum -le 0 -or [long]$E.GateB_Cum -le 0 -or
+        [long]$E.GateA_Cum -ge [long]$E.FixtureBytes -or [long]$E.GateB_Cum -ge [long]$E.FixtureBytes) {
+        $reasons.Add('NO-FILECHUNK')
+    }
+    $distinctIds = @(@($E.SessionIds) | Select-Object -Unique)
+    if ($distinctIds.Count -lt 2) { $reasons.Add('SESSION-NOT-DISTINCT') }
+    if (-not $E.ClientA_Alive -or -not $E.ClientB_Alive) { $reasons.Add('CLIENT-FINISHED-EARLY') }
+    if ([int]$E.Accepted_A -ne 1 -or [int]$E.Accepted_B -ne 1 -or
+        [int]$E.AuxEndA -ne 0 -or [int]$E.AuxEndB -ne 0) {
+        $reasons.Add('MULTI-LANE')
+    }
+    return [pscustomobject]@{ Ok = ($reasons.Count -eq 0); Reasons = $reasons.ToArray() }
 }
 
 # ---------------------------------------------------------------------------

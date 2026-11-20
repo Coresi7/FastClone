@@ -294,14 +294,17 @@ function Write-FcDiag {
 # [10 section 4.4 A11 / 12 section 3] OM-4 frame-gate diagnostic helper: dumps the gate
 # state/events/bytes/port (metadata ONLY -- the gate never logs payload or password) plus
 # the tail of its own log. Called from the OM-4 failure paths BEFORE any cleanup runs.
+# [36 §3.4 step12] Optional -CaseTag (default 'OM-4' -- every pre-existing call site and
+# output line is unchanged); the OM-2 rework passes 'OM-2' so the same A11-shaped helper
+# can dump both lifecycle gates without a misleading [OM-4] prefix.
 function Write-FcGateDiag {
-    param($GateObj, [string]$GateLog)
+    param($GateObj, [string]$GateLog, [string]$CaseTag = 'OM-4')
     if ($null -eq $GateObj) {
-        Write-Host "  [OM-4] frame gate: <not started>"
+        Write-Host "  [$CaseTag] frame gate: <not started>"
         return
     }
-    try { Write-Host "  [OM-4] frame gate snapshot: $($GateObj.Snapshot())" } catch {
-        Write-Host "  [OM-4] frame gate snapshot: <unavailable: $_>"
+    try { Write-Host "  [$CaseTag] frame gate snapshot: $($GateObj.Snapshot())" } catch {
+        Write-Host "  [$CaseTag] frame gate snapshot: <unavailable: $_>"
     }
     if ($GateLog -and (Test-Path -LiteralPath $GateLog)) {
         Write-Host "  ----- tail $(Split-Path -Leaf $GateLog) -----"
@@ -508,11 +511,26 @@ Set-Content -Path (Join-Path $src "nested\deep\leaf.txt") -Value "nested"
 
 # Large fixture for interruptible / long-running sessions (streams=1 + 1KB chunks is
 # syscall-bound and stays in-flight for many seconds even over loopback).
-$srcBig = Join-Path $root "srcbig"
-New-Item -ItemType Directory -Force -Path $srcBig | Out-Null
-$bigFile = Join-Path $srcBig "big.bin"
+# [36 §3.5] THREE physically isolated fixture variables, each written ONCE with its own
+# SetLength in its own directory -- no variable is shared between cases, so no single
+# SetLength can ever shrink or grow another case's source:
+#   $src              small (15 files + nested)   OM-1 / OM-5a / OM-5b (verbatim, untouched)
+#   $srcLifecycle128  128 MiB (134217728 bytes)   OM-2 srv2 + OM-3 srv3 + the two OM-2 gates
+#   $srcBig512        512 MB (536870912 bytes)   OM-4 srv4 + its gate + the L776 cum guard ONLY
+# 128 is NOT 512: no threshold of one is ever compared against the other (36 §3.5 note);
+# the 512-level big-IO oracle stays with data_integrity/file_range (not touched, not run).
+$script:FcLifecycleBytes = 134217728
+$srcLifecycle128 = Join-Path $root "srclife128"
+New-Item -ItemType Directory -Force -Path $srcLifecycle128 | Out-Null
+$lifeFile = Join-Path $srcLifecycle128 "big.bin"
+$fsLife = [System.IO.File]::Create($lifeFile)
+try { $fsLife.SetLength($script:FcLifecycleBytes) } finally { $fsLife.Close() }
+$script:FcBigBytes = 536870912
+$srcBig512 = Join-Path $root "srcbig512"
+New-Item -ItemType Directory -Force -Path $srcBig512 | Out-Null
+$bigFile = Join-Path $srcBig512 "big.bin"
 $fsBig = [System.IO.File]::Create($bigFile)
-try { $fsBig.SetLength(512MB) } finally { $fsBig.Close() }
+try { $fsBig.SetLength($script:FcBigBytes) } finally { $fsBig.Close() }
 
 $password = "fc-om-pw"
 $serverAddr = "127.0.0.1:$Port"
@@ -557,14 +575,17 @@ try {
     }
 
     if ($Case -contains 'OM-2') {
-    Write-Host "[OM-2] concurrent: two real sessions served at once, exit 0 after both finish"
+    Write-Host "[OM-2] concurrent: two real sessions held at two frame gates, released together, exit 0 after both finish"
     Enter-FcCase -Name 'OM-2'
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before OM-2 server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
     }
+    # [36 section 3.4 step1] srv2 serves the 128MiB lifecycle source; the two gates below
+    # and the SHA oracle use the SAME $script:FcLifecycleBytes constant -- no 512-level
+    # threshold is ever compared against the 128MiB fixture (128 != 512, 36 section 3.5).
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
+        "server", "--dir", $srcLifecycle128, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $grace
     ) -OutLog "$logDir\om2-server.out" -ErrLog "$logDir\om2-server.err"
     if (-not (Wait-PortListening -PortNum $Port -Proc $srv2 -TimeoutSec 15)) {
@@ -572,18 +593,60 @@ try {
             -Proc $srv2 -OutLog "$logDir\om2-server.out" -ErrLog "$logDir\om2-server.err"
         throw "OM-2: server pid=$($srv2.Id) never reached LISTENING on port $Port within 15s"
     }
-    $tgt2a = Join-Path $root "tgt2a"; New-Item -ItemType Directory -Force -Path $tgt2a | Out-Null
-    $tgt2b = Join-Path $root "tgt2b"; New-Item -ItemType Directory -Force -Path $tgt2b | Out-Null
-    $c2a = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt2a, "--password", $password,
-        "--streams", "1", "--chunk-kb", "1"
-    ) -OutLog "$logDir\om2-c2a.out" -ErrLog "$logDir\om2-c2a.err"
-    $c2b = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt2b, "--password", $password,
-        "--streams", "1", "--chunk-kb", "1"
-    ) -OutLog "$logDir\om2-c2b.out" -ErrLog "$logDir\om2-c2b.err"
+    $g2a = $null
+    $g2b = $null
+    $gateLogA = Join-Path $logDir "om2-gate-a.log"
+    $gateLogB = Join-Path $logDir "om2-gate-b.log"
+    $om2Failed = $false
+    try {
+        # [36 section 3.4 step2] Two INDEPENDENT loopback frame gates, both upstreamed to
+        # srv2, CloseMode=Graceful (SyncDone-observing half-close lifecycle), FixtureBytes =
+        # the 128MiB lifecycle constant. Readiness = in-process Listening + the
+        # FRAME_GATE_READY line on disk (A1-shaped; no TCP probe, C2).
+        $g2a = Start-FcFrameGateProxy -UpstreamHost '127.0.0.1' -UpstreamPort $Port `
+            -StopAfterType 31 -CapBytes 64MB -FixtureBytes $script:FcLifecycleBytes `
+            -ReadTimeoutMs 60000 -CloseMode Graceful -LogPath $gateLogA
+        $g2b = Start-FcFrameGateProxy -UpstreamHost '127.0.0.1' -UpstreamPort $Port `
+            -StopAfterType 31 -CapBytes 64MB -FixtureBytes $script:FcLifecycleBytes `
+            -ReadTimeoutMs 60000 -CloseMode Graceful -LogPath $gateLogB
+        if ($g2a.State -ne [FcGate.GateState]::Listening -or $g2b.State -ne [FcGate.GateState]::Listening) {
+            Write-FcDiag -StageTag "OM-2/gate-start" -Reason "FRAME-GATE-NOT-READY" -TimeoutSec 10 `
+                -Proc $srv2 -OutLog "$logDir\om2-server.out" -ErrLog "$logDir\om2-server.err"
+            Write-FcGateDiag -GateObj $g2a -GateLog $gateLogA -CaseTag 'OM-2'
+            Write-FcGateDiag -GateObj $g2b -GateLog $gateLogB -CaseTag 'OM-2'
+            throw "OM-2: FRAME-GATE-NOT-READY gate states a=$($g2a.State) b=$($g2b.State) (expected Listening)"
+        }
+        $readyA = (Select-String -Path $gateLogA -Pattern 'FRAME_GATE_READY' | Select-Object -First 1).Line
+        $readyB = (Select-String -Path $gateLogB -Pattern 'FRAME_GATE_READY' | Select-Object -First 1).Line
+        if (-not $readyA -or -not ($readyA.Contains("port=" + $g2a.Port)) -or
+            -not $readyB -or -not ($readyB.Contains("port=" + $g2b.Port))) {
+            throw "OM-2: FRAME-GATE-NOT-READY FRAME_GATE_READY line missing/wrong on disk (a='$readyA' b='$readyB')"
+        }
+        Write-Host ("  [OM-2] gates ready a={0} b={1} -> upstream 127.0.0.1:{2} (Graceful, fixture={3}B)" -f `
+            $g2a.Port, $g2b.Port, $Port, $script:FcLifecycleBytes)
+
+        # [36 section 3.4 step3] c2a/c2b each go THROUGH their own gate with BOTH --server
+        # and the single --link pin aimed at it (pins[1..] empty => aux lanes = 0, the same
+        # pinning as OM-4 c4a); the slow flags --streams 1 --chunk-kb 1 stay exactly as the
+        # previous direct-connect OM-2 had them (no easy-green removal).
+        $tgt2a = Join-Path $root "tgt2a"; New-Item -ItemType Directory -Force -Path $tgt2a | Out-Null
+        $tgt2b = Join-Path $root "tgt2b"; New-Item -ItemType Directory -Force -Path $tgt2b | Out-Null
+        $gateAddrA = "127.0.0.1:$($g2a.Port)"
+        $gateAddrB = "127.0.0.1:$($g2b.Port)"
+        $c2a = Start-FastCloneProcess -Exe $exe -CliArgs @(
+            "client", "--server", $gateAddrA, "--link", "127.0.0.1=$gateAddrA",
+            "--target", $tgt2a, "--password", $password,
+            "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
+        ) -OutLog "$logDir\om2-c2a.out" -ErrLog "$logDir\om2-c2a.err"
+        $c2b = Start-FastCloneProcess -Exe $exe -CliArgs @(
+            "client", "--server", $gateAddrB, "--link", "127.0.0.1=$gateAddrB",
+            "--target", $tgt2b, "--password", $password,
+            "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
+        ) -OutLog "$logDir\om2-c2b.out" -ErrLog "$logDir\om2-c2b.err"
     # [3.4] Wait until BOTH concurrent sessions are really accepted (two [mp] conn_accept
     # lines in om2-server.out) instead of a fixed 3s sleep; bounded by min(60, case budget).
+    # [36 section 3.4 step4] Kept as the NECESSARY-but-not-sufficient counter gate; the
+    # real overlap proof is the step5 barrier + the step6 evidence snapshot.
     $script:Om2Offset = 0
     $script:Om2Accepts = 0
     $g2 = Wait-FcCondition -Condition {
@@ -597,13 +660,248 @@ try {
             -Proc $srv2 -OutLog "$logDir\om2-c2a.out" -ErrLog "$logDir\om2-c2a.err"
         throw "OM-2: expected 2 [mp] conn_accept within window, saw $($script:Om2Accepts) (ABORT-SIGNAL-MISSING)"
     }
-    $code2a = Wait-ExitCode -Proc $c2a -TimeoutSec 300
-    $code2b = Wait-ExitCode -Proc $c2b -TimeoutSec 300
+
+    # [36 section 3.4 step5] BARRIER: BOTH gates Held at their first complete FileChunk
+    # while srv2 is still up -- the mechanism-level overlap proof (each client has
+    # provably received its first complete chunk and provably not finished; 32-R1: not a
+    # conn_accept/live_conns accumulation, not an active_real sample).
+    $barrierOk = Wait-FcCondition -Condition {
+        ($g2a.State -eq [FcGate.GateState]::Held -and $g2b.State -eq [FcGate.GateState]::Held) -or
+        $srv2.HasExited
+    } -TimeoutSec ([Math]::Min(60, (Get-FcCaseRemainingSec))) -PollMs 100
+    if (-not ($g2a.State -eq [FcGate.GateState]::Held -and $g2b.State -eq [FcGate.GateState]::Held)) {
+        Write-FcDiag -StageTag "OM-2/gate-barrier" -Reason "FRAME-GATE-NO-FILECHUNK" -TimeoutSec 60 `
+            -Proc $srv2 -OutLog "$logDir\om2-server.out" -ErrLog "$logDir\om2-server.err"
+        Write-FcGateDiag -GateObj $g2a -GateLog $gateLogA -CaseTag 'OM-2'
+        Write-FcGateDiag -GateObj $g2b -GateLog $gateLogB -CaseTag 'OM-2'
+        throw "OM-2: FRAME-GATE-NO-FILECHUNK both gates not Held within window (a=$($g2a.State) b=$($g2b.State))"
+    }
+
+    # [36 section 3.4 step6] Evidence snapshot, persisted ONCE, BEFORE the joint Resume --
+    # this is what the overlap claim stands on.
+    # (a) both gate logs: FIRST_FILECHUNK type=31 len>0 cum < FcLifecycleBytes.
+    $chunkLineA = (Select-String -Path $gateLogA -Pattern 'FRAME_GATE_FIRST_FILECHUNK' | Select-Object -First 1).Line
+    $chunkLineB = (Select-String -Path $gateLogB -Pattern 'FRAME_GATE_FIRST_FILECHUNK' | Select-Object -First 1).Line
+    $cLenA = -1; $cCumA = -1; $cLenB = -1; $cCumB = -1
+    if ($chunkLineA) {
+        if ($chunkLineA -match 'len=(\d+)') { $cLenA = [long]$Matches[1] }
+        if ($chunkLineA -match 'cum=(\d+)') { $cCumA = [long]$Matches[1] }
+    }
+    if ($chunkLineB) {
+        if ($chunkLineB -match 'len=(\d+)') { $cLenB = [long]$Matches[1] }
+        if ($chunkLineB -match 'cum=(\d+)') { $cCumB = [long]$Matches[1] }
+    }
+    if ($cLenA -le 0 -or $cCumA -le 0 -or $cCumA -ge $script:FcLifecycleBytes -or
+        $cLenB -le 0 -or $cCumB -le 0 -or $cCumB -ge $script:FcLifecycleBytes) {
+        Write-FcGateDiag -GateObj $g2a -GateLog $gateLogA -CaseTag 'OM-2'
+        Write-FcGateDiag -GateObj $g2b -GateLog $gateLogB -CaseTag 'OM-2'
+        throw "OM-2: FRAME-GATE-NO-FILECHUNK bad first-chunk evidence (a len=$cLenA cum=$cCumA; b len=$cLenB cum=$cCumB; fixture=$($script:FcLifecycleBytes))"
+    }
+    # (b) exactly one accepted connection per gate (multi-lane bypass guard).
+    if ($g2a.AcceptedConnections -ne 1 -or $g2b.AcceptedConnections -ne 1) {
+        Write-FcGateDiag -GateObj $g2a -GateLog $gateLogA -CaseTag 'OM-2'
+        Write-FcGateDiag -GateObj $g2b -GateLog $gateLogB -CaseTag 'OM-2'
+        throw "OM-2: MULTI-LANE gate accepted a=$($g2a.AcceptedConnections) b=$($g2b.AcceptedConnections) (expected 1 each)"
+    }
+    # (c) the two [mp] conn_accept sessionIds are DISTINCT (source-level session identity).
+    $acceptIds = @()
+    foreach ($al in @(Select-String -Path "$logDir\om2-server.out" -Pattern '\[mp\] conn_accept' |
+            ForEach-Object { $_.Line })) {
+        if ($al -match 'sessionId=(\S+)') { $acceptIds += $Matches[1] }
+    }
+    $distinctAcceptIds = @($acceptIds | Select-Object -Unique)
+    if ($distinctAcceptIds.Count -ne 2) {
+        throw "OM-2: SESSION-NOT-DISTINCT conn_accept sessionIds not 2 distinct values (got: $($acceptIds -join ','))"
+    }
+    # (d) both clients .err show [phase] tag=aux_end n=0 (zero aux lanes). The line is
+    # emitted unconditionally (client L803-804) shortly after the lanes settle; the
+    # bounded wait (A3-shaped) keeps a not-yet-written line from being read as a bypass.
+    $script:Om2AuxOffA = 0
+    $script:Om2AuxOffB = 0
+    $script:Om2AuxA = $false
+    $script:Om2AuxB = $false
+    $null = Wait-FcCondition -Condition {
+        $na = Get-FcLogNewLines -Path "$logDir\om2-c2a.err" -Offset ([ref]$script:Om2AuxOffA)
+        foreach ($l in @($na)) { if ($l -match '\[phase\] tag=aux_end n=') { $script:Om2AuxA = $true } }
+        $nb = Get-FcLogNewLines -Path "$logDir\om2-c2b.err" -Offset ([ref]$script:Om2AuxOffB)
+        foreach ($l in @($nb)) { if ($l -match '\[phase\] tag=aux_end n=') { $script:Om2AuxB = $true } }
+        ($script:Om2AuxA -and $script:Om2AuxB) -or $c2a.HasExited -or $c2b.HasExited
+    } -TimeoutSec ([Math]::Min(10, (Get-FcCaseRemainingSec))) -PollMs 250
+    foreach ($ce in @(@("$logDir\om2-c2a.err", 'c2a'), @("$logDir\om2-c2b.err", 'c2b'))) {
+        $auxLine = (Select-String -Path $ce[0] -Pattern '\[phase\] tag=aux_end n=(\d+)' | Select-Object -First 1).Line
+        $auxN = -1
+        if ($auxLine -and $auxLine -match 'n=(\d+)') { $auxN = [int]$Matches[1] }
+        if ($auxN -ne 0) {
+            throw "OM-2: PROXY-BYPASS-AUX-LANE $($ce[1]) aux_end n=$auxN (expected 0; missing line is also a failure)"
+        }
+    }
+    # (e) both clients still ALIVE at the barrier moment (Refresh before asking).
+    $c2a.Refresh()
+    $c2b.Refresh()
+    if ($c2a.HasExited -or $c2b.HasExited) {
+        throw "OM-2: CLIENT-FINISHED-EARLY c2a exited=$($c2a.HasExited) c2b exited=$($c2b.HasExited) at the barrier"
+    }
+    # (f) auxiliary pure-function re-check over the SAME just-collected observable values
+    # (Test-FcOm2OverlapEvidence is a helper, never the only overlap evidence).
+    $overlap = Test-FcOm2OverlapEvidence -E @{
+        GateA_Held    = ($g2a.State -eq [FcGate.GateState]::Held)
+        GateB_Held    = ($g2b.State -eq [FcGate.GateState]::Held)
+        GateA_Cum     = $cCumA
+        GateB_Cum     = $cCumB
+        Accepted_A    = $g2a.AcceptedConnections
+        Accepted_B    = $g2b.AcceptedConnections
+        ClientA_Alive = (-not $c2a.HasExited)
+        ClientB_Alive = (-not $c2b.HasExited)
+        SessionIds    = $acceptIds
+        AuxEndA       = 0
+        AuxEndB       = 0
+        FixtureBytes  = $script:FcLifecycleBytes
+    }
+    if (-not $overlap.Ok) {
+        throw "OM-2: overlap evidence recheck failed: $($overlap.Reasons -join ',')"
+    }
+    Write-Host ("  [OM-2] barrier evidence: both gates Held (a len={0}B cum={1}B; b len={2}B cum={3}B); sessions {4} / {5}; both clients alive; aux=0" -f `
+        $cLenA, $cCumA, $cLenB, $cCumB, $distinctAcceptIds[0], $distinctAcceptIds[1])
+
+    # [36 section 3.4 step7] JOINT release: two consecutive statements -- never "finish A
+    # then release B" (that would prove nothing about overlap).
+    $g2a.Resume(); $g2b.Resume()
+
+    # [36 section 3.4 step8] Both clients exit 0 (each wait clamped to the case budget).
+    # [r44 41-B2] restored the pre-r40 240s window -- 39 S-03's 240->30 tightening was an
+    # unauthorized cap change; the no-timeout-as-completion oracle stays the product-evidence
+    # block right below (no join_recv heartbeat + join_recv->exit <= 5000ms).
+    $code2a = Wait-ExitCode -Proc $c2a -TimeoutSec 240
+    $code2b = Wait-ExitCode -Proc $c2b -TimeoutSec 240
     if ($code2a -ne 0) { throw "OM-2: client A expected exit 0, got $code2a" }
     if ($code2b -ne 0) { throw "OM-2: client B expected exit 0, got $code2b" }
+
+    # [39 B-01 product evidence] The forwarded downstream EOF must wake each client's blocked
+    # recv thread immediately (sync_engine_client.cpp L1421-1422; pre-fix the join hung on the
+    # 120s idle watchdog, L5115-5124/L681, logging 5s-interval [hb] stage=join_recv heartbeats
+    # -- the retained r38 run showed 24 of them before exit at t_ms=120591). Hard per-client
+    # evidence: (1) NO join_recv heartbeat line may exist, and (2) the exit phase must land
+    # within 5000ms of the join_recv phase (the direct-connection reference is ~5ms; 5000ms
+    # = one heartbeat interval, i.e. strictly before any watchdog rescue could fire).
+    foreach ($ce in @(@("$logDir\om2-c2a.err", 'c2a'), @("$logDir\om2-c2b.err", 'c2b'))) {
+        $cliErrText = Get-FcLogFullText -Path $ce[0]
+        if ($null -eq $cliErrText) { $cliErrText = '' }
+        if ($cliErrText -match '\[hb\][^\r\n]*stage=join_recv') {
+            throw "OM-2: $($ce[1]) still blocks in join_recv ([hb] stage=join_recv heartbeat present -- the downstream EOF was not forwarded; the pre-fix run relied on the 120s idle-watchdog rescue)"
+        }
+        $jrMs = -1; $exitMs = -1
+        foreach ($pl in @($cliErrText -split "`r?`n")) {
+            if ($pl -match '\[phase\] tag=join_recv t_ms=(\d+)') { $jrMs = [int]$Matches[1] }
+            elseif ($pl -match '\[phase\] tag=exit code=\d+ t_ms=(\d+)') { $exitMs = [int]$Matches[1] }
+        }
+        if ($jrMs -lt 0 -or $exitMs -lt 0) {
+            throw "OM-2: $($ce[1]) .err lacks the join_recv/exit phase lines (join_recv=$jrMs exit=$exitMs)"
+        }
+        if (($exitMs - $jrMs) -gt 5000) {
+            throw "OM-2: $($ce[1]) join_recv->exit gap $($exitMs - $jrMs)ms exceeds 5000ms (the client was NOT woken by the forwarded downstream EOF; pre-fix gap was ~120000ms)"
+        }
+    }
+
+    # [36 section 3.4 step9] Server-side protocol completion: srv2 exit 0 within 30s,
+    # EXACTLY two [mp] conn_done whose sessionId SET equals the two conn_accept sessionIds
+    # (source-level reconciliation, sync_engine_server.cpp L2627/L2641-2642), and NO
+    # [mp] conn_error anywhere on this clean path (the gate's own SyncDone/Finished
+    # self-evidence is only the transport layer; the PROTOCOL verdict is this joint chain).
     $code2 = Wait-ExitCode -Proc $srv2 -TimeoutSec 30
     if ($code2 -ne 0) { throw "OM-2: server expected exit 0 after both finished, got $code2" }
-    Write-Host "  OK two concurrent sessions served; server exit=$code2"
+    $doneLines = @(Select-String -Path "$logDir\om2-server.out" -Pattern '\[mp\] conn_done' |
+        ForEach-Object { $_.Line })
+    if ($doneLines.Count -ne 2) {
+        throw "OM-2: expected exactly 2 [mp] conn_done, got $($doneLines.Count) ($($doneLines -join ' | '))"
+    }
+    $doneIds = @()
+    foreach ($dl in $doneLines) { if ($dl -match 'sessionId=(\S+)') { $doneIds += $Matches[1] } }
+    $distinctDoneIds = @($doneIds | Select-Object -Unique)
+    if ($distinctDoneIds.Count -ne 2) {
+        throw "OM-2: conn_done sessionIds not 2 distinct values (got: $($doneIds -join ','))"
+    }
+    $missingIds = @($distinctAcceptIds | Where-Object { $distinctDoneIds -notcontains $_ })
+    $extraIds = @($distinctDoneIds | Where-Object { $distinctAcceptIds -notcontains $_ })
+    if ($missingIds.Count -gt 0 -or $extraIds.Count -gt 0) {
+        throw "OM-2: conn_done/conn_accept sessionId reconciliation failed (missing=$($missingIds -join ',') extra=$($extraIds -join ','))"
+    }
+    $om2ErrText = Get-FcLogFullText -Path "$logDir\om2-server.err"
+    if ($null -ne $om2ErrText -and $om2ErrText -match '\[mp\] conn_error') {
+        throw "OM-2: clean path produced [mp] conn_error (see om2-server.err)"
+    }
+
+    # [36 section 3.4 step10] Both gates reach Finished inside the bounded 15s window
+    # (the 60s read timeout stays a stall backstop only, never the normal terminator);
+    # SYNCDONE_FORWARDED strictly before FINISHED per gate; no ABORTED, no ERROR.
+    foreach ($gp in @(@($g2a, $gateLogA, 'a'), @($g2b, $gateLogB, 'b'))) {
+        $gObj = $gp[0]; $gLog = $gp[1]; $gTag = $gp[2]
+        if (-not $gObj.WaitForState([FcGate.GateState]::Finished, 15000)) {
+            Write-FcGateDiag -GateObj $gObj -GateLog $gLog -CaseTag 'OM-2'
+            throw "OM-2: gate $gTag did not reach Finished within 15s (state=$($gObj.State))"
+        }
+        $gLogText = Get-Content -LiteralPath $gLog -Raw
+        if (-not (Test-FcGateFinishedOrder -LogText $gLogText)) {
+            throw "OM-2: gate $gTag log lacks SYNCDONE_FORWARDED-before-FINISHED order evidence"
+        }
+        if ($gLogText -notmatch '(?m)^FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND ') {
+            throw "OM-2: gate $gTag log lacks the downstream half-close evidence (the server EOF was not forwarded to the client; 39 B-01)"
+        }
+        if ($gLogText -match 'FRAME_GATE_UPSTREAM_ABORTED' -or $gLogText -match 'FRAME_GATE_ERROR') {
+            throw "OM-2: gate $gTag log shows ABORTED/ERROR on the clean path"
+        }
+    }
+
+    # [36 section 3.4 step11] Full byte equivalence: source vs BOTH targets (SHA256 + exact
+    # length; the target file carries the same relative name as the source leaf).
+    $tgt2aFile = Join-Path $tgt2a "big.bin"
+    $tgt2bFile = Join-Path $tgt2b "big.bin"
+    foreach ($tf in @($tgt2aFile, $tgt2bFile)) {
+        if (-not (Test-Path -LiteralPath $tf)) {
+            throw "OM-2: target file missing after sync: $tf"
+        }
+        $tl = (Get-Item -LiteralPath $tf).Length
+        if ($tl -ne $script:FcLifecycleBytes) {
+            throw "OM-2: target length $tl != $($script:FcLifecycleBytes) ($tf)"
+        }
+    }
+    $srcHash2 = (Get-FileHash -LiteralPath $lifeFile -Algorithm SHA256).Hash
+    $hashA2 = (Get-FileHash -LiteralPath $tgt2aFile -Algorithm SHA256).Hash
+    $hashB2 = (Get-FileHash -LiteralPath $tgt2bFile -Algorithm SHA256).Hash
+    if ($hashA2 -ne $srcHash2 -or $hashB2 -ne $srcHash2) {
+        throw "OM-2: SHA256 mismatch src=$srcHash2 a=$hashA2 b=$hashB2"
+    }
+    Write-Host "  OK two concurrent sessions through both gates; server exit=$code2; SHA256 three-way equal"
+    }
+    catch {
+        # [36 section 3.4 step12] A11-shaped: both gate snapshots + log tails BEFORE any
+        # cleanup, then the ORIGINAL exception propagates unchanged (never masked).
+        $om2Failed = $true
+        if (-not $script:FcDiagEmitted) {
+            Write-FcDiag -StageTag "OM-2/unhandled" -Reason "unhandled-failure" -TimeoutSec 0 `
+                -Proc $null -OutLog $null -ErrLog $null
+        }
+        Write-FcGateDiag -GateObj $g2a -GateLog $gateLogA -CaseTag 'OM-2'
+        Write-FcGateDiag -GateObj $g2b -GateLog $gateLogB -CaseTag 'OM-2'
+        throw
+    }
+    finally {
+        # [36 section 3.4 step13 / section 2.3] Per-gate Dispose (aggregate 5000ms each)
+        # BEFORE the global Stop-AllFastClone -- killing the server first would make the
+        # gates' pending reads fail and pollute the verdict. A dispose timeout is APPENDED
+        # (FRAME-GATE-CLOSE-TIMEOUT) and never masks the original failure.
+        foreach ($gObj in @($g2a, $g2b)) {
+            if ($null -ne $gObj) {
+                try { $gObj.Dispose() } catch {
+                    Write-Host "  [OM-2] FRAME-GATE-CLOSE-TIMEOUT: gate dispose threw: $_" -ForegroundColor Red
+                }
+                if ($gObj.DisposeTimedOut) {
+                    $closeFail = "OM-2: FRAME-GATE-CLOSE-TIMEOUT gate worker threads did not join within $($gObj.DisposeTimeoutMs)ms"
+                    Write-Host "FAILED: $closeFail" -ForegroundColor Red
+                    if (-not $om2Failed) { throw $closeFail }
+                }
+            }
+        }
+    }
     }
 
     if ($Case -contains 'OM-3') {
@@ -615,7 +913,7 @@ try {
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
     }
     $srv3 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
+        "server", "--dir", $srcLifecycle128, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $longGrace
     ) -OutLog "$logDir\om3-server.out" -ErrLog "$logDir\om3-server.err"
     if (-not (Wait-PortListening -PortNum $Port -Proc $srv3 -TimeoutSec 15)) {
@@ -691,7 +989,7 @@ try {
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
     }
     $srv4 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "server", "--dir", $srcBig, "--password", $password, "--port", "$Port", $bindLoopbackArg,
+        "server", "--dir", $srcBig512, "--password", $password, "--port", "$Port", $bindLoopbackArg,
         "--once-multi", "--once-idle-grace", $grace
     ) -OutLog "$logDir\om4-server.out" -ErrLog "$logDir\om4-server.err"
     if (-not (Wait-PortListening -PortNum $Port -Proc $srv4 -TimeoutSec 15)) {
