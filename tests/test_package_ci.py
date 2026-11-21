@@ -774,6 +774,24 @@ class TestStaticCiGating(unittest.TestCase):
         build = next(i for i, l in enumerate(lines) if "Build (ARM64, no test)" in l)
         pkg = next(i for i, l in enumerate(lines) if "Package (cross)" in l)
         self.assertLess(build, pkg)
+        # 66 §3.3: the ARM64 LTCG-ICE workaround -D is scoped to the
+        # windows-arm64 Configure only. NOTE: _job_block() has no col-0
+        # terminator under `jobs:` (its blocks run to EOF), so the other
+        # jobs are bounded by the next 2-space job key exactly like
+        # test_v02's block() -- same scope proof, no helper change.
+        self.assertIn("-DFC_ARM64_MSVC_NO_LTCG_FILE_INDEX=ON", wa)
+        self.assertEqual(self.code.count("FC_ARM64_MSVC_NO_LTCG_FILE_INDEX"), 1)
+        jobs_at = next(i for i, l in enumerate(self.lines) if l.rstrip() == "jobs:")
+        job_keys = [i for i, l in enumerate(self.lines)
+                    if i > jobs_at and re.match(r"^  [A-Za-z0-9_-]+:$", l)]
+
+        def _block(job):
+            s = next(i for i in job_keys if self.lines[i].rstrip() == "  %s:" % job)
+            e = next((j for j in job_keys if j > s), len(self.lines))
+            return "\n".join(self.lines[s:e])
+
+        self.assertNotIn("FC_ARM64_MSVC_NO_LTCG_FILE_INDEX",
+                         _block("build-test") + "\n" + _block("sanitizers"))
 
     def test_no_continue_on_error(self):
         self.assertNotIn("continue-on-error", self.code)

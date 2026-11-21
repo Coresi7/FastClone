@@ -35,6 +35,7 @@ include(GNUInstallDirs)
 # ON: take kFastCloneVersion verbatim from the committed FastClone/version.h (strict
 # quoted MAJOR.MINOR.PATCH, FATAL on missing/invalid); no +1, no .fcversion, no rewrite.
 option(FC_VERSION_FREEZE "CI version freeze: use committed FastClone/version.h verbatim (no auto-increment, no .fcversion, no version.h rewrite)" OFF)
+option(FC_ARM64_MSVC_NO_LTCG_FILE_INDEX "ARM64 cross only: compile file_index.cpp without /GL (MSVC p2 ICE workaround)" OFF)
 set(FC_VERSION_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/FastClone/version.h")
 set(FC_VERSION_COUNTER_FILE "${CMAKE_CURRENT_SOURCE_DIR}/.fcversion")
 
@@ -178,6 +179,13 @@ if(MSVC)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_compile_options($<$<NOT:$<CONFIG:Debug>>:/GL>)
         add_link_options($<$<NOT:$<CONFIG:Debug>>:/LTCG>)
+    endif()
+    if(FC_ARM64_MSVC_NO_LTCG_FILE_INDEX)
+        string(TOUPPER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" _fc_arch_upper)
+        if(NOT _fc_arch_upper STREQUAL "ARM64")
+            message(FATAL_ERROR "FC_ARM64_MSVC_NO_LTCG_FILE_INDEX=ON requires MSVC targeting ARM64; MSVC=${MSVC} id='${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}' compiler='${CMAKE_CXX_COMPILER_ID}'")
+        endif()
+        set_source_files_properties(FastClone/file_index.cpp PROPERTIES COMPILE_OPTIONS "/GL-")
     endif()
 endif()
 
