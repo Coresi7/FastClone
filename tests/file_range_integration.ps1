@@ -326,7 +326,12 @@ public static extern int GetLongPathName(string lpszShortPath, System.Text.Strin
 $fcSavedBuildEnv = @{}
 foreach ($fcEnvVar in 'LIB', 'LIBPATH', 'INCLUDE') {
     $fcSavedBuildEnv[$fcEnvVar] = [Environment]::GetEnvironmentVariable($fcEnvVar)
-    Remove-Item "Env:\$fcEnvVar" -ErrorAction SilentlyContinue
+    # [r63 / G-AC8] Env-var clearing via the .NET API only: the host's wrapped
+    # file-delete cmdlet throws a terminating error on non-existing Env:
+    # entries (dev-map section 4.6, same treatment as
+    # once_multi_test_support.ps1); $null == unset, exactly the old semantics,
+    # and no delete-cmdlet literal remains anywhere in this script.
+    [Environment]::SetEnvironmentVariable($fcEnvVar, $null)
 }
 try {
     $longPathUtil = Add-Type -MemberDefinition $longPathSig -Name 'LongPathUtilFR' -Namespace 'FcDiag' -PassThru
@@ -478,7 +483,7 @@ try {
         throw "FR-A: unexpected finalize failure"
     }
     Write-Host "  OK FR-A: $($srcHashes.Count) files SHA256-match; file_range lanes: $($frConns -join ',')"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-A target dir (no deletion by design): $tgt"
 
     # ================= FR-B: block OFF (explicit off form), 2 lanes ==================
     # Since T-largefile-block-auto-default the DEFAULT is auto (which would activate on 2
@@ -517,7 +522,7 @@ try {
         throw "FR-B: unexpected [file_range] lines with the switch OFF (AC-07 regression)"
     }
     Write-Host "  OK FR-B: explicit off keeps the legacy path (no file_range frames), SHA256 match"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-B target dir (no deletion by design): $tgt"
 
     # ============================ FR-C: block ON, 1 lane =============================
     Write-Host ""
@@ -549,7 +554,7 @@ try {
         throw "FR-C: unexpected kind=file_range with a single lane (AC-05 regression)"
     }
     Write-Host "  OK FR-C: single-lane fallback to legacy path, SHA256 match"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-C target dir (no deletion by design): $tgt"
 
     # ============ FR-E: NO-VALUE form = AUTO, 2 lanes (auto-activates) ==============
     # Since T-largefile-block-auto-default (C-4) the no-value form `--large-file-block`
@@ -595,7 +600,7 @@ try {
         throw "FR-E: unexpected finalize failure"
     }
     Write-Host "  OK FR-E: no-value = auto, block mode auto-activated (32M default), SHA256 match; lanes: $($frConnsE -join ',')"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-E target dir (no deletion by design): $tgt"
 
     # ================= FR-D: block ON, 2 lanes, kill lane mid-transfer ================
     Write-Host ""
@@ -691,7 +696,7 @@ try {
         throw "FR-D: unexpected finalize failure after reroute"
     }
     Write-Host "  OK FR-D: lane kill -> block reroute, all SHA256 match (allocs=$allocCount)"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-D target dir (no deletion by design): $tgt"
 
     # ================ FR-F: delta too-different -> routed to block mode ================
     # T-largefile-block-multinic follow-up: a large file whose LOCAL old version differs >65%
@@ -787,7 +792,7 @@ try {
     $diffF = Compare-FileHashTrees -Src $srcHashesF -Tgt (Get-FileHashTree -Root $tgtF)
     if ($null -ne $diffF) { throw "FR-F: DATA INTEGRITY FAILURE: $diffF" }
     Write-Host "  OK FR-F: delta too-different fallback routed to block (lanes: $($frConnsF -join ',')), SHA256 match"
-    Remove-Item -Recurse -Force $tgtF -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-F target dir (no deletion by design): $tgtF"
 
     # ================ FR-G: batch 占满 lane + 块流存活 + 无 H1 预读 ================
     # T-block-lane-quota-and-h1-hash. Verifies on a small loopback fixture:
@@ -868,7 +873,7 @@ try {
         throw "FR-G: unexpected finalize failure"
     }
     Write-Host "  OK FR-G: file_range alloc=$allocG lanes=$($frConnsG -join ','), hash_req_sent=0, SHA256 match"
-    Remove-Item -Recurse -Force $tgtG -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-G target dir (no deletion by design): $tgtG"
 
     # ============ FR-H: default ABSENT (auto) + 2 lanes -> auto-activation ============
     # T-largefile-block-auto-default AC-01/AC-03: no --large-file-block on the command line at
@@ -928,7 +933,7 @@ try {
         throw "FR-H: unexpected finalize failure"
     }
     Write-Host "  OK FR-H: default auto activated (block=33554432, lanes: $($frConnsH -join ',')), SHA256 match"
-    Remove-Item -Recurse -Force $tgtH -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-H target dir (no deletion by design): $tgtH"
 
     # ============ FR-I: default auto + explicit --large-file-lane -> treated as off ======
     # T-largefile-block-auto-default AC-19 (C-3 case 1): the PRESENCE of --large-file-lane is
@@ -979,7 +984,7 @@ try {
         throw "FR-I: expected a lane-pinned legacy large-file alloc (kind=file large=1 primary=1)"
     }
     Write-Host "  OK FR-I: auto+lane folded to off (no file_range), lane pinning applied, SHA256 match"
-    Remove-Item -Recurse -Force $tgtI -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-I target dir (no deletion by design): $tgtI"
 
     # ============ FR-J: forced ON (size) + --large-file-lane -> parse-time rejection =====
     # T-largefile-block-auto-default AC-20 (C-3 case 2): an explicit contradiction must be
@@ -1002,16 +1007,24 @@ try {
         throw "FR-J: error message must name --large-file-lane"
     }
     Write-Host "  OK FR-J: on+lane rejected at parse time (exit=$codeJ), error names both flags"
-    Remove-Item -Recurse -Force $tgtJ -ErrorAction SilentlyContinue
+    Write-Host "  RETAINED FR-J target dir (no deletion by design): $tgtJ"
 
     Write-Host ""
     Write-Host "All file-range integration tests passed. Logs: $logDir"
+    # [r63 / G-AC8] Zero-delete retention (mirrors once_server/reconnect):
+    # this script executes no deletion of any kind -- the unique run tree
+    # (fastclone-file-range-<random> directly under $env:TEMP, this run's
+    # own) is retained and its path printed so the CI failure-artifact
+    # upload can collect the per-case logs; per-case target dirs above are
+    # likewise retained with their own paths.
+    Write-Host "RETAINED run temp root (no deletion by design; logs: $logDir): $root"
     Stop-AllFastClone
     exit 0
 }
 catch {
     Write-Host "FAILED: $_" -ForegroundColor Red
     Write-Host "Logs: $logDir"
+    Write-Host "RETAINED run temp root (no deletion by design; logs: $logDir): $root"
     Stop-AllFastClone
     Get-Process powershell -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'file_range_tcp_proxy' } |

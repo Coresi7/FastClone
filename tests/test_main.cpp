@@ -24,6 +24,7 @@ void RunWritePathAccountingTests();
 void RunComparePhaseTests();
 void RunComparePipelineTests();
 void RunProtocolCodecTests();
+void RunTaskQueueShutdownTests();
 // unify-probe-extra-shared: shared probe / extra-scan / source-gate tests.
 namespace fc::test {
 void RunSharedProbeTestsFastCloneSide();
@@ -69,6 +70,7 @@ int main() {
         RunTest("RunComparePhaseTests", RunComparePhaseTests);
         RunTest("RunComparePipelineTests", RunComparePipelineTests);
         RunTest("RunProtocolCodecTests", RunProtocolCodecTests);
+        RunTest("RunTaskQueueShutdownTests", RunTaskQueueShutdownTests);
         RunTest("fc::test::RunSharedProbeTestsFastCloneSide", fc::test::RunSharedProbeTestsFastCloneSide);
         RunTest("fc::test::RunSharedExtraScanTestsFastCloneSide", fc::test::RunSharedExtraScanTestsFastCloneSide);
         RunTest("fc::test::RunSharedSourceGateTests", fc::test::RunSharedSourceGateTests);

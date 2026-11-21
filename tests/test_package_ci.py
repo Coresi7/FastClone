@@ -714,6 +714,34 @@ class TestStaticCiGating(unittest.TestCase):
                 break
         return self.lines[start:end]
 
+    def _step_texts(self, name_needle):
+        """Comment-stripped text of every step block whose `- name:` line
+        contains name_needle. A step block starts at the 6-space `- name:`
+        line and ends right before the next 6-space `-` line or the first
+        non-empty line indented by less than 6 spaces. unique62 B-01: the
+        production and diagnostic upload steps carry different contracts,
+        so their pins are scoped per step, not just counted globally."""
+        stripped = [re.sub(r"(^|\s)#.*$", "", l).rstrip() for l in self.lines]
+        texts = []
+        cur = None
+        for l in stripped:
+            m = re.match(r"^      - name: (.*)$", l)
+            if m:
+                if cur is not None:
+                    texts.append("\n".join(cur))
+                cur = [l] if name_needle in m.group(1) else None
+                continue
+            if cur is None:
+                continue
+            if not l.strip() or l.startswith("      "):
+                cur.append(l)
+            else:
+                texts.append("\n".join(cur))
+                cur = None
+        if cur is not None:
+            texts.append("\n".join(cur))
+        return texts
+
     def test_job_inventory_unchanged(self):
         body = self.text.split("jobs:", 1)[1]
         jobs = [l.strip()[:-1] for l in body.splitlines()
@@ -751,11 +779,58 @@ class TestStaticCiGating(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.code)
 
     def test_uploads_are_strict(self):
+        # unique62 B-01: three upload steps exist now -- the two PRODUCTION
+        # uploads (build-test native matrix -> one package per OS, plus the
+        # windows-arm64 cross package; 4 production packages, never 5: the
+        # diagnostic is not a package) and ONE Windows failure-only
+        # diagnostic upload (59 section 3.9). Production pins stay exactly
+        # as strict as the pre-diagnostic era; the diagnostic carries its
+        # own bounded policy and never touches the package outputs.
+        self.assertEqual(self.code.count("uses: actions/upload-artifact@v4"), 3)
+        # --- production (2 steps): validated package outputs only, hard
+        # --- fail on a missing manifest, no retention policy change.
         self.assertEqual(self.code.count("if-no-files-found: error"), 2)
         self.assertEqual(self.code.count("steps.pkg.outputs.dist_glob"), 2)
         self.assertEqual(self.code.count("steps.pkg.outputs.artifact_name"), 2)
-        self.assertEqual(self.code.count("uses: actions/upload-artifact@v4"), 2)
-        self.assertNotIn("retention-days", self.code)
+        prod = self._step_texts("Upload package")
+        self.assertEqual(len(prod), 2)
+        for p in prod:
+            self.assertIn("uses: actions/upload-artifact@v4", p)
+            self.assertIn("name: ${{ steps.pkg.outputs.artifact_name }}", p)
+            self.assertIn("path: ${{ steps.pkg.outputs.dist_glob }}", p)
+            self.assertIn("if-no-files-found: error", p)
+            self.assertIn("if: success()", p)
+            self.assertNotIn("continue-on-error", p)
+            self.assertNotIn("retention-days", p)
+        # --- diagnostic (exactly 1): failure-only + Windows-only, its own
+        # --- artifact name (never the package glob), ignore-if-empty (worst
+        # --- case the diag artifact is absent, never a false red), and the
+        # --- ONLY retention-days allowed in the workflow: 7 days.
+        diag = self._step_texts("Upload Windows test logs")
+        self.assertEqual(len(diag), 1)
+        d = diag[0]
+        self.assertIn("if: failure() && runner.os == 'Windows'", d)
+        self.assertIn("uses: actions/upload-artifact@v4", d)
+        self.assertIn("name: win-test-logs-${{ github.run_id }}-${{ github.run_attempt }}", d)
+        self.assertNotIn("steps.pkg.outputs", d)
+        self.assertIn("if-no-files-found: ignore", d)
+        self.assertEqual(self.code.count("if-no-files-found: ignore"), 1)
+        self.assertEqual(self.code.count("retention-days"), 1)
+        self.assertIn("retention-days: 7", d)
+        # Literal path entries: log metadata only, across the multiple run
+        # roots; never a binary or a package artifact. Exact frozen set:
+        # onemulti x3 (out/err/log) + once x3 + reconnect x2 (out/err) +
+        # the ctest Testing glob = 9 entries.
+        path_lines = [l.strip() for l in d.splitlines()
+                      if l.strip().startswith(("${{", "build/"))]
+        self.assertTrue(path_lines, "diagnostic path block is empty")
+        for pl in path_lines:
+            self.assertRegex(
+                pl,
+                r"^(\$\{\{ env\.FC_WIN_TEMP \}\}/fastclone-"
+                r"(onemulti|once|reconnect)-it-\*/logs/\*\.(out|err|log)"
+                r"|build/Testing/\*\*/\*\.log)$")
+        self.assertEqual(len(path_lines), 9)
 
     def test_protected_sections_untouched(self):
         self.assertIn("permissions:", self.text)

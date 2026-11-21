@@ -380,6 +380,7 @@ add_executable(FastCloneTests
     tests/test_cli.cpp
     tests/test_compare_phase.cpp
     tests/test_compare_pipeline.cpp
+    tests/test_task_queue_shutdown.cpp
     tests/test_protocol_codec.cpp
     tests/test_delta.cpp
     tests/test_streaming_buildplan.cpp

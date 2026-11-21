@@ -22,6 +22,14 @@ $ErrorActionPreference = "Stop"
 # Optional server arg fragment: empty in production, "--bind-loopback" in test mode.
 $bindLoopbackArg = if ($BindLoopback) { "--bind-loopback" } else { "" }
 
+# [59 section 3.7 / C7] OS-5b needs the loopback frame-gate proxy (Start-FcFrameGateProxy)
+# for its deterministic in-flight hold. The support module is DEFINITIONS + shared-state
+# init ONLY (no main body, no side effects at dot-source time; the C# compile happens on
+# the first Start-FcFrameGateProxy call). Function sets are disjoint from this script's
+# own helpers (verified: 17 vs 18 names, zero overlaps), so the dot-source only ADDS the
+# gate/budget-wait/log-parse primitives this script now uses.
+. "$PSScriptRoot\once_multi_test_support.ps1"
+
 function Resolve-FastCloneExe {
     param([string]$Hint)
     if ($Hint -and (Test-Path $Hint)) { return (Resolve-Path $Hint).Path }
@@ -380,35 +388,122 @@ try {
             -Proc $srv5b -OutLog "$logDir\os5b-server.out" -ErrLog "$logDir\os5b-server.err"
         throw "OS-5b: server pid=$($srv5b.Id) never reached LISTENING on port $Port within 15s"
     }
+    $g5b = $null
+    $gate5bLog = Join-Path $logDir "os5b-gate.log"
+    try {
+    # [59 section 3.7 / C7] Deterministic in-flight: a Graceful frame gate holds the
+    # FIRST complete FileChunk (type 31) of the 512MB session, so cli5b1 is provably
+    # mid-transfer (state-machine Held, not an elapsed-time guess). The single --link
+    # pin keeps the client to ONE lane (blockModeActive() needs >=2 healthy lanes,
+    # sync_engine_client L2188-2192), so the payload path stays FileChunk frames and
+    # StopAfterType 31 is reliable. The deliberate slow flags (--streams 1 --chunk-kb 1)
+    # are GONE: the gate, not syscall slowness, now guarantees in-flight, so the 512MB
+    # payload moves at full speed inside the SAME 180s completion windows (the CI
+    # failure 44714408885 was 512MB / ~2.7MB/s ~= 190s > 180s -- structural, not a
+    # hang; the fixture stays 512MB, the business path stays the real big-file path).
+    $g5b = Start-FcFrameGateProxy -UpstreamHost '127.0.0.1' -UpstreamPort $Port `
+        -StopAfterType 31 -CapBytes 64MB -FixtureBytes 512MB `
+        -ReadTimeoutMs 60000 -CloseMode Graceful -LogPath $gate5bLog
     $tgt5b1 = Join-Path $root "tgt5b1"
     New-Item -ItemType Directory -Force -Path $tgt5b1 | Out-Null
+    $gate5bAddr = "127.0.0.1:$($g5b.Port)"
     $cli5b1 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt5b1, "--password", $password,
-        "--reconnect-retries", "0", "--streams", "1", "--chunk-kb", "1"
+        "client", "--server", $gate5bAddr, "--link", "127.0.0.1=$gate5bAddr",
+        "--target", $tgt5b1, "--password", $password,
+        "--reconnect-retries", "0"
     ) -OutLog "$logDir\os5b-cli1.out" -ErrLog "$logDir\os5b-cli1.err"
-    Start-Sleep -Seconds 2
-    if ($cli5b1.HasExited) {
-        throw "OS-5b: first client finished too fast; fixture no longer in-flight"
+    # Readiness = the REAL Held state (bounded by min(60s, global remaining); NOTE
+    # WaitForState takes MILLISECONDS -- 60000 = 60s, matching the 15000ms Finished wait
+    # below) plus the client provably still alive -- no Start-Sleep guess. Held itself
+    # is the in-flight proof: the server has sent (and the gate has verified) a complete
+    # FileChunk of the 512MB payload while the transfer is frozen.
+    $held5b = $g5b.WaitForState([FcGate.GateState]::Held, [Math]::Min(60000, ((Get-FcRemainingSec) * 1000)))
+    $cli5b1.Refresh()
+    if (-not $held5b -or $cli5b1.HasExited) {
+        Write-FcDiag -StageTag "OS-5b/gate-not-held" -Reason "FRAME-GATE-NO-FILECHUNK" -TimeoutSec 60 `
+            -Proc $cli5b1 -OutLog "$logDir\os5b-cli1.out" -ErrLog "$logDir\os5b-cli1.err"
+        Write-Host ("  [OS-5b] gate snapshot: " + $g5b.Snapshot())
+        if (Test-Path $gate5bLog) {
+            Write-Host "  [OS-5b] gate log tail:"
+            Get-Content $gate5bLog -Tail 12 | ForEach-Object { Write-Host ("    " + $_) }
+        }
+        throw "OS-5b: gate did not reach Held within window (state=$($g5b.State)) cli1 exited=$($cli5b1.HasExited)"
     }
+    # Second client: WRONG password, DIRECT to the server (not through the gate). The
+    # once server is already serving cli5b1's held session, so this handshake must be
+    # rejected with AuthFail (client_handshake "Server authentication rejected") and a
+    # fatal exit 1 -- deterministic, no dependence on "single slot" wording. The server
+    # must NOT finish on this rejected connection: the single-session evidence is the
+    # exactly-one [mp] conn_accept check below (a failed handshake never conn_accepts).
     $tgt5b2 = Join-Path $root "tgt5b2"
     New-Item -ItemType Directory -Force -Path $tgt5b2 | Out-Null
     $cli5b2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt5b2, "--password", $password,
+        "client", "--server", $serverAddr, "--target", $tgt5b2, "--password", "wrong-password",
         "--reconnect-retries", "0"
     ) -OutLog "$logDir\os5b-cli2.out" -ErrLog "$logDir\os5b-cli2.err"
-    $code5b2 = Wait-ExitCode -Proc $cli5b2 -TimeoutSec 10
+    $code5b2 = Wait-ExitCode -Proc $cli5b2 -TimeoutSec 10 -StageTag "OS-5b-cli2"
     if ($code5b2 -ne 1) {
-        throw "OS-5b: second client expected fatal exit 1, got $code5b2"
+        throw "OS-5b: second client expected fatal exit 1 (AuthFail), got $code5b2"
     }
     $err5b2 = Get-Content "$logDir\os5b-cli2.err" -Raw -ErrorAction SilentlyContinue
-    if ($err5b2 -notmatch "authentication rejected|once: server already serving one session") {
-        throw "OS-5b: second client stderr missing AuthFail/once rejection text: $err5b2"
+    if ($err5b2 -notmatch "authentication rejected") {
+        throw "OS-5b: second client stderr missing AuthFail text: $err5b2"
     }
-    $code5b1 = Wait-ExitCode -Proc $cli5b1 -TimeoutSec 180
+    $accept5bCount = @(Select-String -Path "$logDir\os5b-server.out" -Pattern '\[mp\] conn_accept' `
+        -ErrorAction SilentlyContinue).Count
+    if ($accept5bCount -ne 1) {
+        throw "OS-5b: expected exactly 1 [mp] conn_accept (the gate upstream only), got $accept5bCount"
+    }
+    # Release the hold: cli5b1 must complete (exit 0) and the once-server must exit 0,
+    # both inside the ORIGINAL 180s windows (512MB at full loopback speed; no budget
+    # change, no extended waits).
+    $g5b.Resume()
+    $code5b1 = Wait-ExitCode -Proc $cli5b1 -TimeoutSec 180 -StageTag "OS-5b-cli1"
     if ($code5b1 -ne 0) { throw "OS-5b: first client expected exit 0, got $code5b1" }
-    $code5b = Wait-ExitCode -Proc $srv5b -TimeoutSec 180
+    $code5b = Wait-ExitCode -Proc $srv5b -TimeoutSec 180 -StageTag "OS-5b-server"
     if ($code5b -ne 0) { throw "OS-5b: server --once expected exit 0, got $code5b" }
-    Write-Host "  OK second Auth rejected; first session completed; server exit=$code5b"
+    # Gate lifecycle evidence: a complete SyncDone was forwarded, the drain reached EOF,
+    # and the gate reached Finished (bounded log-content wait; the FINISHED line is
+    # written by the gate's downlink thread right after the state flips).
+    $null = Wait-FcCondition -Condition {
+        $t = Get-FcLogFullText -Path $gate5bLog
+        ($null -ne $t) -and (Test-FcGateFinishedOrder -LogText $t) -and
+        ($t -match '(?m)^FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1')
+    } -TimeoutSec 15 -PollMs 200
+    $gate5bText = Get-FcLogFullText -Path $gate5bLog
+    if (-not (Test-FcGateFinishedOrder -LogText $gate5bText)) {
+        throw "OS-5b: gate log lacks SYNCDONE_FORWARDED-before-FINISHED order evidence"
+    }
+    if ($gate5bText -notmatch '(?m)^FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1') {
+        throw "OS-5b: gate log lacks FRAME_GATE_FINISHED sync_done_forwarded=1 eof=1"
+    }
+    if (-not $g5b.WaitForState([FcGate.GateState]::Finished, 15000)) {
+        throw "OS-5b: gate did not reach Finished within 15s (state=$($g5b.State))"
+    }
+    # Server-side protocol completion for the held session.
+    if (-not (Select-String -Path "$logDir\os5b-server.out" -Pattern '\[mp\] conn_done' -Quiet)) {
+        throw "OS-5b: server log lacks [mp] conn_done for the held session"
+    }
+    # Byte-for-byte: the 512MB target equals the source (length + SHA256, three-way with
+    # the fixture itself).
+    $tgt5b1File = Join-Path $tgt5b1 "big.bin"
+    if (-not (Test-Path -LiteralPath $tgt5b1File)) {
+        throw "OS-5b: target file missing after sync: $tgt5b1File"
+    }
+    $len5b1 = (Get-Item -LiteralPath $tgt5b1File).Length
+    if ($len5b1 -ne 512MB) {
+        throw "OS-5b: target length $len5b1 != 536870912"
+    }
+    $src5bHash = (Get-FileHash -LiteralPath $bigFile -Algorithm SHA256).Hash
+    $tgt5bHash = (Get-FileHash -LiteralPath $tgt5b1File -Algorithm SHA256).Hash
+    if ($src5bHash -ne $tgt5bHash) {
+        throw "OS-5b: SHA256 mismatch src=$src5bHash tgt=$tgt5bHash"
+    }
+    Write-Host "  OK second Auth rejected (exit=$code5b2); held session completed; server exit=$code5b; SHA256 equal"
+    }
+    finally {
+        if ($null -ne $g5b) { $g5b.Dispose() }
+    }
 
     Write-Host "[OS-2] failure path -> client aborted mid-transfer -> server exit 5"
     Assert-FcDeadline -Stage "OS-2"
@@ -500,5 +595,10 @@ catch {
 }
 finally {
     Stop-AllFastClone
+    # [r61 / G-AC8] Zero-delete retention (mirrors once_multi's r19 rule): this script
+    # executes no deletion of any kind -- the unique run tree (fastclone-once-it-<random>
+    # directly under $env:TEMP, this run's own) is retained and its path printed so the
+    # CI failure-artifact upload can collect the per-case logs.
+    Write-Host "RETAINED run temp root (no deletion by design; logs: $logDir): $root"
     if ($failures -ne 0) { exit 1 }
 }

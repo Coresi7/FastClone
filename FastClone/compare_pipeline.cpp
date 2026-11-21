@@ -1,5 +1,7 @@
 #include "compare_pipeline.h"
 
+#include "task_queue_shutdown.h"
+
 #include <algorithm>
 #include <utility>
 
@@ -81,13 +83,18 @@ bool ComparePipeline::HasResults() const noexcept {
 }
 
 void ComparePipeline::Stop() noexcept {
-    stop_.store(true, std::memory_order_relaxed);
-    taskCv_.notify_all();
+    // 59 design section 3.2 (C3): the workers' wait predicate reads stop_ under taskMu_
+    // (WorkerLoop, cv.wait(lock, pred)), so the store must happen under the SAME mutex or
+    // a notify issued between the predicate check and the parked wait is lost (lost
+    // wakeup -> Join hangs until an unrelated wakeup). Same-family fix as the client's
+    // 11 write points via fc::ShutdownFlagged; Join() stays with the caller.
+    fc::ShutdownFlagged(taskMu_, taskCv_, stop_);
 }
 
 void ComparePipeline::SetActiveCap(uint32_t cap) noexcept {
-    activeCap_.store(cap, std::memory_order_relaxed);
-    taskCv_.notify_all();  // wake parked workers so a raised cap takes effect immediately
+    // Same one-mutex rule as Stop(): activeCap_ is read inside the taskMu_-guarded wait
+    // predicate; park/unpark gating must observe the new cap under that mutex (59 3.2).
+    fc::SetCapFlagged(taskMu_, taskCv_, activeCap_, cap);  // wake parked workers so a raised cap takes effect immediately
 }
 
 void ComparePipeline::Join() {

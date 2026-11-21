@@ -10,6 +10,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -264,6 +267,201 @@ void TestAuthClaim() {
     }
 }
 
+// --- ci-once-multi-test-budget (59 design section 3.6): real-socket recv cancellation
+// and EOF classification. Every lane uses the SAME loopback building blocks as
+// TestCheckAuthWireRoundTrip above (WsaContext is the caller's; CreateServer(0) +
+// AcceptClientTimeout + ConnectTo). A blocked RecvFrame runs inside std::async and is
+// NEVER joined directly: a bounded wait_for, then a MANDATORY peer-side rescue
+// (ShutdownBothRc => peer FIN => the blocked recv returns 0 => RecvEof), then get()
+// (the std::async future joins the thread). No kill, no detach, no socket delete, no
+// sleep-as-oracle; each case stays under 2s of wall clock.
+
+struct RecvLaneResult {
+    std::string kind;   // "ok" | "eof" | "error"
+    std::string what;
+    bool rescued = false;  // completed only after the peer-side ShutdownBothRc rescue
+    int rescueRc = 0;
+};
+
+uint16_t LoopbackListenerPort(const fc::SocketHandle& listener) {
+    sockaddr_in6 bound{};
+#ifdef _WIN32
+    int len = static_cast<int>(sizeof(bound));
+#else
+    socklen_t len = static_cast<socklen_t>(sizeof(bound));
+#endif
+    if (getsockname(listener.Get(), reinterpret_cast<sockaddr*>(&bound), &len) != 0) {
+        throw std::runtime_error("test_protocol_codec: getsockname failed");
+    }
+    return ntohs(bound.sin6_port);
+}
+
+// Reader body: connect (IPv6 loopback, IPv4 fallback) and block in ONE RecvFrame.
+// The result records the exception classification, mirroring the client recv thread's
+// RecvEof / std::exception split (59 section 3.3).
+std::future<RecvLaneResult> SpawnBlockedReader(uint16_t port) {
+    return std::async(std::launch::async, [port]() {
+        RecvLaneResult r;
+        try {
+            fc::SocketHandle conn = [&]() {
+                try {
+                    return fc::ConnectTo("::1", port);
+                } catch (const std::exception&) {
+                    return fc::ConnectTo("127.0.0.1", port);
+                }
+            }();
+            fc::Frame f = fc::RecvFrame(conn);
+            r.kind = "ok";
+            r.what = std::to_string(static_cast<int>(static_cast<uint8_t>(f.type)));
+        } catch (const fc::RecvEof& ex) {
+            r.kind = "eof";
+            r.what = ex.what();
+        } catch (const std::exception& ex) {
+            r.kind = "error";
+            r.what = ex.what();
+        }
+        return r;
+    });
+}
+
+// Bounded wait + mandatory rescue (59 section 3.6): the rescue is the PEER-side
+// ShutdownBothRc, which is exactly how the production teardown wakes its blocked recv
+// threads. rescued=true means the reader only finished because of the rescue.
+RecvLaneResult WaitReaderWithRescue(std::future<RecvLaneResult>& fut, fc::SocketHandle& peer) {
+    if (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+        return fut.get();
+    }
+    const int rc = fc::ShutdownBothRc(peer);
+    if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+        throw std::runtime_error(
+            "test_protocol_codec: blocked RecvFrame did not wake within 2s after the peer rescue");
+    }
+    RecvLaneResult r = fut.get();
+    r.rescued = true;
+    r.rescueRc = rc;
+    return r;
+}
+
+void ExpectRecvEofLane(const RecvLaneResult& r, const std::string& tag) {
+    Expect(r.kind == "eof",
+           tag + ": expected RecvEof classification, got kind=" + r.kind + " what=" + r.what);
+    Expect(r.what.rfind("recv failed", 0) == 0,
+           tag + ": RecvEof message must keep the recv-failed text: " + r.what);
+}
+
+void TestRecvCancelWakesBlockedReader() {
+    fc::WsaContext wsa;  // RAII Winsock init (same as TestCheckAuthWireRoundTrip).
+    // Contract probe: ShutdownBothRc returns -1 for an invalid socket, 0 for a live one.
+    Expect(fc::ShutdownBothRc(fc::SocketHandle{}) == -1,
+           "ShutdownBothRc(invalid) must return -1");
+
+    // P1: half header -- 4 of the 9 header bytes, then the peer shuts down. The blocked
+    // reader must wake with RecvEof (orderly close mid-header), not hang, not desync.
+    {
+        std::vector<uint8_t> wire;
+        fc::AppendEncodedFrame(wire, fc::Frame{fc::MsgType::FileChunk, 7,
+                                               std::vector<uint8_t>(64, 0xAB)});
+        fc::SocketHandle listener = fc::CreateServer(0);
+        const uint16_t port = LoopbackListenerPort(listener);
+        std::future<RecvLaneResult> fut = SpawnBlockedReader(port);
+        std::optional<fc::SocketHandle> peer = fc::AcceptClientTimeout(listener, 10000);
+        Expect(peer.has_value(), "P1: reader never connected within 10s");
+        fc::SendAll(*peer, wire.data(), 4);
+        const int rc = fc::ShutdownBothRc(*peer);
+        Expect(rc == 0, "P1: peer ShutdownBothRc rc=" + std::to_string(rc));
+        RecvLaneResult r = WaitReaderWithRescue(fut, *peer);
+        Expect(!r.rescued, "P1: the peer shutdown itself must complete the reader (no rescue needed)");
+        ExpectRecvEofLane(r, "P1");
+    }
+
+    // P2: half payload -- a complete 9-byte header declaring a 64-byte payload, only 10
+    // payload bytes, then the peer shuts down. RecvFrame must wake with RecvEof.
+    {
+        std::vector<uint8_t> wire;
+        fc::AppendEncodedFrame(wire, fc::Frame{fc::MsgType::FileChunk, 9,
+                                               std::vector<uint8_t>(64, 0xCD)});
+        fc::SocketHandle listener = fc::CreateServer(0);
+        const uint16_t port = LoopbackListenerPort(listener);
+        std::future<RecvLaneResult> fut = SpawnBlockedReader(port);
+        std::optional<fc::SocketHandle> peer = fc::AcceptClientTimeout(listener, 10000);
+        Expect(peer.has_value(), "P2: reader never connected within 10s");
+        fc::SendAll(*peer, wire.data(), 9 + 10);
+        const int rc = fc::ShutdownBothRc(*peer);
+        Expect(rc == 0, "P2: peer ShutdownBothRc rc=" + std::to_string(rc));
+        RecvLaneResult r = WaitReaderWithRescue(fut, *peer);
+        Expect(!r.rescued, "P2: the peer shutdown itself must complete the reader (no rescue needed)");
+        ExpectRecvEofLane(r, "P2");
+    }
+
+    // P3: zero-byte EOF -- the peer sends nothing and half-closes its send side (raw
+    // Shutdown(Send), the closesocket/FIN shape). The blocked reader wakes with RecvEof.
+    {
+        fc::SocketHandle listener = fc::CreateServer(0);
+        const uint16_t port = LoopbackListenerPort(listener);
+        std::future<RecvLaneResult> fut = SpawnBlockedReader(port);
+        std::optional<fc::SocketHandle> peer = fc::AcceptClientTimeout(listener, 10000);
+        Expect(peer.has_value(), "P3: reader never connected within 10s");
+#ifdef _WIN32
+        const int rc = shutdown(peer->Get(), SD_SEND);
+#else
+        const int rc = shutdown(peer->Get(), SHUT_WR);
+#endif
+        Expect(rc == 0, "P3: raw shutdown(Send) rc=" + std::to_string(rc));
+        RecvLaneResult r = WaitReaderWithRescue(fut, *peer);
+        Expect(!r.rescued, "P3: the peer Shutdown(Send) itself must complete the reader");
+        ExpectRecvEofLane(r, "P3");
+    }
+
+    // P4: two lanes at once -- two connections with two RecvFrame readers blocked
+    // simultaneously; lane A gets the P1 shape, lane B the P2 shape; each wakes and
+    // joins independently (per-lane rescue if ever needed), each within its 2s bound.
+    {
+        std::vector<uint8_t> wireA;
+        fc::AppendEncodedFrame(wireA, fc::Frame{fc::MsgType::FileChunk, 1,
+                                                std::vector<uint8_t>(64, 0x11)});
+        std::vector<uint8_t> wireB;
+        fc::AppendEncodedFrame(wireB, fc::Frame{fc::MsgType::FileChunk, 2,
+                                                std::vector<uint8_t>(64, 0x22)});
+        fc::SocketHandle listenerA = fc::CreateServer(0);
+        fc::SocketHandle listenerB = fc::CreateServer(0);
+        const uint16_t portA = LoopbackListenerPort(listenerA);
+        const uint16_t portB = LoopbackListenerPort(listenerB);
+        std::future<RecvLaneResult> futA = SpawnBlockedReader(portA);
+        std::future<RecvLaneResult> futB = SpawnBlockedReader(portB);
+        std::optional<fc::SocketHandle> peerA = fc::AcceptClientTimeout(listenerA, 10000);
+        std::optional<fc::SocketHandle> peerB = fc::AcceptClientTimeout(listenerB, 10000);
+        Expect(peerA.has_value() && peerB.has_value(), "P4: a reader never connected within 10s");
+        fc::SendAll(*peerA, wireA.data(), 4);
+        fc::SendAll(*peerB, wireB.data(), 9 + 10);
+        const int rcA = fc::ShutdownBothRc(*peerA);
+        const int rcB = fc::ShutdownBothRc(*peerB);
+        Expect(rcA == 0 && rcB == 0,
+               "P4: peer ShutdownBothRc rcA=" + std::to_string(rcA) + " rcB=" + std::to_string(rcB));
+        RecvLaneResult rA = WaitReaderWithRescue(futA, *peerA);
+        RecvLaneResult rB = WaitReaderWithRescue(futB, *peerB);
+        Expect(!rA.rescued && !rB.rescued, "P4: each lane's own peer shutdown must complete it");
+        ExpectRecvEofLane(rA, "P4/A");
+        ExpectRecvEofLane(rB, "P4/B");
+    }
+
+    // P5: negative -- NO peer signal: the reader must STILL be blocked after 300ms
+    // (wait_for timeout is the blocked-proof), and only the peer rescue shutdown lets
+    // the thread collect the EOF and JOIN. No permanent thread, no kill.
+    {
+        fc::SocketHandle listener = fc::CreateServer(0);
+        const uint16_t port = LoopbackListenerPort(listener);
+        std::future<RecvLaneResult> fut = SpawnBlockedReader(port);
+        std::optional<fc::SocketHandle> peer = fc::AcceptClientTimeout(listener, 10000);
+        Expect(peer.has_value(), "P5: reader never connected within 10s");
+        Expect(fut.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout,
+               "P5: with no peer signal the RecvFrame reader must still be blocked after 300ms");
+        RecvLaneResult r = WaitReaderWithRescue(fut, *peer);
+        Expect(r.rescued, "P5: only the peer rescue shutdown may complete the blocked reader");
+        Expect(r.rescueRc == 0, "P5: rescue ShutdownBothRc rc=" + std::to_string(r.rescueRc));
+        ExpectRecvEofLane(r, "P5");
+    }
+}
+
 }  // namespace
 
 void RunProtocolCodecTests() {
@@ -294,4 +492,9 @@ void RunProtocolCodecTests() {
     TestAuthOkExtensionString();
     TestSessionJoinCapabilities();
     TestAuthClaim();
+
+    // ci-once-multi-test-budget (59 section 3.6): real loopback recv cancellation
+    // (P1 half header / P2 half payload / P3 zero-byte EOF / P4 two lanes / P5 negative
+    // blocked-proof + peer rescue).
+    TestRecvCancelWakesBlockedReader();
 }

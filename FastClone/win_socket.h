@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -126,5 +127,22 @@ void SendAll(const SocketHandle& socket, const void* data, size_t length);
 void SendBuffersAll(const SocketHandle& socket, const SocketBuffer* buffers, size_t count);
 void RecvAll(const SocketHandle& socket, void* data, size_t length);
 void ShutdownBoth(const SocketHandle& socket);
+
+// Task ci-once-multi-test-budget (59 design section 3.3): orderly-close classification.
+// RecvAll throws RecvEof when recv() returns 0 (peer FIN). The message text is generated
+// by the SAME LastSocketError("recv failed") call the old single runtime_error used, so
+// every existing what()-based classification (the server's "recv failed WSA=0" orderly-
+// close detection) keeps working byte-for-byte; RecvEof IS-A std::runtime_error, so all
+// existing catch(std::runtime_error)/catch(std::exception) sites keep catching it.
+class RecvEof : public std::runtime_error {
+public:
+    explicit RecvEof(const std::string& message) : std::runtime_error(message) {}
+};
+
+// Same shutdown as ShutdownBoth, but returns the immediate result code instead of
+// discarding it: 0 = success, -1 = invalid socket, otherwise the OS error (WSAGetLastError
+// on Windows / errno on POSIX). noexcept: shutdown() does not throw; the caller logs the
+// rc for diagnostics without changing control flow (59 section 3.3).
+int ShutdownBothRc(const SocketHandle& socket) noexcept;
 
 }  // namespace fc

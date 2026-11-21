@@ -776,18 +776,33 @@ try {
     if ($code2a -ne 0) { throw "OM-2: client A expected exit 0, got $code2a" }
     if ($code2b -ne 0) { throw "OM-2: client B expected exit 0, got $code2b" }
 
-    # [39 B-01 product evidence] The forwarded downstream EOF must wake each client's blocked
-    # recv thread immediately (sync_engine_client.cpp L1421-1422; pre-fix the join hung on the
-    # 120s idle watchdog, L5115-5124/L681, logging 5s-interval [hb] stage=join_recv heartbeats
-    # -- the retained r38 run showed 24 of them before exit at t_ms=120591). Hard per-client
-    # evidence: (1) NO join_recv heartbeat line may exist, and (2) the exit phase must land
-    # within 5000ms of the join_recv phase (the direct-connection reference is ~5ms; 5000ms
-    # = one heartbeat interval, i.e. strictly before any watchdog rescue could fire).
+    # [39 B-01 product evidence / 59 C1] The forwarded downstream EOF must wake each
+    # client's blocked recv thread. Per-client hard evidence, judged on REAL product
+    # outcomes only:
+    #   (1) NO idle-watchdog rescue marker (idle_detected / tag=idle_abort /
+    #       idle_watchdog_abort): the 120s watchdog must never be the terminator --
+    #       this is the packet-return-level proof that no watchdog rescue ran.
+    #   (2) The exit phase lands within 5000ms of the join_recv phase (one heartbeat
+    #       interval, strictly before any watchdog rescue could fire; the direct-
+    #       connection reference is ~5ms).
+    # A 5s-sampled [hb] stage=join_recv heartbeat ALONE is NOT a failure (59 section
+    # 3.4): on a slow host the client may legitimately sit in join_recv for several
+    # seconds while the normal LOCAL teardown lands (recvStop + ShutdownBoth,
+    # sync_engine_client.cpp L5115-5118) -- "eof" is not the only legal completion, the
+    # local stop is equally legal. The old any-heartbeat throw misfired on exactly that.
     foreach ($ce in @(@("$logDir\om2-c2a.err", 'c2a'), @("$logDir\om2-c2b.err", 'c2b'))) {
         $cliErrText = Get-FcLogFullText -Path $ce[0]
         if ($null -eq $cliErrText) { $cliErrText = '' }
-        if ($cliErrText -match '\[hb\][^\r\n]*stage=join_recv') {
-            throw "OM-2: $($ce[1]) still blocks in join_recv ([hb] stage=join_recv heartbeat present -- the downstream EOF was not forwarded; the pre-fix run relied on the 120s idle-watchdog rescue)"
+        if ($cliErrText -match 'idle_detected|tag=idle_abort|idle_watchdog_abort') {
+            throw "OM-2: $($ce[1]) relied on the idle watchdog to finish (idle_detected/idle_abort markers present in .err)"
+        }
+        # [59 section 3.3/3.4] The per-lane [recv] exit marks are DIAGNOSTICS ONLY, never
+        # a hard gate: reason=stop (local recvStop+ShutdownBoth teardown) and reason=eof
+        # (forwarded downstream FIN) are BOTH legal normal-completion outcomes. Echo them
+        # for the CI artifact record.
+        $recvExitLines = @(($cliErrText -split "`r?`n") | Where-Object { $_ -match '^\[recv\] (exit|shutdown) ' })
+        if ($recvExitLines.Count -gt 0) {
+            Write-Host ("  [OM-2] {0} recv observability: {1}" -f $ce[1], ($recvExitLines -join ' ; '))
         }
         $jrMs = -1; $exitMs = -1
         foreach ($pl in @($cliErrText -split "`r?`n")) {

@@ -589,7 +589,14 @@ void RecvAll(const SocketHandle& socket, void* data, size_t length) {
 #else
         const ssize_t recved = recv(socket.Get(), cursor, remaining, 0);
 #endif
-        if (recved <= 0) {
+        // 59 design section 3.3: split the old `recved <= 0` throw into two exception
+        // types with the SAME message construction, so callers can classify orderly close
+        // (EOF) without changing any what()-text-based behavior (server "recv failed
+        // WSA=0" orderly-close detection is byte-for-byte preserved).
+        if (recved == 0) {
+            throw RecvEof(LastSocketError("recv failed"));
+        }
+        if (recved < 0) {
             throw std::runtime_error(LastSocketError("recv failed"));
         }
         cursor += recved;
@@ -598,13 +605,21 @@ void RecvAll(const SocketHandle& socket, void* data, size_t length) {
 }
 
 void ShutdownBoth(const SocketHandle& socket) {
+    // Old signature/behavior preserved verbatim for every existing caller (server/probe/
+    // tests); delegates to the rc-returning variant and discards the code (59 D-08).
+    (void)ShutdownBothRc(socket);
+}
+
+int ShutdownBothRc(const SocketHandle& socket) noexcept {
     if (!socket.Valid()) {
-        return;
+        return -1;
     }
 #ifdef _WIN32
-    shutdown(socket.Get(), SD_BOTH);
+    const int rc = shutdown(socket.Get(), SD_BOTH);
+    return rc == 0 ? 0 : static_cast<int>(WSAGetLastError());
 #else
-    shutdown(socket.Get(), SHUT_RDWR);
+    const int rc = shutdown(socket.Get(), SHUT_RDWR);
+    return rc == 0 ? 0 : errno;
 #endif
 }
 

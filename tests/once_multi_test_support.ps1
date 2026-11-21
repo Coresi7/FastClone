@@ -485,6 +485,14 @@ namespace FcGate {
         // downlink tail bookkeeping for CLIENT_WRITE_AFTER_CLOSE.
         private readonly UpstreamCloseMode _closeMode = UpstreamCloseMode.Abortive;
         private volatile bool _syncDoneForwarded = false;
+        // [59 C2] The ONE lock covering the SyncDone flag: the completing segment's
+        // Write+Flush and the flag publication happen in the SAME _syncDoneLock critical
+        // section, and every cross-thread reader goes through the SyncDoneForwarded()
+        // accessor (same lock). A reader that observes false therefore provably did so
+        // BEFORE the SyncDone's last byte was flushed, so an EOF it classifies can never
+        // be the FIN that this SyncDone caused (the old post-Write observer race produced
+        // false NoSyncDone verdicts). Bulk block bytes NEVER enter this lock (<=9B only).
+        private readonly object _syncDoneLock = new object();
         private byte[] _obsHdr = new byte[9];
         private int _obsNeed = 9;      // header bytes still required for the current frame
         private long _obsSkip = 0;     // payload bytes still to be passed for the current frame
@@ -565,26 +573,45 @@ namespace FcGate {
             }
         }
 
-        // [36 §3.1.3] Uplink SyncDone observer: advances ONLY over bytes whose Write+Flush
-        // to the upstream already succeeded (called right after both), reuses the single
-        // Scanner.DecodeHeader, and marks _syncDoneForwarded at a FRAME BOUNDARY of a
-        // type==40 && len==0 frame -- the last byte of that 9-byte frame must already be
-        // written and flushed. Memory bound: 9 bytes + counters. sid is recorded, never
-        // asserted (protocol redundancy stays out of the hard gate).
-        private void AdvanceUplinkObserver(byte[] buf, int n, long upbytesAfter) {
+        // [36 §3.1.3 / 59 C2] Uplink SyncDone observer, step 1 (PRE-write): advance the
+        // SAME cross-block state machine (_obsNeed/_obsHdr/_obsSkip, single uplink-thread
+        // owner, the one Scanner.DecodeHeader) over the block and locate the FIRST
+        // complete type==40 && len==0 (SyncDone) frame. segStart/segEnd delimit the
+        // bytes of THAT frame that lie in THIS block (segEnd = one past the frame's last
+        // byte); a frame split across reads reports its completing tail segment
+        // (segStart=0 when the 9-byte header began in an earlier block). Memory bound
+        // stays 9 bytes + counters; zero payload copies. Returns false when no SyncDone
+        // completes in this block -- the caller then keeps the original single
+        // Write+Flush (hot path: no new lock). The state machine advances here, but the
+        // FLAG is only published by PublishSyncDone after the completing segment's
+        // Write+Flush succeeded inside _syncDoneLock.
+        private bool ProbeSyncDone(byte[] buf, int n, out int segStart, out int segEnd, out uint sid) {
+            segStart = 0; segEnd = 0; sid = 0;
+            bool found = false;
             int pos = 0;
+            // -1 = no header in progress inside this block; otherwise the block index of
+            // the current header's first byte within this block.
+            int hdrStartInBlock = (_obsNeed < 9) ? 0 : -1;
             while (pos < n) {
                 if (_obsNeed > 0) {
+                    if (hdrStartInBlock < 0) hdrStartInBlock = pos;
                     int take = _obsNeed;
                     if (take > n - pos) take = n - pos;
                     Array.Copy(buf, pos, _obsHdr, 9 - _obsNeed, take);
                     pos += take; _obsNeed -= take;
                     if (_obsNeed == 0) {
-                        int t; uint sid; long len;
-                        Scanner.DecodeHeader(_obsHdr, out t, out sid, out len);
+                        int t; uint s; long len;
+                        Scanner.DecodeHeader(_obsHdr, out t, out s, out len);
+                        int hdrStart = hdrStartInBlock;
+                        hdrStartInBlock = -1;
                         if (len == 0) {
                             // zero-payload frame: its boundary IS the end of its 9-byte header
-                            if (t == 40) MarkSyncDoneForwarded(sid, upbytesAfter);
+                            if (t == 40 && !found) {
+                                sid = s;
+                                segStart = hdrStart;
+                                segEnd = pos;
+                                found = true;
+                            }
                             _obsNeed = 9;
                         } else {
                             _obsSkip = len;
@@ -593,16 +620,26 @@ namespace FcGate {
                 } else {
                     int take = (int)Math.Min(_obsSkip, (long)(n - pos));
                     pos += take; _obsSkip -= take;
-                    if (_obsSkip == 0) _obsNeed = 9;   // payload-frame boundary (len>0: cannot be the len==0 SyncDone)
+                    if (_obsSkip == 0) { _obsNeed = 9; hdrStartInBlock = -1; }   // payload-frame boundary (len>0: cannot be the len==0 SyncDone)
                 }
             }
+            return found;
         }
 
-        private void MarkSyncDoneForwarded(uint sid, long upbytes) {
+        // [59 C2] Observer step 2: latch + log. Called ONLY with _syncDoneLock held,
+        // immediately after the completing segment's Write+Flush succeeded in the SAME
+        // critical section (so a false read is ordered before that write, never
+        // "EOF raced ahead of the publish").
+        private void PublishSyncDone(uint sid, long upbytes) {
             _syncDoneForwarded = true;
             LogEvent("sync_done_forwarded", 40, sid, 0, 0, null);
             LogLine("FRAME_GATE_SYNCDONE_FORWARDED upbytes=" + upbytes + " sid=" + sid);
         }
+
+        // [59 C2] The ONLY sanctioned cross-thread read of the flag (all four former
+        // bare _syncDoneForwarded readers route through here): same lock as the publish,
+        // so the happens-before ordering is carried by the critical section itself.
+        private bool SyncDoneForwarded() { lock (_syncDoneLock) { return _syncDoneForwarded; } }
 
         // [36 §3.2.3] Graceful terminal classification after ResumeDrain. Finished needs
         // ALL of: upstream EOF, a complete forwarded SyncDone, no cancel, and the client
@@ -617,7 +654,7 @@ namespace FcGate {
                 return;
             }
             if (o.Eof) {
-                if (_syncDoneForwarded) {
+                if (SyncDoneForwarded()) {
                     bool gone = o.ClientWriteFailed || ClientGone();
                     if (!gone) {
                         Stopwatch sw = Stopwatch.StartNew();
@@ -868,7 +905,7 @@ namespace FcGate {
                             // cancel): every other path (early close / upstream fault /
                             // cancel / missing SyncDone) stays fail-closed and forwards
                             // nothing (unit-verified: I9a-e, I9c-e, I9d-f, I13a-e, I13b-e).
-                            if (o.Eof && _syncDoneForwarded && !_cancel) {
+                            if (o.Eof && SyncDoneForwarded() && !_cancel) {
                                 try {
                                     _client.Client.Shutdown(SocketShutdown.Send);
                                     LogLine("FRAME_GATE_DOWNSTREAM_HALF_CLOSE_SEND downbytes=" + _downBytes +
@@ -904,7 +941,7 @@ namespace FcGate {
                     // [36 §3.2.3] Graceful drain interrupted by a read exception after the
                     // client closed: classify fail-closed (a timeout/reset is NEVER EOF, so
                     // it can never be Finished).
-                    if (!_syncDoneForwarded) SetError(GateError.NoSyncDone, "drain failed before SyncDone: " + ex.Message);
+                    if (!SyncDoneForwarded()) SetError(GateError.NoSyncDone, "drain failed before SyncDone: " + ex.Message);
                     else SetError(GateError.Upstream, "drain failed after client close: " + ex.Message);
                 }
             }
@@ -949,19 +986,38 @@ namespace FcGate {
                         break;
                     }
                     if (n <= 0) { clientClosed = true; break; }   // clean client FIN
+                    // [59 C2] Probe BEFORE writing: if this block COMPLETES a SyncDone
+                    // frame, the write is split into three segments -- prefix outside
+                    // the lock, the <=9B completing segment + Flush + flag publication
+                    // inside _syncDoneLock (ONE critical section), suffix outside. A
+                    // block with no completing SyncDone keeps the original single
+                    // Write+Flush (bulk bytes never enter the lock; zero new locking on
+                    // the hot path). This closes the 58 C2 race where Write+Flush
+                    // succeeded, the server's FIN arrived at the downlink, and only THEN
+                    // the observer set the flag -> false NoSyncDone.
+                    int segStart, segEnd; uint syncSid;
+                    bool completesSyncDone = ProbeSyncDone(buf, n, out segStart, out segEnd, out syncSid);
                     try {
-                        up.Write(buf, 0, n);
-                        up.Flush();
+                        if (!completesSyncDone) {
+                            up.Write(buf, 0, n);
+                            up.Flush();
+                            total += n;
+                        } else {
+                            if (segStart > 0) up.Write(buf, 0, segStart);
+                            lock (_syncDoneLock) {
+                                up.Write(buf, segStart, segEnd - segStart);
+                                up.Flush();
+                                total += segEnd;
+                                PublishSyncDone(syncSid, total);
+                            }
+                            if (segEnd < n) up.Write(buf, segEnd, n - segEnd);
+                            total += (n - segEnd);
+                        }
                     } catch (Exception ex) {
                         if (_cancel) return;                 // unblocked by Dispose, not an upstream error
                         upstreamFail = ex.Message;           // upstream write failure: NOT a client close
                         break;
                     }
-                    total += n;
-                    // [36 §3.1.3] Observer advances only over bytes whose Write+Flush to the
-                    // upstream ALREADY succeeded -- a partial Write or an unflushed SyncDone
-                    // can never mark _syncDoneForwarded here.
-                    AdvanceUplinkObserver(buf, n, total);
                 }
             } catch (Exception) {
                 if (_cancel) return;
@@ -990,7 +1046,7 @@ namespace FcGate {
                 // closed NORMALLY -> half-close the upstream send side (FIN, no LingerState,
                 // no RST, no Close, no _exitSignal) so the server sees the lane ending
                 // cleanly. No SyncDone forwarded => an early disconnect is an ERROR.
-                if (_syncDoneForwarded) {
+                if (SyncDoneForwarded()) {
                     try {
                         _upstream.Client.Shutdown(SocketShutdown.Send);
                         LogLine("FRAME_GATE_UPSTREAM_HALF_CLOSE_SEND upbytes=" + total + " sync_done=1");

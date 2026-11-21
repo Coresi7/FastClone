@@ -96,6 +96,40 @@ jobs:
         # Ninja is single-config; -C <cfg> is ignored/invalid there, so omit it.
         run: ctest --test-dir build --output-on-failure
 
+      # [59 C9 / 60-gate section 4 minor] Windows failure diagnostics. The integration
+      # PS scripts create their unique run trees under the runner's USER temp
+      # ($env:TEMP), which on windows-latest is C:\Users\runneradmin\AppData\Local\Temp
+      # -- NOT the same root as ${{ runner.temp }} (D:\a\_temp): verified against
+      # actions/runner-images#712 ("%TEMP% = C:\Users\RUNNER~1\AppData\Local\Temp",
+      # closed as by-design) and the pip-maintainer measurement of the same default.
+      # So the path prefix is the ACTUAL $env:TEMP, recorded here from the same step
+      # environment the ctest-spawned PowerShell children inherit. Failure-only and
+      # Windows-only; log files only (no .git, no env, no payload); the fixed test
+      # password is a script constant, not a credential; the artifact name never
+      # matches the production package glob, so the 4-package contract is untouched.
+      - name: Record Windows TEMP root (failure diagnostics)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: '"FC_WIN_TEMP=$env:TEMP" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8'
+
+      - name: Upload Windows test logs (failure diagnostics)
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FC_WIN_TEMP }}/fastclone-onemulti-it-*/logs/*.out
+            ${{ env.FC_WIN_TEMP }}/fastclone-onemulti-it-*/logs/*.err
+            ${{ env.FC_WIN_TEMP }}/fastclone-onemulti-it-*/logs/*.log
+            ${{ env.FC_WIN_TEMP }}/fastclone-once-it-*/logs/*.out
+            ${{ env.FC_WIN_TEMP }}/fastclone-once-it-*/logs/*.err
+            ${{ env.FC_WIN_TEMP }}/fastclone-once-it-*/logs/*.log
+            ${{ env.FC_WIN_TEMP }}/fastclone-reconnect-it-*/logs/*.out
+            ${{ env.FC_WIN_TEMP }}/fastclone-reconnect-it-*/logs/*.err
+            build/Testing/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Package (install→archive) — runs only after ctest is green (post-test
       # gating). The helper reads RUNNER_TEMP / GITHUB_* from os.environ itself
       # (D-10), so no absolute path ever crosses a bash/cmd argv: no MSYS path

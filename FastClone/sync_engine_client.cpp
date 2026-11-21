@@ -4,6 +4,7 @@
 #include "compare_pipeline.h"
 #include "extra_scan.h"     // unify-probe-extra-shared: shared extra enumeration + SelfExcludeUnderRoot
 #include "local_probe.h"    // unify-probe-extra-shared: shared probe + DirProbeCache
+#include "task_queue_shutdown.h"  // ci-once-multi-test-budget 59 §3.1: locked stop/cap writes
 #include "write_path_accounting.h"
 
 #include <shared_mutex>
@@ -1398,6 +1399,11 @@ int RunClient(const CliOptions& options) {
             std::vector<IncomingFrame> manifestBatch;
             manifestBatch.reserve(kRecvManifestBatchFrames);
             uint64_t manifestBatchBytes = 0;
+            // 59 §3.3 recv-exit classification state: the while loop can only leave
+            // normally with recvStop already latched (loop condition), so the default
+            // reason is "stop"; the catches below overwrite it for exception exits.
+            const char* exitReason = "stop";
+            std::string exitErr;
             try {
                 auto flushManifestBatch = [&]() {
                     if (manifestBatch.empty()) {
@@ -1470,7 +1476,24 @@ int RunClient(const CliOptions& options) {
                         applyRecvBackpressure(queuedBytesSnapshot);
                     }
                 }
+            } catch (const fc::RecvEof& ex) {
+                // 59 §3.3: classify the recv-thread exit. An EOF caused by the LOCAL
+                // teardown (recvStop already latched + ShutdownBoth) is "stop"; a genuine
+                // remote orderly close is "eof". Failover semantics unchanged from the old
+                // single catch(std::exception): a real remote EOF while not stopping still
+                // marks the lane down (nothing is whitewashed, 474-1480 preserved).
+                exitReason = recvStop.load() ? "stop" : "eof";
+                exitErr = ex.what();
+                if (!recvStop.load()) {
+                    conn->downReason = ex.what();
+                    conn->healthy.store(false);
+                    // Wake the main loop so it can run failover (requeue this lane's files
+                    // to healthy lanes, or tear down if this was the last lane).
+                    incomingDataCv.notify_all();
+                }
             } catch (const std::exception& ex) {
+                exitReason = recvStop.load() ? "stop" : "error";
+                exitErr = ex.what();
                 if (!recvStop.load()) {
                     conn->downReason = ex.what();
                     conn->healthy.store(false);
@@ -1479,6 +1502,14 @@ int RunClient(const CliOptions& options) {
                     incomingDataCv.notify_all();
                 }
             }
+            // 59 §3.3: exactly ONE exit mark per lane, on every exit path (the while loop
+            // only leaves normally with recvStop already true => "stop"). stderr, single
+            // line, no payload/password (G-AC7); informational for diagnostics/CI logs,
+            // never a test oracle by itself.
+            std::cerr << "[recv] exit conn=" << conn->connId
+                      << " tid=" << std::this_thread::get_id()
+                      << " reason=" << exitReason
+                      << " err=\"" << exitErr << "\"" << std::endl;
         });
     };
     for (auto& cptr : pool) {
@@ -4406,9 +4437,13 @@ int RunClient(const CliOptions& options) {
                     sample.writeFailures = failuresNow - lastSampleFailures;
 
                     writeCapState = NextWriteActiveCap(writeCapState, sample, ioWorkerCount);
-                    writeActiveCap.store(writeCapState.activeCap, std::memory_order_relaxed);
-                    // Wake any parked workers so a raised cap takes effect immediately (D-09).
-                    ioTaskCv.notify_all();
+                    // 59 §3.1 (D-01): the io workers' wait predicate reads writeActiveCap
+                    // while holding ioTaskMu, so the cap store must happen under the SAME
+                    // mutex (the ioTasks.size() lock above is already released); a bare
+                    // store+notify could land between a worker's predicate check and its
+                    // parked wait and be lost. SetCapFlagged does store-under-lock +
+                    // notify (D-09 wake-on-raise preserved).
+                    fc::SetCapFlagged(ioTaskMu, ioTaskCv, writeActiveCap, writeCapState.activeCap);
                     lastCapSampleSnapshot = sample;
 
                     // Sync compare active cap to the write controller's direction. Compare's
@@ -4536,11 +4571,18 @@ int RunClient(const CliOptions& options) {
                     // lands in the existing reconnect gate.
                     recvError = "idle_watchdog_abort";   // becomes the reconnect reason below
                     idleAbort.store(true);
-                    dirStop.store(true);
-                    dirTaskCv.notify_all();
+                    // 59 §3.1: dirStop under dirTaskMu (the dir workers' predicate reads it
+                    // under that mutex); a bare store+notify can lose the wakeup.
+                    fc::ShutdownFlagged(dirTaskMu, dirTaskCv, dirStop);
+                    // recvStop stays a bare store: recv threads block in RecvFrame(), never
+                    // on a cv predicate reading recvStop; they are woken by ShutdownBoth
+                    // below (59 D-03). Do NOT take incomingMu here (errc 36 hazard, 4786-4811).
                     recvStop.store(true);
                     incomingDataCv.notify_all();
-                    for (auto& cptr : pool) { ShutdownBoth(cptr->socket); }
+                    for (auto& cptr : pool) {
+                        const int rc = ShutdownBothRc(cptr->socket);
+                        std::cerr << "[recv] shutdown conn=" << cptr->connId << " rc=" << rc << std::endl;
+                    }
                     break;
                 }
             }
@@ -4827,20 +4869,23 @@ int RunClient(const CliOptions& options) {
             updateStallWatchdog(loopHadForwardProgress);
         }
     } catch (...) {
+        // 59 §3.1: all four worker-pool stop flags go through the locked helpers (their
+        // wait predicates read the flags under the matching task mutexes; bare
+        // store+notify lost the wakeup between predicate check and parked wait).
+        // recvStop is deliberately NOT in that family (D-03 whitelist): recv threads
+        // block inside RecvFrame(), no cv predicate reads recvStop, and their wakeup is
+        // the ShutdownBothRc loop right below.
         recvStop.store(true);
         incomingDataCv.notify_all();
         for (auto& cptr : pool) {
-            ShutdownBoth(cptr->socket);
+            const int rc = ShutdownBothRc(cptr->socket);
+            std::cerr << "[recv] shutdown conn=" << cptr->connId << " rc=" << rc << std::endl;
         }
         comparePipeline.Stop();
-        hashStop.store(true);
-        hashTaskCv.notify_all();
-        deltaPlanStop.store(true);
-        deltaPlanTaskCv.notify_all();
-        dirStop.store(true);
-        dirTaskCv.notify_all();
-        ioStop.store(true);
-        ioTaskCv.notify_all();
+        fc::ShutdownFlagged(hashTaskMu, hashTaskCv, hashStop);
+        fc::ShutdownFlagged(deltaPlanTaskMu, deltaPlanTaskCv, deltaPlanStop);
+        fc::ShutdownFlagged(dirTaskMu, dirTaskCv, dirStop);
+        fc::ShutdownFlagged(ioTaskMu, ioTaskCv, ioStop);
         for (auto& cptr : pool) {
             JoinDiag(cptr->recvThread, "client-catch-recv");
         }
@@ -4861,12 +4906,10 @@ int RunClient(const CliOptions& options) {
     }
 
     comparePipeline.Stop();
-    hashStop.store(true);
-    hashTaskCv.notify_all();
-    deltaPlanStop.store(true);
-    deltaPlanTaskCv.notify_all();
-    ioStop.store(true);
-    ioTaskCv.notify_all();
+    // 59 §3.1: locked stop writes (same one-mutex rule as the catch path above).
+    fc::ShutdownFlagged(hashTaskMu, hashTaskCv, hashStop);
+    fc::ShutdownFlagged(deltaPlanTaskMu, deltaPlanTaskCv, deltaPlanStop);
+    fc::ShutdownFlagged(ioTaskMu, ioTaskCv, ioStop);
     comparePipeline.Join();
     // Phase markers (task ci-integration-test-timeout, design section 3.8.3): join-site
     // markers, so a stall in the teardown joins is immediately attributable (D-06 keeps
@@ -4992,15 +5035,17 @@ int RunClient(const CliOptions& options) {
                   << " recv_error=\"" << recvError << "\" enumerated=" << enumerated
                   << "); SKIPPING deletion to avoid destroying local files not yet received."
                   << std::endl;
-        dirStop.store(true);
-        dirTaskCv.notify_all();
+        // 59 §3.1: dirStop under dirTaskMu (locked helper; bare store+notify lost wakeups).
+        fc::ShutdownFlagged(dirTaskMu, dirTaskCv, dirStop);
         for (auto& w : dirWorkers) {
             JoinDiag(w, "client-dir-abort");
         }
+        // recvStop: D-03 whitelist (bare store; woken by the ShutdownBothRc loop below).
         recvStop.store(true);
         incomingDataCv.notify_all();
         for (auto& cptr : pool) {
-            ShutdownBoth(cptr->socket);
+            const int rc = ShutdownBothRc(cptr->socket);
+            std::cerr << "[recv] shutdown conn=" << cptr->connId << " rc=" << rc << std::endl;
         }
         for (auto& cptr : pool) {
             JoinDiag(cptr->recvThread, "client-recv-incomplete");
@@ -5091,8 +5136,9 @@ int RunClient(const CliOptions& options) {
             }
         }
     }
-    dirStop.store(true);
-    dirTaskCv.notify_all();
+    // 59 §3.1: dirStop under dirTaskMu; the lock_guard scope pushing the last dirTasks
+    // ended above, so the mutex is free here (verified: no holder on this path).
+    fc::ShutdownFlagged(dirTaskMu, dirTaskCv, dirStop);
     hb.SetStage("join_dir");
     EmitPhase("join_dir");
     for (auto& w : dirWorkers) {
@@ -5112,10 +5158,14 @@ int RunClient(const CliOptions& options) {
             }
         }
     }
+    // recvStop: D-03 whitelist (bare store; woken by the ShutdownBothRc loop below).
     recvStop.store(true);
     incomingDataCv.notify_all();
     for (auto& cptr : pool) {
-        ShutdownBoth(cptr->socket);
+        // 59 §3.3: log the immediate shutdown rc per lane (0 = clean SD_BOTH, else the
+        // WSA error). Informational single stderr line; no retry, no control-flow change.
+        const int rc = ShutdownBothRc(cptr->socket);
+        std::cerr << "[recv] shutdown conn=" << cptr->connId << " rc=" << rc << std::endl;
     }
     hb.SetStage("join_recv");
     EmitPhase("join_recv");

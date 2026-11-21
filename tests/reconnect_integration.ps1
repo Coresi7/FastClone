@@ -58,8 +58,42 @@ $script:FcOwnedPids = @{}
 
 function Register-OwnedProcess {
     param([System.Diagnostics.Process]$Proc, [string]$Tag)
-    $script:FcOwnedPids[[int]$Proc.Id] = $Tag
+    # [59 C8] Record the start time so the kill guard below can require BOTH the pid and
+    # an identical StartTime (a recycled pid would have a different one).
+    $startUtc = $null
+    try { $startUtc = $Proc.StartTime.ToUniversalTime() } catch { $startUtc = $null }
+    $script:FcOwnedPids[[int]$Proc.Id] = [pscustomobject]@{ Tag = $Tag; StartTimeUtc = $startUtc }
     return $Proc
+}
+
+# [59 C8 / original-source triple guard, cf. once_multi Stop-FcOwnedProcess] Stop a
+# process THIS script registered: the pid must be in this run's registry, STILL be named
+# FastClone, and carry the exact recorded StartTime (a recycled pid fails the name or the
+# time check; a MISSING StartTimeUtc is a hard, fail-closed refusal). No whole-machine
+# kill, no by-port/by-name fallback. Returns $true if the stop was issued, $false if the
+# process was already gone (the CALLER judges that case: no kill happened).
+function Stop-FcOwnedProcess {
+    param([System.Diagnostics.Process]$Proc, [string]$StageTag = "stop-owned")
+    if ($null -eq $Proc) { throw "$StageTag`: Stop-FcOwnedProcess called with no process" }
+    if (-not $script:FcOwnedPids.ContainsKey([int]$Proc.Id)) {
+        throw "$StageTag`: pid=$($Proc.Id) is not in this run's owned-process registry (refusing to touch it)"
+    }
+    $info = $script:FcOwnedPids[[int]$Proc.Id]
+    $p = Get-Process -Id $Proc.Id -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }    # already exited on its own
+    if ($p.ProcessName -ne 'FastClone') {
+        throw "$StageTag`: pid=$($Proc.Id) name='$($p.ProcessName)' is not FastClone (pid reuse? refusing)"
+    }
+    if ($null -eq $info.StartTimeUtc) {
+        throw "$StageTag`: pid=$($Proc.Id) registry entry has no recorded StartTimeUtc (fail-closed: refusing to stop)"
+    }
+    $same = $false
+    try { $same = ($p.StartTime.ToUniversalTime() -eq $info.StartTimeUtc) } catch { $same = $false }
+    if (-not $same) {
+        throw "$StageTag`: pid=$($Proc.Id) StartTime differs from the registry entry (pid reuse? refusing)"
+    }
+    Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+    return $true
 }
 
 function Stop-OwnedFastClone {
@@ -356,10 +390,14 @@ try {
 
     Write-Host "[IT-2] server late start -> connect tolerance + reconnect log"
     Assert-FcDeadline -Stage "IT-2"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $tgt | Out-Null
+    # [r61 / G-AC8] Fresh target for this case: the old between-case reset was a recursive
+    # force-delete of $tgt; the zero-delete rule replaces it with a NEW unique target dir
+    # per case (same fresh-empty-target semantics; nothing is ever deleted).
+    $tgtIt2 = Join-Path $root "tgt-it2"
+    New-Item -ItemType Directory -Force -Path $tgtIt2 | Out-Null
+    Write-Host "RETAINED fresh target dir (no deletion by design): $tgtIt2"
     $cli2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt,
+        "client", "--server", $serverAddr, "--target", $tgtIt2,
         "--password", $password, "--reconnect-retries", "10",
         "--streams", "1", "--chunk-kb", "1"
     ) -OutLog "$logDir\it2-client.out" -ErrLog "$logDir\it2-client.err"
@@ -367,29 +405,65 @@ try {
     $srv2 = Start-FastCloneProcess -Exe $exe -CliArgs @(
         "server", "--dir", $src, "--password", $password, "--port", "$Port", $bindLoopbackArg
     ) -OutLog "$logDir\it2-server.out" -ErrLog "$logDir\it2-server.err"
-    Start-Sleep -Seconds 12
-    if (-not $cli2.HasExited) {
-        Stop-Process -Id $cli2.Id -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 300
+    # [59 C8] The fixed 12s sleep becomes a BOUNDED EVENT wait (local PS5.1 helper:
+    # Select-String + 200ms polls): the server is provably serving when [mp] conn_accept
+    # appears in it2-server.out, OR the client already finished on its own. No event
+    # within 12s => loud failure with diagnostics -- never a silent kill that would mask
+    # a dead server (the old code force-killed on timeout and then misjudged the -1).
+    $it2Deadline = [DateTime]::UtcNow.AddSeconds(12)
+    $it2Accept = $false
+    while ([DateTime]::UtcNow -lt $it2Deadline) {
+        if ($cli2.HasExited) { break }
+        if (Select-String -Path "$logDir\it2-server.out" -Pattern '\[mp\] conn_accept' -Quiet -ErrorAction SilentlyContinue) {
+            $it2Accept = $true
+            break
+        }
+        Start-Sleep -Milliseconds 200
     }
+    if (-not $it2Accept -and -not $cli2.HasExited) {
+        Write-FcDiag -StageTag "IT-2/no-server-event" -Reason "no-conn-accept" -TimeoutSec 12 `
+            -Proc $cli2 -OutLog "$logDir\it2-client.out" -ErrLog "$logDir\it2-client.err"
+        throw "IT-2: no [mp] conn_accept in it2-server.out and client still running after 12s (server not serving; failing loudly instead of masking)"
+    }
+    # Reconnect evidence BEFORE any kill: only an active kill that FOLLOWS an observed
+    # reconnect attempt may later justify the forced -1 (both exit branches must pass).
     Assert-ReconnectLog -Paths @("$logDir\it2-client.err", "$logDir\it2-client.out") -Scenario "IT-2"
     if (Select-String -Path "$logDir\it2-client.err" -Pattern "FastClone error: connect failed" -Quiet) {
         throw "IT-2: connect failed was fatal (regression)"
     }
-    if ($cli2.HasExited) {
+    # [59 C8] Unforced-exit record: did the client exit on its OWN before any stop?
+    $cli2.Refresh()
+    $preExit = $cli2.HasExited
+    $ownKilled = $false
+    if (-not $preExit) {
+        # Active abort of OUR registered client, behind the triple ownership guard
+        # (registry pid + still-named FastClone + identical recorded StartTime).
+        $null = Stop-FcOwnedProcess -Proc $cli2 -StageTag "IT-2-own-stop"
+        $ownKilled = $true
+        $null = $cli2.WaitForExit(3000)
         $cli2.Refresh()
+    }
+    if ($cli2.HasExited) {
         $ec = $cli2.ExitCode
-        if ($null -ne $ec -and $ec -ne 0 -and $ec -ne 2) {
+        if ($ownKilled) {
+            # Our own force-kill's expected product: PowerShell reports -1. Accepted ONLY
+            # because the reconnect attempt was observed BEFORE the kill.
+            if ($null -eq $ec -or $ec -ne -1) { throw "IT-2: own-killed client expected exit -1, got $ec" }
+        } elseif ($null -ne $ec -and $ec -ne 0 -and $ec -ne 2) {
+            # Autonomous exit keeps the ORIGINAL allowed set {0,2}; 6 is server-only
+            # (kExitWaitConnectTimeout, sync_engine_server) and stays excluded.
             throw "IT-2: unexpected client exit $ec"
         }
     }
-    Write-Host "  OK connect tolerance (client exit=$($cli2.ExitCode))"
+    Write-Host "  OK connect tolerance (client exit=$($cli2.ExitCode) ownkilled=$ownKilled preExit=$preExit)"
     Stop-Process -Id $srv2.Id -Force -ErrorAction SilentlyContinue
 
     Write-Host "[IT-3] reconnect disabled -> exit 3 on disconnect"
     Assert-FcDeadline -Stage "IT-3"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $tgt | Out-Null
+    # [r61 / G-AC8] Fresh unique target (replaces the old recursive force-delete reset).
+    $tgtIt3 = Join-Path $root "tgt-it3"
+    New-Item -ItemType Directory -Force -Path $tgtIt3 | Out-Null
+    Write-Host "RETAINED fresh target dir (no deletion by design): $tgtIt3"
     if (-not (Wait-PortFree -PortNum $Port -TimeoutSec 15)) {
         Write-Host "[PORT-BUSY] port $Port still held before IT-3 server start:"
         (netstat -ano | Select-String -Pattern ":$Port ") | ForEach-Object { Write-Host "    $($_.Line)" }
@@ -403,7 +477,7 @@ try {
         throw "IT-3: server pid=$($srv4.Id) never reached LISTENING on port $Port within 15s"
     }
     $cli3 = Start-FastCloneProcess -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt,
+        "client", "--server", $serverAddr, "--target", $tgtIt3,
         "--password", $password, "--reconnect-retries", "0",
         "--streams", "1", "--chunk-kb", "1"
     ) -OutLog "$logDir\it3-client.out" -ErrLog "$logDir\it3-client.err"
@@ -429,10 +503,12 @@ try {
 
     Write-Host "[IT-4] reconnect budget exhausted -> exit 4"
     Assert-FcDeadline -Stage "IT-4"
-    Remove-Item -Recurse -Force $tgt -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $tgt | Out-Null
+    # [r61 / G-AC8] Fresh unique target (replaces the old recursive force-delete reset).
+    $tgtIt4 = Join-Path $root "tgt-it4"
+    New-Item -ItemType Directory -Force -Path $tgtIt4 | Out-Null
+    Write-Host "RETAINED fresh target dir (no deletion by design): $tgtIt4"
     $code4 = Invoke-FastCloneSync -Exe $exe -CliArgs @(
-        "client", "--server", $serverAddr, "--target", $tgt,
+        "client", "--server", $serverAddr, "--target", $tgtIt4,
         "--password", $password, "--reconnect-retries", "1"
     ) -OutLog "$logDir\it4-client.out" -ErrLog "$logDir\it4-client.err" -TimeoutSec 150 -StageTag "IT-4"
     if ($code4 -ne 4) { throw "IT-4: expected exit 4, got $code4" }
@@ -453,5 +529,12 @@ catch {
 }
 finally {
     Stop-AllFastClone
+    # [r61 / G-AC8] Zero-delete retention (mirrors once_multi's r19 rule): this script
+    # now executes no deletion of any kind (the three old between-case recursive
+    # force-deletes of $tgt were replaced by fresh unique per-case target dirs). The
+    # run tree (fastclone-reconnect-it-<random> directly under $env:TEMP, this run's
+    # own) is retained and its path printed so the CI failure-artifact upload can
+    # collect the per-case logs.
+    Write-Host "RETAINED run temp root (no deletion by design; logs: $logDir): $root"
     if ($failures -ne 0) { exit 1 }
 }
