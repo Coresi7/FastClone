@@ -194,7 +194,7 @@ jobs:
         shell: cmd
         # The msvc-dev-cmd step already put the ARM64 cross compiler (Hostx64/arm64
         # cl.exe) on PATH; Ninja keeps the build single-config like the x64 job.
-        run: cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CMAKE_PREFIX_PATH%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DFC_VERSION_FREEZE=ON -DFC_ARM64_MSVC_NO_LTCG_FILE_INDEX=ON || exit /b 1
+        run: cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%CMAKE_PREFIX_PATH%" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DFC_VERSION_FREEZE=ON -DFC_ARM64_MSVC_FILE_INDEX_ICE_WORKAROUND=ON || exit /b 1
 
       - name: Build (ARM64, no test)
         shell: cmd

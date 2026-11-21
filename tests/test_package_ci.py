@@ -779,8 +779,8 @@ class TestStaticCiGating(unittest.TestCase):
         # terminator under `jobs:` (its blocks run to EOF), so the other
         # jobs are bounded by the next 2-space job key exactly like
         # test_v02's block() -- same scope proof, no helper change.
-        self.assertIn("-DFC_ARM64_MSVC_NO_LTCG_FILE_INDEX=ON", wa)
-        self.assertEqual(self.code.count("FC_ARM64_MSVC_NO_LTCG_FILE_INDEX"), 1)
+        self.assertIn("-DFC_ARM64_MSVC_FILE_INDEX_ICE_WORKAROUND=ON", wa)
+        self.assertEqual(self.code.count("FC_ARM64_MSVC_FILE_INDEX_ICE_WORKAROUND"), 1)
         jobs_at = next(i for i, l in enumerate(self.lines) if l.rstrip() == "jobs:")
         job_keys = [i for i, l in enumerate(self.lines)
                     if i > jobs_at and re.match(r"^  [A-Za-z0-9_-]+:$", l)]
@@ -790,7 +790,7 @@ class TestStaticCiGating(unittest.TestCase):
             e = next((j for j in job_keys if j > s), len(self.lines))
             return "\n".join(self.lines[s:e])
 
-        self.assertNotIn("FC_ARM64_MSVC_NO_LTCG_FILE_INDEX",
+        self.assertNotIn("FC_ARM64_MSVC_FILE_INDEX_ICE_WORKAROUND",
                          _block("build-test") + "\n" + _block("sanitizers"))
 
     def test_no_continue_on_error(self):
